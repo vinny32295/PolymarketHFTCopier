@@ -31,7 +31,7 @@ mock_web3_module = MagicMock()
 mock_web3_module.Web3 = MagicMock()
 mock_web3_module.Web3.to_checksum_address = lambda x: x
 mock_web3_module.Web3.HTTPProvider = MagicMock()
-mock_web3_module.Web3.WebsocketProvider = MagicMock()
+mock_web3_module.Web3.WebSocketProvider = MagicMock()
 sys.modules.setdefault("web3", mock_web3_module)
 sys.modules.setdefault("web3.middleware", MagicMock())
 

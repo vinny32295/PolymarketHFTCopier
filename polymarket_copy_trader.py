@@ -73,6 +73,9 @@ CLOB_API_BASE = "https://clob.polymarket.com"
 # Polymarket Gamma Markets API
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 
+# Polymarket Data API (user activity, positions, trades)
+DATA_API_BASE = "https://data-api.polymarket.com"
+
 # Minimal ERC20 ABI for USDC balance/approval checks
 ERC20_ABI = json.loads("""[
     {"constant":true,"inputs":[{"name":"_owner","type":"address"}],
@@ -252,6 +255,7 @@ class PolymarketCLOBClient:
         self.cfg = cfg
         self.base_url = CLOB_API_BASE.rstrip("/")
         self.gamma_url = GAMMA_API_BASE.rstrip("/")
+        self.data_url = DATA_API_BASE.rstrip("/")
         self.session = requests.Session() if requests else None
         self.logger = logger or logging.getLogger("CopyTrader")
         self._last_trade_ids = {}  # address -> set of seen trade IDs
@@ -371,9 +375,9 @@ class PolymarketCLOBClient:
                     address[:10], exc,
                 )
 
-        # Fallback: Gamma API (public, no auth needed)
-        url = f"{self.gamma_url}/activity"
-        params = {"address": address.lower(), "limit": limit}
+        # Fallback: Data API (public, no auth needed)
+        url = f"{self.data_url}/activity"
+        params = {"user": address.lower(), "limit": limit}
         data = self._get_public(url, params=params)
         if data is None:
             return []
@@ -913,7 +917,11 @@ class CopyTraderBot:
         if ws_url:
             try:
                 from web3 import Web3 as W3
-                self.w3 = W3(W3.WebsocketProvider(ws_url))
+                # web3.py 6.x+: WebsocketProvider was removed; try WebSocketProvider
+                _WsProvider = getattr(W3, "WebSocketProvider", None) or getattr(W3, "WebsocketProvider", None)
+                if _WsProvider is None:
+                    from web3.providers import WebSocketProvider as _WsProvider
+                self.w3 = W3(_WsProvider(ws_url))
                 self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
                 if self.w3.is_connected():
                     self.logger.info("Connected via WebSocket: %s", ws_url[:40] + "...")

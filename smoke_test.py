@@ -168,10 +168,10 @@ def check_address_activity(address):
     print(f"\n7. Checking trade activity for {address[:10]}...{address[-6:]}...")
     try:
         import requests
-        # Try Gamma API activity
+        # Try Data API activity
         resp = requests.get(
-            "https://gamma-api.polymarket.com/activity",
-            params={"address": address.lower(), "limit": 5},
+            "https://data-api.polymarket.com/activity",
+            params={"user": address.lower(), "limit": 5},
             timeout=10,
         )
         if resp.status_code == 200:
@@ -182,9 +182,9 @@ def check_address_activity(address):
                 for t in trades[:3]:
                     print(f"   {INFO} {json.dumps(t, default=str)[:120]}...")
             else:
-                print(f"   {INFO} No recent activity found via Gamma API")
+                print(f"   {INFO} No recent activity found via Data API")
         else:
-            print(f"   {INFO} Gamma activity endpoint returned {resp.status_code}")
+            print(f"   {INFO} Data API activity endpoint returned {resp.status_code}")
 
         # Also check CLOB trades endpoint (may require auth)
         resp2 = requests.get(
