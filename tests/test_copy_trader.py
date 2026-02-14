@@ -1844,18 +1844,16 @@ class TestProxyWalletDiscovery(unittest.TestCase):
         mock_factory.functions.proxyFor.return_value.call.return_value = zero
         executor.w3.eth.contract.side_effect = None
         executor.w3.eth.contract.return_value = mock_factory
-        executor.w3.eth.block_number = 50_000_000
+        executor.w3.eth.block_number = 80_000_000  # must exceed start_block (70M)
 
         # Legacy event logs empty, Safe factory logs return a result
         safe_addr = self.PROXY_ADDR
         safe_log_data = bytes.fromhex("00" * 12 + safe_addr[2:].lower())
-        call_count = [0]
 
         def get_logs_side_effect(params):
-            call_count[0] += 1
             addr = params.get("address", "").lower()
             if addr == bot.SAFE_PROXY_FACTORY_ADDRESS.lower():
-                return [{"data": safe_log_data, "blockNumber": 45_000_000}]
+                return [{"data": safe_log_data, "blockNumber": 75_000_000}]
             return []
 
         executor.w3.eth.get_logs.side_effect = get_logs_side_effect
@@ -1874,7 +1872,7 @@ class TestProxyWalletDiscovery(unittest.TestCase):
         mock_factory.functions.proxyFor.return_value.call.side_effect = Exception("fail")
         executor.w3.eth.contract.side_effect = None
         executor.w3.eth.contract.return_value = mock_factory
-        executor.w3.eth.block_number = 50_000_000
+        executor.w3.eth.block_number = 80_000_000
         executor.w3.eth.get_logs.side_effect = Exception("fail")
 
         result = executor.discover_proxy_wallet()
