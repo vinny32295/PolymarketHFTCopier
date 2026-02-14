@@ -1741,5 +1741,470 @@ class TestScanAndRedeemPortfolio(unittest.TestCase):
         self.assertEqual(results, [])
 
 
+class TestProxyWalletDiscovery(unittest.TestCase):
+    """Test proxy wallet discovery from factory contract."""
+
+    PROXY_ADDR = "0x" + "P" * 40
+
+    def _make_executor(self):
+        w3 = MagicMock()
+        mock_account = MagicMock()
+        mock_account.address = "0x" + "1" * 40
+        w3.eth.account.from_key.return_value = mock_account
+
+        mock_usdc = MagicMock()
+        mock_ctf_exchange = MagicMock()
+        mock_conditional_tokens = MagicMock()
+
+        def contract_factory(address, abi):
+            addr = address.lower() if hasattr(address, "lower") else address
+            if addr == bot.USDC_ADDRESS.lower():
+                return mock_usdc
+            if addr == bot.CTF_EXCHANGE_ADDRESS.lower():
+                return mock_ctf_exchange
+            if addr == bot.CONDITIONAL_TOKENS_ADDRESS.lower():
+                return mock_conditional_tokens
+            return MagicMock()
+
+        w3.eth.contract.side_effect = contract_factory
+
+        cfg = dict(bot.DEFAULT_CONFIG)
+        executor = bot.TradeExecutor(
+            w3=w3,
+            private_key="0x" + "a" * 64,
+            cfg=cfg,
+            logger=logging.getLogger("test_proxy"),
+        )
+        executor.conditional_tokens = mock_conditional_tokens
+        executor.usdc = mock_usdc
+        executor.clob_client = MagicMock()
+        executor.clob_client.clob_sdk = MagicMock()
+        executor._sign_and_send = MagicMock()
+        executor._base_tx_params = MagicMock(return_value={
+            "from": executor.address, "nonce": 0,
+            "maxFeePerGas": 100, "maxPriorityFeePerGas": 30,
+            "chainId": 137,
+        })
+        return executor
+
+    def test_discover_proxy_returns_address(self):
+        executor = self._make_executor()
+        # Mock factory contract
+        mock_factory = MagicMock()
+        mock_factory.functions.getProxy.return_value.call.return_value = self.PROXY_ADDR
+        executor.w3.eth.contract.side_effect = None
+        executor.w3.eth.contract.return_value = mock_factory
+
+        result = executor.discover_proxy_wallet()
+        self.assertEqual(result, self.PROXY_ADDR)
+
+    def test_discover_proxy_zero_address_returns_none(self):
+        executor = self._make_executor()
+        mock_factory = MagicMock()
+        mock_factory.functions.getProxy.return_value.call.return_value = "0x" + "0" * 40
+        executor.w3.eth.contract.side_effect = None
+        executor.w3.eth.contract.return_value = mock_factory
+
+        result = executor.discover_proxy_wallet()
+        self.assertIsNone(result)
+
+    def test_discover_proxy_exception_returns_none(self):
+        executor = self._make_executor()
+        executor.w3.eth.contract.side_effect = Exception("RPC error")
+
+        result = executor.discover_proxy_wallet()
+        self.assertIsNone(result)
+
+
+class TestProxyBalances(unittest.TestCase):
+    """Test proxy USDC and token balance queries."""
+
+    PROXY_ADDR = "0x" + "P" * 40
+
+    def _make_executor(self):
+        w3 = MagicMock()
+        mock_account = MagicMock()
+        mock_account.address = "0x" + "1" * 40
+        w3.eth.account.from_key.return_value = mock_account
+
+        mock_usdc = MagicMock()
+        mock_conditional_tokens = MagicMock()
+
+        def contract_factory(address, abi):
+            addr = address.lower() if hasattr(address, "lower") else address
+            if addr == bot.USDC_ADDRESS.lower():
+                return mock_usdc
+            if addr == bot.CONDITIONAL_TOKENS_ADDRESS.lower():
+                return mock_conditional_tokens
+            return MagicMock()
+
+        w3.eth.contract.side_effect = contract_factory
+
+        cfg = dict(bot.DEFAULT_CONFIG)
+        executor = bot.TradeExecutor(
+            w3=w3,
+            private_key="0x" + "a" * 64,
+            cfg=cfg,
+            logger=logging.getLogger("test_proxy_bal"),
+        )
+        executor.usdc = mock_usdc
+        executor.conditional_tokens = mock_conditional_tokens
+        return executor
+
+    def test_proxy_usdc_balance(self):
+        executor = self._make_executor()
+        executor.usdc.functions.balanceOf.return_value.call.return_value = 150_000000
+        result = executor.get_proxy_usdc_balance(self.PROXY_ADDR)
+        self.assertEqual(result, Decimal("150"))
+
+    def test_proxy_token_balance(self):
+        executor = self._make_executor()
+        executor.conditional_tokens.functions.balanceOf.return_value.call.return_value = 30_000000
+        result = executor.get_proxy_token_balance(self.PROXY_ADDR, "12345")
+        self.assertEqual(result, 30_000000)
+
+
+class TestProxyRedemptionAndWithdrawal(unittest.TestCase):
+    """Test proxy redemption via execute and USDC withdrawal."""
+
+    PROXY_ADDR = "0x" + "P" * 40
+    TOK1 = "12345678901234567890"
+
+    def _make_executor(self, dry_run=False, proxy_redeem=True, proxy_withdraw=True):
+        w3 = MagicMock()
+        mock_account = MagicMock()
+        mock_account.address = "0x" + "1" * 40
+        w3.eth.account.from_key.return_value = mock_account
+
+        mock_usdc = MagicMock()
+        mock_ctf_exchange = MagicMock()
+        mock_conditional_tokens = MagicMock()
+
+        def contract_factory(address, abi):
+            addr = address.lower() if hasattr(address, "lower") else address
+            if addr == bot.USDC_ADDRESS.lower():
+                return mock_usdc
+            if addr == bot.CTF_EXCHANGE_ADDRESS.lower():
+                return mock_ctf_exchange
+            if addr == bot.CONDITIONAL_TOKENS_ADDRESS.lower():
+                return mock_conditional_tokens
+            return MagicMock()
+
+        w3.eth.contract.side_effect = contract_factory
+
+        cfg = dict(bot.DEFAULT_CONFIG)
+        cfg["dry_run"] = dry_run
+        cfg["proxy_redeem"] = proxy_redeem
+        cfg["proxy_withdraw"] = proxy_withdraw
+
+        executor = bot.TradeExecutor(
+            w3=w3,
+            private_key="0x" + "a" * 64,
+            cfg=cfg,
+            logger=logging.getLogger("test_proxy_redeem"),
+        )
+        executor.conditional_tokens = mock_conditional_tokens
+        executor.usdc = mock_usdc
+        executor.ctf_exchange = mock_ctf_exchange
+        executor.clob_client = MagicMock()
+        executor.clob_client.clob_sdk = MagicMock()
+        executor._sign_and_send = MagicMock()
+        executor._base_tx_params = MagicMock(return_value={
+            "from": executor.address, "nonce": 0,
+            "maxFeePerGas": 100, "maxPriorityFeePerGas": 30,
+            "chainId": 137,
+        })
+        executor.get_usdc_balance = MagicMock(return_value=Decimal("500"))
+        return executor
+
+    def test_redeem_via_proxy(self):
+        """Test redeem_via_proxy encodes and sends correctly."""
+        executor = self._make_executor()
+        cond_id = "0x" + "a" * 64
+        executor.conditional_tokens.encodeABI = MagicMock(return_value=b"\x01\x02")
+
+        mock_proxy_contract = MagicMock()
+        mock_proxy_contract.functions.execute.return_value.build_transaction.return_value = {}
+        executor.w3.eth.contract.side_effect = None
+        executor.w3.eth.contract.return_value = mock_proxy_contract
+
+        mock_receipt = MagicMock()
+        mock_receipt.status = 1
+        executor._sign_and_send.return_value = mock_receipt
+
+        result = executor.redeem_via_proxy(self.PROXY_ADDR, cond_id)
+        self.assertEqual(result.status, 1)
+        executor.conditional_tokens.encodeABI.assert_called_once()
+        executor._sign_and_send.assert_called_once()
+
+    def test_withdraw_usdc_from_proxy(self):
+        """Test USDC withdrawal from proxy to EOA."""
+        executor = self._make_executor()
+        executor.usdc.functions.balanceOf.return_value.call.return_value = 200_000000
+        executor.usdc.encodeABI = MagicMock(return_value=b"\x03\x04")
+
+        mock_proxy_contract = MagicMock()
+        mock_proxy_contract.functions.execute.return_value.build_transaction.return_value = {}
+        executor.w3.eth.contract.side_effect = None
+        executor.w3.eth.contract.return_value = mock_proxy_contract
+
+        mock_receipt = MagicMock()
+        mock_receipt.status = 1
+        mock_receipt.transactionHash.hex.return_value = "0xwithdraw123"
+        executor._sign_and_send.return_value = mock_receipt
+
+        result = executor.withdraw_usdc_from_proxy(self.PROXY_ADDR)
+        self.assertEqual(result.status, 1)
+        executor.usdc.encodeABI.assert_called_once()
+
+    def test_withdraw_zero_balance_returns_none(self):
+        """No withdrawal when proxy USDC balance is 0."""
+        executor = self._make_executor()
+        executor.usdc.functions.balanceOf.return_value.call.return_value = 0
+
+        result = executor.withdraw_usdc_from_proxy(self.PROXY_ADDR)
+        self.assertIsNone(result)
+        executor._sign_and_send.assert_not_called()
+
+    def test_withdraw_specific_amount(self):
+        """Withdraw a specific amount rather than full balance."""
+        executor = self._make_executor()
+        executor.usdc.encodeABI = MagicMock(return_value=b"\x05\x06")
+
+        mock_proxy_contract = MagicMock()
+        mock_proxy_contract.functions.execute.return_value.build_transaction.return_value = {}
+        executor.w3.eth.contract.side_effect = None
+        executor.w3.eth.contract.return_value = mock_proxy_contract
+
+        mock_receipt = MagicMock()
+        mock_receipt.status = 1
+        executor._sign_and_send.return_value = mock_receipt
+
+        result = executor.withdraw_usdc_from_proxy(self.PROXY_ADDR, amount=Decimal("50"))
+        self.assertEqual(result.status, 1)
+        # Verify transfer args: amount should be 50 * 1000000
+        call_args = executor.usdc.encodeABI.call_args
+        self.assertEqual(call_args[1]["args"][1], 50_000000)
+
+
+class TestScanAndRedeemProxyPortfolio(unittest.TestCase):
+    """Test the full proxy portfolio scan, redeem, and withdraw flow."""
+
+    PROXY_ADDR = "0x" + "P" * 40
+    TOK_RESOLVED = "11111111111111111111"
+    TOK_ACTIVE = "22222222222222222222"
+    TOK_EMPTY = "33333333333333333333"
+
+    def _make_executor(self, dry_run=False, proxy_redeem=True, proxy_withdraw=True):
+        w3 = MagicMock()
+        mock_account = MagicMock()
+        mock_account.address = "0x" + "1" * 40
+        w3.eth.account.from_key.return_value = mock_account
+
+        mock_usdc = MagicMock()
+        mock_ctf_exchange = MagicMock()
+        mock_conditional_tokens = MagicMock()
+
+        def contract_factory(address, abi):
+            addr = address.lower() if hasattr(address, "lower") else address
+            if addr == bot.USDC_ADDRESS.lower():
+                return mock_usdc
+            if addr == bot.CTF_EXCHANGE_ADDRESS.lower():
+                return mock_ctf_exchange
+            if addr == bot.CONDITIONAL_TOKENS_ADDRESS.lower():
+                return mock_conditional_tokens
+            return MagicMock()
+
+        w3.eth.contract.side_effect = contract_factory
+
+        cfg = dict(bot.DEFAULT_CONFIG)
+        cfg["dry_run"] = dry_run
+        cfg["proxy_redeem"] = proxy_redeem
+        cfg["proxy_withdraw"] = proxy_withdraw
+
+        executor = bot.TradeExecutor(
+            w3=w3,
+            private_key="0x" + "a" * 64,
+            cfg=cfg,
+            logger=logging.getLogger("test_proxy_scan"),
+        )
+        executor.conditional_tokens = mock_conditional_tokens
+        executor.usdc = mock_usdc
+        executor.ctf_exchange = mock_ctf_exchange
+        executor.clob_client = MagicMock()
+        executor.clob_client.clob_sdk = MagicMock()
+        executor._sign_and_send = MagicMock()
+        executor._base_tx_params = MagicMock(return_value={
+            "from": executor.address, "nonce": 0,
+            "maxFeePerGas": 100, "maxPriorityFeePerGas": 30,
+            "chainId": 137,
+        })
+        executor.get_usdc_balance = MagicMock(return_value=Decimal("500"))
+        return executor
+
+    def test_disabled_via_config(self):
+        executor = self._make_executor(proxy_redeem=False)
+        results = executor.scan_and_redeem_proxy_portfolio()
+        self.assertEqual(results, [])
+
+    def test_no_clob_client_skips(self):
+        executor = self._make_executor()
+        executor.clob_client = None
+        results = executor.scan_and_redeem_proxy_portfolio()
+        self.assertEqual(results, [])
+
+    def test_no_proxy_wallet_returns_empty(self):
+        executor = self._make_executor()
+        executor.discover_proxy_wallet = MagicMock(return_value=None)
+        results = executor.scan_and_redeem_proxy_portfolio()
+        self.assertEqual(results, [])
+
+    def test_redeems_resolved_proxy_position(self):
+        """Full flow: discovers proxy, redeems resolved position, withdraws USDC."""
+        executor = self._make_executor()
+        executor.discover_proxy_wallet = MagicMock(return_value=self.PROXY_ADDR)
+        executor.get_proxy_usdc_balance = MagicMock(return_value=Decimal("50"))
+
+        executor.clob_client.get_wallet_token_ids.return_value = {self.TOK_RESOLVED}
+
+        # Mock proxy token balance
+        executor.get_proxy_token_balance = MagicMock(return_value=30_000000)
+
+        executor.clob_client.get_market_by_token.return_value = {
+            "condition_id": "0x" + "a" * 64,
+            "closed": True,
+            "active": False,
+            "question": "Test resolved?",
+        }
+        executor.conditional_tokens.functions.payoutDenominator.return_value.call.return_value = 1000000
+
+        # Mock redeem via proxy
+        mock_receipt = MagicMock()
+        mock_receipt.status = 1
+        mock_receipt.transactionHash.hex.return_value = "0xproxyredeem123"
+        executor.redeem_via_proxy = MagicMock(return_value=mock_receipt)
+
+        # Mock withdrawal
+        withdraw_receipt = MagicMock()
+        withdraw_receipt.status = 1
+        withdraw_receipt.transactionHash.hex.return_value = "0xproxywithdraw456"
+        executor.withdraw_usdc_from_proxy = MagicMock(return_value=withdraw_receipt)
+        # After redeem, proxy now has USDC to withdraw
+        executor.get_proxy_usdc_balance = MagicMock(
+            side_effect=[Decimal("50"), Decimal("80")]
+        )
+
+        results = executor.scan_and_redeem_proxy_portfolio()
+
+        redeemed = [r for r in results if r.get("status") == "redeemed"]
+        withdrawn = [r for r in results if r.get("status") == "withdrawn"]
+        self.assertEqual(len(redeemed), 1)
+        self.assertEqual(redeemed[0]["source"], "proxy")
+        self.assertEqual(len(withdrawn), 1)
+        self.assertEqual(withdrawn[0]["source"], "proxy_withdrawal")
+
+    def test_skips_active_positions_in_proxy(self):
+        """Active (non-closed) positions in proxy are not redeemed."""
+        executor = self._make_executor()
+        executor.discover_proxy_wallet = MagicMock(return_value=self.PROXY_ADDR)
+        executor.get_proxy_usdc_balance = MagicMock(return_value=Decimal("0"))
+        executor.clob_client.get_wallet_token_ids.return_value = {self.TOK_ACTIVE}
+        executor.get_proxy_token_balance = MagicMock(return_value=10_000000)
+        executor.clob_client.get_market_by_token.return_value = {
+            "condition_id": "0x" + "b" * 64,
+            "closed": False,
+            "active": True,
+        }
+
+        results = executor.scan_and_redeem_proxy_portfolio()
+        # No redemptions, no withdrawals (proxy balance is 0)
+        self.assertEqual(results, [])
+
+    def test_dry_run_does_not_execute(self):
+        executor = self._make_executor(dry_run=True)
+        executor.discover_proxy_wallet = MagicMock(return_value=self.PROXY_ADDR)
+        executor.get_proxy_usdc_balance = MagicMock(return_value=Decimal("100"))
+        executor.clob_client.get_wallet_token_ids.return_value = {self.TOK_RESOLVED}
+        executor.get_proxy_token_balance = MagicMock(return_value=50_000000)
+        executor.clob_client.get_market_by_token.return_value = {
+            "condition_id": "0x" + "a" * 64,
+            "closed": True,
+            "active": False,
+            "question": "Test?",
+        }
+        executor.conditional_tokens.functions.payoutDenominator.return_value.call.return_value = 1000000
+
+        results = executor.scan_and_redeem_proxy_portfolio()
+
+        dry_runs = [r for r in results if r.get("status") == "dry_run"]
+        self.assertTrue(len(dry_runs) >= 1)
+        executor._sign_and_send.assert_not_called()
+
+    def test_withdraw_disabled_skips_withdrawal(self):
+        """When proxy_withdraw is False, only redemption happens."""
+        executor = self._make_executor(proxy_withdraw=False)
+        executor.discover_proxy_wallet = MagicMock(return_value=self.PROXY_ADDR)
+        executor.get_proxy_usdc_balance = MagicMock(return_value=Decimal("100"))
+        executor.clob_client.get_wallet_token_ids.return_value = {self.TOK_RESOLVED}
+        executor.get_proxy_token_balance = MagicMock(return_value=50_000000)
+        executor.clob_client.get_market_by_token.return_value = {
+            "condition_id": "0x" + "a" * 64,
+            "closed": True,
+            "active": False,
+            "question": "Test?",
+        }
+        executor.conditional_tokens.functions.payoutDenominator.return_value.call.return_value = 1000000
+
+        mock_receipt = MagicMock()
+        mock_receipt.status = 1
+        mock_receipt.transactionHash.hex.return_value = "0xredeem789"
+        executor.redeem_via_proxy = MagicMock(return_value=mock_receipt)
+
+        results = executor.scan_and_redeem_proxy_portfolio()
+
+        redeemed = [r for r in results if r.get("status") == "redeemed"]
+        withdrawn = [r for r in results if r.get("status") == "withdrawn"]
+        self.assertEqual(len(redeemed), 1)
+        self.assertEqual(len(withdrawn), 0)  # no withdrawal
+
+    def test_no_trade_history_but_proxy_has_usdc(self):
+        """When no trades found but proxy holds USDC, still withdraws."""
+        executor = self._make_executor()
+        executor.discover_proxy_wallet = MagicMock(return_value=self.PROXY_ADDR)
+        executor.get_proxy_usdc_balance = MagicMock(return_value=Decimal("75"))
+        executor.clob_client.get_wallet_token_ids.return_value = set()
+
+        withdraw_receipt = MagicMock()
+        withdraw_receipt.status = 1
+        withdraw_receipt.transactionHash.hex.return_value = "0xwithdraw_only"
+        executor.withdraw_usdc_from_proxy = MagicMock(return_value=withdraw_receipt)
+
+        results = executor.scan_and_redeem_proxy_portfolio()
+
+        withdrawn = [r for r in results if r.get("status") == "withdrawn"]
+        self.assertEqual(len(withdrawn), 1)
+        self.assertAlmostEqual(withdrawn[0]["amount_usdc"], 75.0, places=1)
+
+
+class TestProxyConfig(unittest.TestCase):
+    """Test proxy-related configuration defaults and env var overrides."""
+
+    def test_default_config_has_proxy_settings(self):
+        self.assertTrue(bot.DEFAULT_CONFIG.get("proxy_redeem", False))
+        self.assertTrue(bot.DEFAULT_CONFIG.get("proxy_withdraw", False))
+
+    def test_proxy_factory_address_is_set(self):
+        self.assertTrue(bot.PROXY_FACTORY_ADDRESS.startswith("0x"))
+        self.assertEqual(len(bot.PROXY_FACTORY_ADDRESS), 42)
+
+    def test_proxy_factory_abi_has_getProxy(self):
+        names = [entry.get("name") for entry in bot.PROXY_FACTORY_ABI]
+        self.assertIn("getProxy", names)
+
+    def test_proxy_wallet_abi_has_execute(self):
+        names = [entry.get("name") for entry in bot.PROXY_WALLET_ABI]
+        self.assertIn("execute", names)
+
+
 if __name__ == "__main__":
     unittest.main()
