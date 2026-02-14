@@ -196,25 +196,25 @@ class TestPlaceOrderMinSize(unittest.TestCase):
         self.assertEqual(self._get_order_amount(client), 4.5)
 
     def test_small_notional_bumped(self):
-        """When USDC < $1 notional minimum, bumped to $1."""
+        """When USDC < $1.05 notional minimum, bumped to $1.05."""
         client = self._make_client()
-        # $0.30 USDC at price 0.05 -> effective = max(0.30, 0.25, 1.0) = $1.0
+        # $0.30 USDC at price 0.05 -> effective = max(0.30, 0.25, 1.05) = $1.05
         client.place_order("token1", "BUY", 0.30, 0.05)
-        self.assertEqual(self._get_order_amount(client), 1.0)
+        self.assertEqual(self._get_order_amount(client), 1.05)
 
     def test_both_minimums_token_wins(self):
         """When both minimums trigger, the larger USDC requirement wins."""
         client = self._make_client()
-        # $0.50 at price 0.80 -> effective = max(0.50, 4.0, 1.0) = $4.0
+        # $0.50 at price 0.80 -> effective = max(0.50, 4.0, 1.05) = $4.0
         client.place_order("token1", "BUY", 0.50, 0.80)
         self.assertEqual(self._get_order_amount(client), 4.0)
 
     def test_both_minimums_notional_wins(self):
         """When notional minimum requires more USDC than token minimum."""
         client = self._make_client()
-        # $0.50 at price 0.10 -> effective = max(0.50, 0.50, 1.0) = $1.0
+        # $0.50 at price 0.10 -> effective = max(0.50, 0.50, 1.05) = $1.05
         client.place_order("token1", "BUY", 0.50, 0.10)
-        self.assertEqual(self._get_order_amount(client), 1.0)
+        self.assertEqual(self._get_order_amount(client), 1.05)
 
     def test_zero_price_returns_none(self):
         """Price of 0 should return None, not divide by zero."""
@@ -368,7 +368,7 @@ class TestTradeExecutorDryRun(unittest.TestCase):
         """copy_amount is bumped to min viable USDC before order placement."""
         executor = self._make_executor(dry_run=True)
         # Small original trade: 50% of $0.10 = $0.05
-        # Price 0.80 → min viable = max(5*0.80, 1.0) = $4.00
+        # Price 0.80 → min viable = max(5*0.80, 1.05) = $4.00
         # Balance is $1000, so bump should succeed
         result = executor.execute_copy_trade({
             "side": "BUY",
@@ -383,7 +383,7 @@ class TestTradeExecutorDryRun(unittest.TestCase):
     def test_min_viable_skips_when_balance_insufficient(self):
         """Skip trade when min viable USDC exceeds available balance."""
         # Balance = $2.00 → 95% = $1.90
-        # Price 0.80 → min viable = $4.00 > $1.90 → skip
+        # Price 0.80 → min viable = max(5*0.80, 1.05) = $4.00 > $1.90 → skip
         executor = self._make_executor(dry_run=False)
         executor.get_usdc_balance = MagicMock(return_value=Decimal("2.0"))
         result = executor.execute_copy_trade({

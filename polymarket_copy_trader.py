@@ -88,7 +88,7 @@ CONDITIONAL_TOKENS_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 
 # Polymarket minimum order constraints
 MIN_ORDER_SIZE_TOKENS = 5    # minimum outcome tokens per order
-MIN_ORDER_NOTIONAL_USDC = 1.0  # minimum USDC notional for marketable orders
+MIN_ORDER_NOTIONAL_USDC = 1.05  # slightly above $1 to stay above min after fees
 
 # Polymarket CLOB API base URL
 CLOB_API_BASE = "https://clob.polymarket.com"
