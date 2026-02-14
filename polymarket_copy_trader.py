@@ -1351,16 +1351,28 @@ class TradeExecutor:
 
         results = []
         active_seeded = 0
+        zero_balance_count = 0
+        no_market_count = 0
+        error_count = 0
 
         for token_id in token_ids:
             try:
                 # 2. Look up market info to get condition_id and neg_risk
                 market = self.clob_client.get_market_by_token(token_id)
                 if not market:
+                    no_market_count += 1
+                    self.logger.debug(
+                        "No market info found for token %s", token_id[:16] + "...",
+                    )
                     continue
 
                 condition_id = market.get("condition_id")
                 if not condition_id:
+                    self.logger.debug(
+                        "No condition_id for token %s (%s)",
+                        token_id[:16] + "...",
+                        market.get("question", "?")[:40],
+                    )
                     continue
 
                 neg_risk = self._is_neg_risk_market(market)
@@ -1371,6 +1383,7 @@ class TradeExecutor:
                 )
 
                 if ct_balance == 0:
+                    zero_balance_count += 1
                     continue
 
                 # 4. On-chain resolution check (authoritative).
@@ -1447,15 +1460,18 @@ class TradeExecutor:
                     })
 
             except Exception as exc:
-                self.logger.debug(
+                error_count += 1
+                self.logger.info(
                     "Error scanning token %s: %s", token_id[:16] + "...", exc,
                 )
 
         redeemed = sum(1 for r in results if r["status"] == "redeemed")
         self.logger.info(
-            "Portfolio scan complete: %d resolved position(s) processed, "
-            "%d redeemed, %d active position(s) loaded for monitoring",
-            len(results), redeemed, active_seeded,
+            "Portfolio scan complete: %d token(s) scanned — "
+            "%d zero-balance, %d no-market-info, %d error(s), "
+            "%d resolved (%d redeemed), %d active seeded",
+            len(token_ids), zero_balance_count, no_market_count,
+            error_count, len(results), redeemed, active_seeded,
         )
         return results
 
@@ -1852,6 +1868,11 @@ class TradeExecutor:
                 Web3.keccak(text="Deploy(address,address)").hex(),
             ]
 
+        # Approximate deployment blocks on Polygon:
+        #   Legacy Proxy Factory: ~20M    Safe Proxy Factory: ~40M
+        # Use a conservative start to avoid missing early deployments.
+        start_block = 20_000_000
+
         try:
             latest_block = self.w3.eth.block_number
             self.logger.info(
@@ -1969,6 +1990,9 @@ class TradeExecutor:
 
         # 1. Manual config override — most reliable
         cfg_addr = self.cfg.get("proxy_address", "")
+        env_addr = os.environ.get("PROXY_ADDRESS", "").strip()
+        if env_addr and env_addr.startswith("0x") and len(env_addr) == 42:
+            cfg_addr = env_addr
         if cfg_addr and cfg_addr.startswith("0x") and len(cfg_addr) == 42:
             addr = Web3.to_checksum_address(cfg_addr)
             self.logger.info("Using configured proxy address: %s", addr)
@@ -1977,6 +2001,11 @@ class TradeExecutor:
             self._proxy_address = addr
             self._proxy_discovery_done = True
             return addr
+
+        self.logger.info(
+            "No proxy_address in config (got %r) — trying auto-discovery...",
+            self.cfg.get("proxy_address", ""),
+        )
 
         # 2. Polymarket profile API — fast, no auth needed
         self.logger.info(
@@ -2294,25 +2323,18 @@ class TradeExecutor:
                 if ct_balance == 0:
                     continue
 
-                is_closed = (
-                    market.get("closed") is True
-                    or str(market.get("closed", "")).lower() == "true"
-                    or market.get("active") is False
-                    or str(market.get("active", "")).lower() == "false"
-                )
-                if not is_closed:
-                    self.logger.info(
-                        "Proxy holds active position: token %s, balance %d, neg_risk=%s",
-                        token_id[:16] + "...", ct_balance, neg_risk,
-                    )
-                    continue
-
-                # Verify on-chain resolution
+                # On-chain resolution check (authoritative signal).
+                # payoutDenominator > 0 means the oracle has reported —
+                # the market IS resolved even if the API still shows "active".
                 cond_bytes = bytes.fromhex(condition_id.replace("0x", ""))
                 payout_denom = self.conditional_tokens.functions.payoutDenominator(
                     cond_bytes
                 ).call()
                 if payout_denom == 0:
+                    self.logger.info(
+                        "Proxy holds active position: token %s, balance %d, neg_risk=%s",
+                        token_id[:16] + "...", ct_balance, neg_risk,
+                    )
                     continue
 
                 question = market.get("question", "unknown")

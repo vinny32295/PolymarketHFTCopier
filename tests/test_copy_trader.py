@@ -2221,7 +2221,7 @@ class TestScanAndRedeemProxyPortfolio(unittest.TestCase):
         self.assertEqual(withdrawn[0]["source"], "proxy_withdrawal")
 
     def test_skips_active_positions_in_proxy(self):
-        """Active (non-closed) positions in proxy are not redeemed."""
+        """Positions not resolved on-chain (payoutDenominator == 0) are not redeemed."""
         executor = self._make_executor()
         executor.discover_proxy_wallet = MagicMock(return_value=self.PROXY_ADDR)
         executor.get_proxy_usdc_balance = MagicMock(return_value=Decimal("0"))
@@ -2232,6 +2232,8 @@ class TestScanAndRedeemProxyPortfolio(unittest.TestCase):
             "closed": False,
             "active": True,
         }
+        # On-chain: oracle has NOT reported yet
+        executor.conditional_tokens.functions.payoutDenominator.return_value.call.return_value = 0
 
         results = executor.scan_and_redeem_proxy_portfolio()
         # No redemptions, no withdrawals (proxy balance is 0)
