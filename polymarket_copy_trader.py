@@ -77,8 +77,11 @@ CTF_EXCHANGE_ADDRESS = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 # Polymarket Neg Risk CTF Exchange
 NEG_RISK_CTF_EXCHANGE_ADDRESS = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
 
-# Neg Risk Adapter
+# Neg Risk Adapter (acts as oracle on ConditionalTokens for Neg Risk markets)
 NEG_RISK_ADAPTER_ADDRESS = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+
+# UMA CTF Adapter V2 on Polygon (oracle for standard/non-Neg-Risk markets)
+UMA_CTF_ADAPTER_ADDRESS = "0x6A9D222616C90FcA5754cd1333cFD9b7fb6a4F74"
 
 # USDC on Polygon (collateral token)
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
@@ -264,6 +267,14 @@ CONDITIONAL_TOKENS_ABI = json.loads("""[
     {"constant":true,"inputs":[{"name":"conditionId","type":"bytes32"}],
      "name":"payoutDenominator",
      "outputs":[{"name":"","type":"uint256"}],
+     "type":"function"},
+    {"constant":true,"inputs":[
+        {"name":"oracle","type":"address"},
+        {"name":"questionId","type":"bytes32"},
+        {"name":"outcomeSlotCount","type":"uint256"}],
+     "name":"getConditionId",
+     "outputs":[{"name":"","type":"bytes32"}],
+     "stateMutability":"pure",
      "type":"function"},
     {"constant":false,"inputs":[
         {"name":"collateralToken","type":"address"},
@@ -1389,20 +1400,17 @@ class TradeExecutor:
                     continue
 
                 # 4. On-chain resolution check (authoritative).
-                #    payoutDenominator > 0 means the oracle has reported —
-                #    the market IS resolved even if the API still says "active".
-                cond_bytes = bytes.fromhex(condition_id.replace("0x", ""))
-                payout_denom = self.conditional_tokens.functions.payoutDenominator(
-                    cond_bytes
-                ).call()
+                #    Tries the API's condition_id directly, then derives
+                #    the real CTF conditionId using known oracle addresses.
+                resolved_cid, payout_denom = self._resolve_condition_id(
+                    condition_id, neg_risk=neg_risk,
+                )
 
                 if payout_denom == 0:
                     # Not resolved on-chain — seed as active position
                     if token_id not in self._positions:
                         tokens = Decimal(ct_balance) / Decimal("1000000")
                         price = self.clob_client.get_last_trade_price(token_id)
-                        # Seed even without a price — use 0 as a fallback
-                        # so the position is tracked for future redemption.
                         entry_price = Decimal(str(price)) if price and price > 0 else Decimal("0")
                         self._positions[token_id] = {
                             "tokens": tokens,
@@ -1426,6 +1434,9 @@ class TradeExecutor:
                     continue
 
                 # 5. Market is resolved on-chain — redeem!
+                #    Use resolved_cid (may differ from the API's condition_id
+                #    if the API returned a questionId rather than the derived
+                #    CTF conditionId).
                 question = market.get("question", "unknown")
                 self.logger.info(
                     "REDEEM: Resolved position — token %s, "
@@ -1436,7 +1447,7 @@ class TradeExecutor:
                 if self.cfg.get("dry_run", False):
                     self.logger.info(
                         "[DRY RUN] Would redeem for condition %s",
-                        condition_id[:16] + "...",
+                        resolved_cid[:16] + "...",
                     )
                     results.append({
                         "status": "dry_run",
@@ -1445,7 +1456,7 @@ class TradeExecutor:
                     })
                     continue
 
-                tx = self._build_redeem_tx(condition_id, neg_risk=neg_risk)
+                tx = self._build_redeem_tx(resolved_cid, neg_risk=neg_risk)
 
                 receipt = self._sign_and_send(tx)
                 if receipt and receipt.status == 1:
@@ -1498,6 +1509,82 @@ class TradeExecutor:
             return neg.lower() in ("true", "1", "yes")
         # Also check neg_risk_market_id presence as a secondary signal
         return bool(market.get("neg_risk_market_id"))
+
+    def _derive_condition_id(self, oracle_address, question_id_hex):
+        """Compute the CTF conditionId on-chain via getConditionId.
+
+        conditionId = keccak256(abi.encodePacked(oracle, questionId, outcomeSlotCount))
+
+        Uses the ConditionalTokens contract's ``getConditionId`` pure
+        function so we don't need a local keccak library.
+        """
+        question_bytes = bytes.fromhex(question_id_hex.replace("0x", ""))
+        return self.conditional_tokens.functions.getConditionId(
+            Web3.to_checksum_address(oracle_address),
+            question_bytes,
+            2,  # outcomeSlotCount for binary markets
+        ).call()
+
+    def _resolve_condition_id(self, api_condition_id, neg_risk=False):
+        """Find the correct conditionId that has payoutDenominator > 0.
+
+        The Gamma API's ``condition_id`` field may be the raw questionId
+        rather than the derived CTF conditionId.  For Neg Risk markets
+        the oracle is the NegRiskAdapter; for standard markets it's the
+        UMA CTF Adapter.  This method tries the API value directly,
+        then falls back to deriving the conditionId with known oracles.
+
+        Returns ``(conditionId_hex, payout_denom)`` — the conditionId
+        string (with ``0x`` prefix) that resolved on-chain and its
+        payout denominator.  Returns ``(api_condition_id, 0)`` if
+        nothing resolved.
+        """
+        api_cond_bytes = bytes.fromhex(api_condition_id.replace("0x", ""))
+
+        # 1. Try the API's value directly
+        try:
+            pd = self.conditional_tokens.functions.payoutDenominator(
+                api_cond_bytes
+            ).call()
+            if pd > 0:
+                return api_condition_id, pd
+        except Exception:
+            pass
+
+        # 2. Derive conditionId with known oracle addresses.
+        #    The API's condition_id may be a questionId that needs to be
+        #    hashed with the oracle address to get the real CTF conditionId.
+        oracles = []
+        if neg_risk:
+            oracles.append(("NegRiskAdapter", NEG_RISK_ADAPTER_ADDRESS))
+        oracles.append(("UMA_CTF_Adapter", UMA_CTF_ADAPTER_ADDRESS))
+        if not neg_risk:
+            oracles.append(("NegRiskAdapter", NEG_RISK_ADAPTER_ADDRESS))
+
+        for label, oracle_addr in oracles:
+            try:
+                derived = self._derive_condition_id(oracle_addr, api_condition_id)
+                pd = self.conditional_tokens.functions.payoutDenominator(
+                    derived
+                ).call()
+                if pd > 0:
+                    derived_hex = "0x" + (
+                        derived.hex() if isinstance(derived, bytes)
+                        else derived.replace("0x", "")
+                    )
+                    self.logger.info(
+                        "Resolved conditionId via %s oracle: API gave %s, "
+                        "derived %s (payoutDenom=%d)",
+                        label,
+                        api_condition_id[:16] + "...",
+                        derived_hex[:16] + "...",
+                        pd,
+                    )
+                    return derived_hex, pd
+            except Exception:
+                pass
+
+        return api_condition_id, 0
 
     def _get_token_balance(self, owner, token_id, neg_risk=False):
         """Return the on-chain token balance, checking the right contract.
@@ -1601,14 +1688,12 @@ class TradeExecutor:
 
                 neg_risk = pos.get("neg_risk", self._is_neg_risk_market(market))
 
-                # 2. On-chain resolution check (authoritative source of truth).
-                #    payoutDenominator > 0 means the oracle has reported the
-                #    outcome — the market IS resolved even if the API still
-                #    shows it as "active".
-                cond_bytes = bytes.fromhex(condition_id.replace("0x", ""))
-                payout_denom = self.conditional_tokens.functions.payoutDenominator(
-                    cond_bytes
-                ).call()
+                # 2. On-chain resolution check.  Tries the API's
+                #    condition_id directly, then derives the real CTF
+                #    conditionId using known oracle addresses.
+                resolved_cid, payout_denom = self._resolve_condition_id(
+                    condition_id, neg_risk=neg_risk,
+                )
                 if payout_denom == 0:
                     continue
 
@@ -1629,7 +1714,7 @@ class TradeExecutor:
                     "REDEEM: Market resolved for token %s (condition %s, "
                     "neg_risk=%s) — redeeming %d conditional tokens",
                     token_id[:16] + "...",
-                    condition_id[:16] + "...",
+                    resolved_cid[:16] + "...",
                     neg_risk,
                     ct_balance,
                 )
@@ -1638,18 +1723,18 @@ class TradeExecutor:
                 if self.cfg.get("dry_run", False):
                     self.logger.info(
                         "[DRY RUN] Would redeem positions for condition %s",
-                        condition_id[:16] + "...",
+                        resolved_cid[:16] + "...",
                     )
                     results.append({
                         "status": "dry_run",
-                        "condition_id": condition_id,
+                        "condition_id": resolved_cid,
                         "token_id": token_id,
                         "balance": ct_balance,
                     })
                     continue
 
                 # 5. Build and send the redeemPositions transaction
-                tx = self._build_redeem_tx(condition_id, neg_risk=neg_risk)
+                tx = self._build_redeem_tx(resolved_cid, neg_risk=neg_risk)
 
                 receipt = self._sign_and_send(tx)
                 if receipt and receipt.status == 1:
@@ -2337,13 +2422,11 @@ class TradeExecutor:
                 if ct_balance == 0:
                     continue
 
-                # On-chain resolution check (authoritative signal).
-                # payoutDenominator > 0 means the oracle has reported —
-                # the market IS resolved even if the API still shows "active".
-                cond_bytes = bytes.fromhex(condition_id.replace("0x", ""))
-                payout_denom = self.conditional_tokens.functions.payoutDenominator(
-                    cond_bytes
-                ).call()
+                # On-chain resolution check — tries the API's condition_id
+                # directly, then derives the real CTF conditionId.
+                resolved_cid, payout_denom = self._resolve_condition_id(
+                    condition_id, neg_risk=neg_risk,
+                )
                 if payout_denom == 0:
                     self.logger.info(
                         "Proxy holds active position: token %s, balance %d, neg_risk=%s",
@@ -2361,7 +2444,7 @@ class TradeExecutor:
                 if self.cfg.get("dry_run", False):
                     self.logger.info(
                         "[DRY RUN] Would redeem proxy position for condition %s",
-                        condition_id[:16] + "...",
+                        resolved_cid[:16] + "...",
                     )
                     results.append({
                         "status": "dry_run",
@@ -2372,7 +2455,7 @@ class TradeExecutor:
                     continue
 
                 receipt = self.redeem_via_proxy(
-                    proxy_address, condition_id, neg_risk=neg_risk,
+                    proxy_address, resolved_cid, neg_risk=neg_risk,
                 )
                 if receipt and receipt.status == 1:
                     self.logger.info(
