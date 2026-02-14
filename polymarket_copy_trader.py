@@ -115,13 +115,30 @@ DATA_API_BASE = "https://data-api.polymarket.com"
 # address from the owner EOA.
 PROXY_FACTORY_ADDRESS = "0xaB45c5A4B0c941a2F231C04C3f49182e1A254052"
 
-# Minimal Proxy Factory ABI – getProxy(address) returns the proxy address
+# Minimal Proxy Factory ABI – multiple getter names tried in order;
+# also includes the Deploy event for event-log-based discovery.
 PROXY_FACTORY_ABI = json.loads("""[
     {"constant":true,
-     "inputs":[{"name":"owner","type":"address"}],
+     "inputs":[{"name":"","type":"address"}],
      "name":"getProxy",
      "outputs":[{"name":"","type":"address"}],
-     "type":"function"}
+     "type":"function"},
+    {"constant":true,
+     "inputs":[{"name":"","type":"address"}],
+     "name":"proxies",
+     "outputs":[{"name":"","type":"address"}],
+     "type":"function"},
+    {"constant":true,
+     "inputs":[{"name":"","type":"address"}],
+     "name":"proxyFor",
+     "outputs":[{"name":"","type":"address"}],
+     "type":"function"},
+    {"anonymous":false,
+     "inputs":[
+        {"indexed":true,"name":"deployer","type":"address"},
+        {"indexed":false,"name":"proxy","type":"address"}],
+     "name":"Deploy",
+     "type":"event"}
 ]""")
 
 # Minimal Proxy Wallet ABI – execute(address,uint256,bytes) forwards a
@@ -242,6 +259,7 @@ DEFAULT_CONFIG = {
     "auto_redeem_settled": True,
     "proxy_redeem": True,
     "proxy_withdraw": True,
+    "proxy_address": "",
 }
 
 
@@ -912,6 +930,10 @@ class TradeExecutor:
         self._open_orders = {}
         self._order_ttl = cfg.get("order_ttl_seconds", 300)
 
+        # Cached proxy wallet address (discovered once, reused)
+        self._proxy_address = None
+        self._proxy_discovery_done = False
+
         # Position tracker: token_id -> {tokens: Decimal, entry_price: Decimal}
         # Prevents selling tokens we never bought, caps sells to what we
         # actually hold, and enables take-profit / stop-loss exits.
@@ -1510,24 +1532,147 @@ class TradeExecutor:
     # ------------------------------------------------------------------
 
     def discover_proxy_wallet(self):
-        """Query the Polymarket Proxy Factory for this EOA's proxy address.
+        """Discover the Polymarket proxy wallet address for this EOA.
 
-        Returns the proxy address as a checksummed string, or ``None`` if
-        the EOA has no proxy deployed.
+        Tries multiple methods in order of reliability:
+        1. Config override (``proxy_address`` in config / ``PROXY_ADDRESS`` env).
+        2. Cached result from a previous call.
+        3. Factory view functions (``getProxy``, ``proxies``, ``proxyFor``).
+        4. Factory ``Deploy`` event logs (scans on-chain history).
+
+        Returns the proxy address as a checksummed string, or ``None``.
         """
+        # 0. Return cached result if we already discovered it
+        if self._proxy_discovery_done:
+            return self._proxy_address
+
+        zero_addr = "0x" + "0" * 40
+
+        # 1. Manual config override — most reliable
+        cfg_addr = self.cfg.get("proxy_address", "")
+        if cfg_addr and cfg_addr.startswith("0x") and len(cfg_addr) == 42:
+            addr = Web3.to_checksum_address(cfg_addr)
+            self.logger.info("Using configured proxy address: %s", addr)
+            self._proxy_address = addr
+            self._proxy_discovery_done = True
+            return addr
+
+        factory_addr = Web3.to_checksum_address(PROXY_FACTORY_ADDRESS)
+        factory = self.w3.eth.contract(
+            address=factory_addr, abi=PROXY_FACTORY_ABI,
+        )
+
+        # 2. Try factory view functions (different contracts use different names)
+        for fn_name in ("getProxy", "proxies", "proxyFor"):
+            try:
+                fn = getattr(factory.functions, fn_name)
+                result = fn(self.address).call()
+                if result and result != zero_addr:
+                    addr = Web3.to_checksum_address(result)
+                    self.logger.info(
+                        "Discovered proxy wallet via factory.%s: %s",
+                        fn_name, addr,
+                    )
+                    self._proxy_address = addr
+                    self._proxy_discovery_done = True
+                    return addr
+                self.logger.info(
+                    "Factory.%s returned zero address — trying next method",
+                    fn_name,
+                )
+            except Exception as exc:
+                self.logger.info(
+                    "Factory.%s call failed (%s) — trying next method",
+                    fn_name, exc,
+                )
+
+        # 3. Search factory event logs for Deploy(deployer, proxy)
+        self.logger.info(
+            "Searching factory event logs for proxy deployed by %s...",
+            self.address,
+        )
         try:
-            factory = self.w3.eth.contract(
-                address=Web3.to_checksum_address(PROXY_FACTORY_ADDRESS),
-                abi=PROXY_FACTORY_ABI,
+            # Polymarket launched on Polygon around block 25M (late 2022).
+            # Use a generous start block to keep the query manageable.
+            start_block = 25_000_000
+            latest_block = self.w3.eth.block_number
+
+            # Some RPC providers limit log range; paginate in 5M-block chunks
+            chunk_size = 5_000_000
+            for from_blk in range(start_block, latest_block + 1, chunk_size):
+                to_blk = min(from_blk + chunk_size - 1, latest_block)
+                try:
+                    logs = factory.events.Deploy.get_logs(
+                        fromBlock=from_blk,
+                        toBlock=to_blk,
+                        argument_filters={"deployer": self.address},
+                    )
+                    if logs:
+                        addr = Web3.to_checksum_address(logs[-1].args.proxy)
+                        self.logger.info(
+                            "Discovered proxy wallet via Deploy event: %s "
+                            "(block %d)", addr, logs[-1].blockNumber,
+                        )
+                        self._proxy_address = addr
+                        self._proxy_discovery_done = True
+                        return addr
+                except Exception as chunk_exc:
+                    self.logger.debug(
+                        "Event log chunk %d-%d failed: %s",
+                        from_blk, to_blk, chunk_exc,
+                    )
+        except Exception as evt_exc:
+            self.logger.info("Event-based proxy discovery failed: %s", evt_exc)
+
+        # 4. Brute-force: scan ALL factory logs and match by data
+        #    (handles non-indexed deployer parameter)
+        try:
+            self.logger.info(
+                "Trying raw log scan on factory for EOA %s...", self.address,
             )
-            proxy_addr = factory.functions.getProxy(self.address).call()
-            # A zero-address means no proxy has been deployed for this EOA
-            if proxy_addr and proxy_addr != "0x" + "0" * 40:
-                proxy_addr = Web3.to_checksum_address(proxy_addr)
-                self.logger.info("Discovered proxy wallet: %s", proxy_addr)
-                return proxy_addr
-        except Exception as exc:
-            self.logger.debug("Proxy factory query failed: %s", exc)
+            eoa_padded = "0x" + self.address[2:].lower().zfill(64)
+            start_block = 25_000_000
+            latest_block = self.w3.eth.block_number
+            for from_blk in range(start_block, latest_block + 1, chunk_size):
+                to_blk = min(from_blk + chunk_size - 1, latest_block)
+                try:
+                    logs = self.w3.eth.get_logs({
+                        "address": factory_addr,
+                        "fromBlock": from_blk,
+                        "toBlock": to_blk,
+                        "topics": [None, eoa_padded],
+                    })
+                    if logs:
+                        last_log = logs[-1]
+                        # Proxy address is in the data field (non-indexed param)
+                        if last_log.get("data") and len(last_log["data"]) >= 32:
+                            raw = last_log["data"]
+                            if isinstance(raw, bytes):
+                                raw = raw.hex()
+                            else:
+                                raw = raw.replace("0x", "")
+                            addr = Web3.to_checksum_address("0x" + raw[-40:])
+                            self.logger.info(
+                                "Discovered proxy wallet via raw log: %s", addr,
+                            )
+                            self._proxy_address = addr
+                            self._proxy_discovery_done = True
+                            return addr
+                except Exception as raw_exc:
+                    self.logger.debug(
+                        "Raw log chunk %d-%d failed: %s",
+                        from_blk, to_blk, raw_exc,
+                    )
+        except Exception as raw_evt_exc:
+            self.logger.info("Raw log proxy discovery failed: %s", raw_evt_exc)
+
+        self.logger.warning(
+            "Could not discover proxy wallet for EOA %s. "
+            "Set PROXY_ADDRESS env var or proxy_address in config.json "
+            "to provide it manually.",
+            self.address,
+        )
+        self._proxy_discovery_done = True  # don't retry every 5 min
         return None
 
     def get_proxy_usdc_balance(self, proxy_address):
@@ -1734,7 +1879,7 @@ class TradeExecutor:
                     })
 
             except Exception as exc:
-                self.logger.debug(
+                self.logger.info(
                     "Error scanning proxy token %s: %s", token_id[:16] + "...", exc,
                 )
 
@@ -2927,6 +3072,8 @@ def run_headless():
         cfg["proxy_redeem"] = os.environ["PROXY_REDEEM"].lower() in ("1", "true", "yes")
     if os.environ.get("PROXY_WITHDRAW"):
         cfg["proxy_withdraw"] = os.environ["PROXY_WITHDRAW"].lower() in ("1", "true", "yes")
+    if os.environ.get("PROXY_ADDRESS"):
+        cfg["proxy_address"] = os.environ["PROXY_ADDRESS"].strip()
 
     if not cfg.get("watched_addresses"):
         logger.error("No watched addresses configured. Set WATCHED_ADDRESSES env var or edit config.json.")

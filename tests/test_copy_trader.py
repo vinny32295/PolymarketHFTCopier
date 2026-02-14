@@ -1742,11 +1742,11 @@ class TestScanAndRedeemPortfolio(unittest.TestCase):
 
 
 class TestProxyWalletDiscovery(unittest.TestCase):
-    """Test proxy wallet discovery from factory contract."""
+    """Test proxy wallet discovery with multi-method fallback."""
 
-    PROXY_ADDR = "0x" + "P" * 40
+    PROXY_ADDR = "0x" + "Aa" * 20  # valid hex for checksum
 
-    def _make_executor(self):
+    def _make_executor(self, proxy_address=""):
         w3 = MagicMock()
         mock_account = MagicMock()
         mock_account.address = "0x" + "1" * 40
@@ -1769,6 +1769,7 @@ class TestProxyWalletDiscovery(unittest.TestCase):
         w3.eth.contract.side_effect = contract_factory
 
         cfg = dict(bot.DEFAULT_CONFIG)
+        cfg["proxy_address"] = proxy_address
         executor = bot.TradeExecutor(
             w3=w3,
             private_key="0x" + "a" * 64,
@@ -1787,9 +1788,17 @@ class TestProxyWalletDiscovery(unittest.TestCase):
         })
         return executor
 
-    def test_discover_proxy_returns_address(self):
+    def test_config_override_used_first(self):
+        """Manual proxy_address config skips all on-chain discovery."""
+        addr = "0x" + "ab" * 20
+        executor = self._make_executor(proxy_address=addr)
+        result = executor.discover_proxy_wallet()
+        self.assertEqual(result, addr)
+        # Should be cached
+        self.assertTrue(executor._proxy_discovery_done)
+
+    def test_discover_via_getProxy(self):
         executor = self._make_executor()
-        # Mock factory contract
         mock_factory = MagicMock()
         mock_factory.functions.getProxy.return_value.call.return_value = self.PROXY_ADDR
         executor.w3.eth.contract.side_effect = None
@@ -1797,23 +1806,52 @@ class TestProxyWalletDiscovery(unittest.TestCase):
 
         result = executor.discover_proxy_wallet()
         self.assertEqual(result, self.PROXY_ADDR)
+        self.assertTrue(executor._proxy_discovery_done)
 
-    def test_discover_proxy_zero_address_returns_none(self):
+    def test_falls_through_to_proxies_fn(self):
+        """When getProxy fails, tries the 'proxies' function."""
         executor = self._make_executor()
         mock_factory = MagicMock()
-        mock_factory.functions.getProxy.return_value.call.return_value = "0x" + "0" * 40
+        # getProxy fails
+        mock_factory.functions.getProxy.return_value.call.side_effect = Exception("no such fn")
+        # proxies succeeds
+        mock_factory.functions.proxies.return_value.call.return_value = self.PROXY_ADDR
         executor.w3.eth.contract.side_effect = None
         executor.w3.eth.contract.return_value = mock_factory
 
         result = executor.discover_proxy_wallet()
-        self.assertIsNone(result)
+        self.assertEqual(result, self.PROXY_ADDR)
 
-    def test_discover_proxy_exception_returns_none(self):
+    def test_caches_result(self):
+        """Second call returns cached result without querying again."""
         executor = self._make_executor()
-        executor.w3.eth.contract.side_effect = Exception("RPC error")
+        executor._proxy_address = self.PROXY_ADDR
+        executor._proxy_discovery_done = True
+
+        # Even if factory would fail, cached result is returned
+        executor.w3.eth.contract.side_effect = Exception("should not be called")
+        result = executor.discover_proxy_wallet()
+        self.assertEqual(result, self.PROXY_ADDR)
+
+    def test_all_methods_fail_returns_none(self):
+        """When all discovery methods fail, returns None and caches failure."""
+        executor = self._make_executor()
+        mock_factory = MagicMock()
+        # All function calls fail
+        mock_factory.functions.getProxy.return_value.call.side_effect = Exception("fail")
+        mock_factory.functions.proxies.return_value.call.side_effect = Exception("fail")
+        mock_factory.functions.proxyFor.return_value.call.side_effect = Exception("fail")
+        # Event logs fail
+        mock_factory.events.Deploy.get_logs.side_effect = Exception("fail")
+        executor.w3.eth.contract.side_effect = None
+        executor.w3.eth.contract.return_value = mock_factory
+        executor.w3.eth.block_number = 50_000_000
+        executor.w3.eth.get_logs.side_effect = Exception("fail")
 
         result = executor.discover_proxy_wallet()
         self.assertIsNone(result)
+        # Should cache the failure to avoid retrying every 5 min
+        self.assertTrue(executor._proxy_discovery_done)
 
 
 class TestProxyBalances(unittest.TestCase):
@@ -2192,14 +2230,21 @@ class TestProxyConfig(unittest.TestCase):
     def test_default_config_has_proxy_settings(self):
         self.assertTrue(bot.DEFAULT_CONFIG.get("proxy_redeem", False))
         self.assertTrue(bot.DEFAULT_CONFIG.get("proxy_withdraw", False))
+        self.assertEqual(bot.DEFAULT_CONFIG.get("proxy_address"), "")
 
     def test_proxy_factory_address_is_set(self):
         self.assertTrue(bot.PROXY_FACTORY_ADDRESS.startswith("0x"))
         self.assertEqual(len(bot.PROXY_FACTORY_ADDRESS), 42)
 
-    def test_proxy_factory_abi_has_getProxy(self):
+    def test_proxy_factory_abi_has_multiple_getters(self):
         names = [entry.get("name") for entry in bot.PROXY_FACTORY_ABI]
         self.assertIn("getProxy", names)
+        self.assertIn("proxies", names)
+        self.assertIn("proxyFor", names)
+
+    def test_proxy_factory_abi_has_deploy_event(self):
+        events = [e for e in bot.PROXY_FACTORY_ABI if e.get("type") == "event"]
+        self.assertTrue(any(e["name"] == "Deploy" for e in events))
 
     def test_proxy_wallet_abi_has_execute(self):
         names = [entry.get("name") for entry in bot.PROXY_WALLET_ABI]
