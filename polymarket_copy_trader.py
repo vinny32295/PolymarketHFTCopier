@@ -147,6 +147,7 @@ DEFAULT_CONFIG = {
     "clob_api_key": "",
     "clob_api_secret": "",
     "clob_api_passphrase": "",
+    "dry_run": False,
 }
 
 
@@ -815,6 +816,20 @@ class TradeExecutor:
                 original_size / Decimal("1000000"), price,
             )
 
+            # --- DRY RUN: log but do not execute ---
+            if self.cfg.get("dry_run", False):
+                self.logger.info(
+                    "[DRY RUN] Would %s %.2f USDC of token %s @ price %s",
+                    side, copy_amount, token_id[:20], price,
+                )
+                return {
+                    "status": "dry_run",
+                    "side": side,
+                    "amount_usdc": float(copy_amount),
+                    "token_id": token_id,
+                    "price": price,
+                }
+
             # Ensure USDC approval on the CTF Exchange
             raw_amount = int(copy_amount * Decimal("1000000"))
             self.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
@@ -1184,6 +1199,14 @@ class CopyTraderGUI:
             parent, text="Use Polymarket CLOB API (recommended)", variable=self.use_clob_var
         ).grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=3)
 
+        # Dry-run mode checkbox
+        row += 1
+        self.dry_run_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            parent, text="Dry Run Mode (detect trades but do NOT execute)",
+            variable=self.dry_run_var
+        ).grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=3)
+
         # --- CLOB API Credentials ---
         row += 1
         ttk.Separator(parent, orient=tk.HORIZONTAL).grid(
@@ -1274,6 +1297,7 @@ class CopyTraderGUI:
         self.slippage_entry.insert(0, str(self.cfg.get("slippage_tolerance_bps", 100)))
         self.poll_entry.insert(0, str(self.cfg.get("poll_interval_seconds", 10)))
         self.use_clob_var.set(self.cfg.get("use_clob_api", True))
+        self.dry_run_var.set(self.cfg.get("dry_run", False))
         # API credentials
         self.api_key_entry.insert(0, self.cfg.get("clob_api_key", ""))
         self.api_secret_entry.insert(0, self.cfg.get("clob_api_secret", ""))
@@ -1289,6 +1313,7 @@ class CopyTraderGUI:
         self.cfg["ws_rpc_url"] = self.ws_rpc_entry.get().strip()
         self.cfg["copy_percentage"] = self.copy_pct_var.get()
         self.cfg["use_clob_api"] = self.use_clob_var.get()
+        self.cfg["dry_run"] = self.dry_run_var.get()
         # API credentials
         self.cfg["clob_api_key"] = self.api_key_entry.get().strip()
         self.cfg["clob_api_secret"] = self.api_secret_entry.get().strip()
