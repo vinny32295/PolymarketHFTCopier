@@ -444,6 +444,7 @@ class PolymarketCLOBClient:
         self.session = requests.Session() if requests else None
         self.logger = logger or logging.getLogger("CopyTrader")
         self._last_trade_ids = {}  # address -> set of seen trade IDs
+        self._token_to_condition = {}  # token_id -> condition_id from activity
 
         # Authenticated CLOB client (py-clob-client SDK)
         self.clob_sdk = None
@@ -588,12 +589,54 @@ class PolymarketCLOBClient:
 
         Returns a market dict with fields like condition_id, closed,
         active, question, etc.  Returns None on failure.
+
+        Falls back to the CLOB SDK ``get_market(condition_id)`` when the
+        Gamma API returns empty results, using condition_ids cached from
+        the Data API activity feed.
         """
+        # Strategy 1: Gamma API with clob_token_ids
         url = f"{self.gamma_url}/markets"
         params = {"clob_token_ids": token_id}
         data = self._get_public(url, params=params)
         if data and isinstance(data, list) and len(data) > 0:
             return data[0]
+
+        # Strategy 2: CLOB SDK get_market using condition_id from activity cache
+        cached_cid = self._token_to_condition.get(token_id)
+        if cached_cid and self.clob_sdk:
+            try:
+                market = self.clob_sdk.get_market(cached_cid)
+                if market:
+                    self.logger.debug(
+                        "Gamma API empty for token %s — resolved via CLOB SDK "
+                        "with conditionId %s",
+                        token_id[:16] + "...", cached_cid[:16] + "...",
+                    )
+                    # Normalise: the CLOB SDK may return an object or dict;
+                    # ensure we always hand back a plain dict.
+                    if hasattr(market, "__dict__") and not isinstance(market, dict):
+                        market = vars(market)
+                    return market
+            except Exception as exc:
+                self.logger.debug(
+                    "CLOB SDK get_market(%s) failed: %s", cached_cid[:16] + "...", exc,
+                )
+
+        # Strategy 3: Gamma API with condition_id (may match different schema)
+        if cached_cid:
+            params = {"condition_id": cached_cid}
+            data = self._get_public(url, params=params)
+            if data and isinstance(data, list) and len(data) > 0:
+                self.logger.debug(
+                    "Gamma API empty for clob_token_ids but found via condition_id "
+                    "for token %s", token_id[:16] + "...",
+                )
+                return data[0]
+
+        self.logger.info(
+            "No market info for token %s (gamma empty, no CLOB fallback)",
+            token_id[:16] + "...",
+        )
         return None
 
     def get_wallet_token_ids(self, address, limit=200):
@@ -621,7 +664,12 @@ class PolymarketCLOBClient:
                 or trade.get("makerAssetId")
             )
             if tid:
-                token_ids.add(str(tid))
+                tid = str(tid)
+                token_ids.add(tid)
+                # Cache condition_id from activity for CLOB SDK fallback
+                cid = trade.get("conditionId") or trade.get("condition_id")
+                if cid and tid not in self._token_to_condition:
+                    self._token_to_condition[tid] = str(cid)
         return token_ids
 
     def get_order_book(self, token_id):

@@ -107,6 +107,7 @@ class TestCLOBClient(unittest.TestCase):
         client.session = MagicMock()
         client.logger = logger
         client._last_trade_ids = {}
+        client._token_to_condition = {}
         client.clob_sdk = None
         return client
 
@@ -166,6 +167,7 @@ class TestPlaceOrderMinSize(unittest.TestCase):
         client.session = MagicMock()
         client.logger = logger
         client._last_trade_ids = {}
+        client._token_to_condition = {}
         client.clob_sdk = MagicMock()
         client.clob_sdk.create_market_order.return_value = {"signed": True}
         client.clob_sdk.post_order.return_value = {"orderID": "test123"}
@@ -788,6 +790,7 @@ class TestCLOBClientOrderMethods(unittest.TestCase):
         client.session = MagicMock()
         client.logger = logger
         client._last_trade_ids = {}
+        client._token_to_condition = {}
         client.clob_sdk = MagicMock()
         return client
 
@@ -1603,6 +1606,7 @@ class TestGetMarketByToken(unittest.TestCase):
         client.session = MagicMock()
         client.logger = logger
         client._last_trade_ids = {}
+        client._token_to_condition = {}
         client.clob_sdk = None
         return client
 
@@ -1646,6 +1650,7 @@ class TestGetWalletTokenIds(unittest.TestCase):
         client.session = MagicMock()
         client.logger = logger
         client._last_trade_ids = {}
+        client._token_to_condition = {}
         client.clob_sdk = None
         return client
 
