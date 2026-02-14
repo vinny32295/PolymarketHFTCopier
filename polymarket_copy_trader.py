@@ -1576,6 +1576,163 @@ class TradeExecutor:
     # Proxy wallet discovery, redemption & withdrawal
     # ------------------------------------------------------------------
 
+    def _get_proxy_from_profile_api(self):
+        """Try to discover proxy address via Polymarket's public profile API.
+
+        Queries the Gamma API profile endpoint which maps an EOA to its
+        associated proxy/contract wallet.  No authentication needed.
+
+        Returns the proxy address as a checksummed string, or ``None``.
+        """
+        if not requests:
+            return None
+
+        address_variants = [
+            self.address.lower(),
+            Web3.to_checksum_address(self.address),
+        ]
+        proxy_keys = (
+            "proxyAddress", "proxy_address", "proxy", "proxyWallet",
+            "proxy_wallet", "contractAddress", "contract_address",
+            "polyAddress", "poly_address",
+        )
+
+        for addr_form in address_variants:
+            for base in (GAMMA_API_BASE, DATA_API_BASE):
+                url = f"{base}/profiles/{addr_form}"
+                try:
+                    resp = requests.get(url, timeout=10)
+                    if resp.status_code != 200:
+                        continue
+                    data = resp.json()
+                    if not isinstance(data, dict):
+                        continue
+                    for key in proxy_keys:
+                        val = data.get(key)
+                        if (
+                            val
+                            and isinstance(val, str)
+                            and val.startswith("0x")
+                            and len(val) == 42
+                        ):
+                            checksummed = Web3.to_checksum_address(val)
+                            zero = "0x" + "0" * 40
+                            if checksummed != zero:
+                                self.logger.info(
+                                    "Discovered proxy via profile API "
+                                    "(%s): %s",
+                                    base.split("//")[1].split(".")[0],
+                                    checksummed,
+                                )
+                                return checksummed
+                except Exception as exc:
+                    self.logger.debug(
+                        "Profile API probe %s failed: %s", url[:60], exc,
+                    )
+        return None
+
+    def _get_proxy_from_polygonscan(self):
+        """Try to discover proxy address via Polygonscan's free API.
+
+        Searches the EOA's outbound transaction history for calls to the
+        known proxy factory contracts.  When such a transaction is found,
+        checks its internal transactions for the created proxy address.
+
+        Returns the proxy address as a checksummed string, or ``None``.
+        """
+        if not requests:
+            return None
+
+        api_key = self.cfg.get("polygonscan_api_key", "")
+        api_url = "https://api.polygonscan.com/api"
+        factories = {
+            PROXY_FACTORY_ADDRESS.lower(): False,
+            SAFE_PROXY_FACTORY_ADDRESS.lower(): True,
+        }
+        zero = "0x" + "0" * 40
+
+        try:
+            params = {
+                "module": "account",
+                "action": "txlist",
+                "address": self.address,
+                "startblock": 0,
+                "endblock": 99999999,
+                "sort": "asc",
+            }
+            if api_key:
+                params["apikey"] = api_key
+            resp = requests.get(api_url, params=params, timeout=20)
+            data = resp.json()
+            if data.get("status") != "1" or not data.get("result"):
+                return None
+
+            for tx in data["result"]:
+                to_addr = (tx.get("to") or "").lower()
+                if to_addr not in factories:
+                    continue
+                tx_hash = tx.get("hash")
+                if not tx_hash:
+                    continue
+
+                # Found a factory call — look for the created contract
+                # in internal transactions
+                int_params = {
+                    "module": "account",
+                    "action": "txlistinternal",
+                    "txhash": tx_hash,
+                }
+                if api_key:
+                    int_params["apikey"] = api_key
+                int_resp = requests.get(
+                    api_url, params=int_params, timeout=15,
+                )
+                int_data = int_resp.json()
+                if int_data.get("status") == "1" and int_data.get("result"):
+                    for itx in int_data["result"]:
+                        ca = itx.get("contractAddress", "")
+                        if ca and ca != zero:
+                            addr = Web3.to_checksum_address(ca)
+                            is_safe = factories[to_addr]
+                            self.logger.info(
+                                "Discovered %s proxy via Polygonscan: "
+                                "%s (tx %s)",
+                                "Safe" if is_safe else "legacy",
+                                addr, tx_hash[:16] + "...",
+                            )
+                            return addr
+
+                # Also check receipt logs as fallback
+                try:
+                    receipt = self.w3.eth.get_transaction_receipt(tx_hash)
+                    for log in receipt.get("logs", []):
+                        topics = log.get("topics", [])
+                        if len(topics) >= 2:
+                            eoa_topic = "0x" + self.address[2:].lower().zfill(64)
+                            if topics[1].hex().lower() == eoa_topic.lower():
+                                raw_data = log.get("data", b"")
+                                raw_hex = (
+                                    raw_data.hex()
+                                    if isinstance(raw_data, bytes)
+                                    else raw_data.replace("0x", "")
+                                )
+                                if len(raw_hex) >= 40:
+                                    addr = Web3.to_checksum_address(
+                                        "0x" + raw_hex[-40:]
+                                    )
+                                    self.logger.info(
+                                        "Discovered proxy from factory tx "
+                                        "receipt: %s", addr,
+                                    )
+                                    return addr
+                except Exception:
+                    pass
+
+        except Exception as exc:
+            self.logger.debug("Polygonscan proxy search failed: %s", exc)
+
+        return None
+
     def _search_factory_events(self, factory_addr, is_safe=False):
         """Search a factory contract's event logs for a proxy deployed by this EOA.
 
@@ -1586,7 +1743,7 @@ class TradeExecutor:
         Returns the proxy address as a checksummed string, or ``None``.
         """
         eoa_padded = "0x" + self.address[2:].lower().zfill(64)
-        start_block = 25_000_000
+        start_block = 10_000_000
         chunk_size = 5_000_000
         label = "Safe" if is_safe else "legacy"
 
@@ -1639,9 +1796,10 @@ class TradeExecutor:
         Tries multiple methods in order of reliability:
         1. Config override (``proxy_address`` in config / ``PROXY_ADDRESS`` env).
         2. Cached result from a previous call.
-        3. Legacy Proxy Factory — view functions then event logs.
-        4. Safe Proxy Factory — event logs (``ProxyCreation``).
-        5. Raw topic-scan on both factories.
+        3. Polymarket profile API (Gamma / Data API).
+        4. Legacy Proxy Factory — view functions then event logs.
+        5. Safe Proxy Factory — event logs (``ProxyCreation``).
+        6. Polygonscan API — search EOA tx history for factory calls.
 
         Sets ``self._proxy_is_safe`` when the wallet comes from the Safe factory.
 
@@ -1664,13 +1822,24 @@ class TradeExecutor:
             self._proxy_discovery_done = True
             return addr
 
+        # 2. Polymarket profile API — fast, no auth needed
+        self.logger.info(
+            "Attempting proxy discovery via Polymarket profile API..."
+        )
+        api_result = self._get_proxy_from_profile_api()
+        if api_result:
+            self._proxy_is_safe = self._check_is_safe(api_result)
+            self._proxy_address = api_result
+            self._proxy_discovery_done = True
+            return api_result
+
         # ------ Legacy Proxy Factory ------
         factory_addr = Web3.to_checksum_address(PROXY_FACTORY_ADDRESS)
         factory = self.w3.eth.contract(
             address=factory_addr, abi=PROXY_FACTORY_ABI,
         )
 
-        # 2. Try legacy factory view functions
+        # 3. Try legacy factory view functions
         for fn_name in ("getProxy", "proxies", "proxyFor"):
             try:
                 fn = getattr(factory.functions, fn_name)
@@ -1695,7 +1864,7 @@ class TradeExecutor:
                     fn_name, exc,
                 )
 
-        # 3. Search legacy factory event logs
+        # 4. Search legacy factory event logs
         result = self._search_factory_events(PROXY_FACTORY_ADDRESS, is_safe=False)
         if result:
             self._proxy_is_safe = False
@@ -1704,7 +1873,7 @@ class TradeExecutor:
             return result
 
         # ------ Safe Proxy Factory ------
-        # 4. Search Safe factory event logs (ProxyCreation events)
+        # 5. Search Safe factory event logs (ProxyCreation events)
         self.logger.info(
             "Legacy factory had no results. Checking Safe Proxy Factory...",
         )
@@ -1719,6 +1888,19 @@ class TradeExecutor:
                 "Wallet is a Gnosis Safe — will use execTransaction for proxy ops",
             )
             return result
+
+        # ------ Polygonscan API fallback ------
+        # 6. Search EOA's tx history on Polygonscan for factory calls
+        self.logger.info(
+            "On-chain factory searches failed. "
+            "Trying Polygonscan API fallback...",
+        )
+        scan_result = self._get_proxy_from_polygonscan()
+        if scan_result:
+            self._proxy_is_safe = self._check_is_safe(scan_result)
+            self._proxy_address = scan_result
+            self._proxy_discovery_done = True
+            return scan_result
 
         self.logger.warning(
             "Could not discover proxy wallet for EOA %s. "
