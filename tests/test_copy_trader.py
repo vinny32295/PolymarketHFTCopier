@@ -1200,5 +1200,342 @@ class TestLowBalancePauseResume(unittest.TestCase):
         self.assertEqual(cfg["resume_threshold_usdc"], 250.0)
 
 
+class TestAutoRedeemSettled(unittest.TestCase):
+    """Test automatic redemption of settled (resolved) positions back to USDC."""
+
+    # Use realistic numeric token IDs (like real Polymarket ERC-1155 IDs)
+    TOK1 = "12345678901234567890"
+    TOK2 = "98765432109876543210"
+    TOK3 = "55555555555555555555"
+
+    def _make_executor(self, dry_run=False, auto_redeem=True):
+        w3 = MagicMock()
+        mock_account = MagicMock()
+        mock_account.address = "0x" + "1" * 40
+        w3.eth.account.from_key.return_value = mock_account
+
+        # Create separate mocks for each contract so we can configure them
+        # independently.
+        mock_usdc = MagicMock()
+        mock_ctf_exchange = MagicMock()
+        mock_conditional_tokens = MagicMock()
+
+        def contract_factory(address, abi):
+            addr = address.lower() if hasattr(address, "lower") else address
+            if addr == bot.USDC_ADDRESS.lower():
+                return mock_usdc
+            if addr == bot.CTF_EXCHANGE_ADDRESS.lower():
+                return mock_ctf_exchange
+            if addr == bot.CONDITIONAL_TOKENS_ADDRESS.lower():
+                return mock_conditional_tokens
+            return MagicMock()
+
+        w3.eth.contract.side_effect = contract_factory
+
+        cfg = dict(bot.DEFAULT_CONFIG)
+        cfg["dry_run"] = dry_run
+        cfg["auto_redeem_settled"] = auto_redeem
+
+        executor = bot.TradeExecutor(
+            w3=w3,
+            private_key="0x" + "a" * 64,
+            cfg=cfg,
+            logger=logging.getLogger("test_redeem"),
+        )
+        executor.get_usdc_balance = MagicMock(return_value=Decimal("500"))
+
+        # Re-assign contract references so tests can configure them
+        executor.conditional_tokens = mock_conditional_tokens
+        executor.usdc = mock_usdc
+        executor.ctf_exchange = mock_ctf_exchange
+
+        # Mock CLOB client with get_market_by_token
+        executor.clob_client = MagicMock()
+        executor.clob_client.clob_sdk = MagicMock()
+
+        # Mock _sign_and_send to avoid real blockchain interaction
+        executor._sign_and_send = MagicMock()
+        executor._base_tx_params = MagicMock(return_value={
+            "from": executor.address, "nonce": 0,
+            "maxFeePerGas": 100, "maxPriorityFeePerGas": 30,
+            "chainId": 137,
+        })
+
+        return executor
+
+    def test_no_positions_returns_empty(self):
+        executor = self._make_executor()
+        results = executor.check_and_redeem_settled()
+        self.assertEqual(results, [])
+
+    def test_no_clob_client_returns_empty(self):
+        executor = self._make_executor()
+        executor._positions[self.TOK1] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
+        executor.clob_client = None
+        results = executor.check_and_redeem_settled()
+        self.assertEqual(results, [])
+
+    def test_disabled_via_config_returns_empty(self):
+        """When auto_redeem_settled is False, redemption is skipped."""
+        executor = self._make_executor(auto_redeem=False)
+        executor._positions[self.TOK1] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
+        results = executor.check_and_redeem_settled()
+        self.assertEqual(results, [])
+
+    def test_skips_unresolved_market(self):
+        """Positions in active (non-closed) markets are not redeemed."""
+        executor = self._make_executor()
+        executor._positions[self.TOK1] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
+        executor.clob_client.get_market_by_token.return_value = {
+            "condition_id": "0x" + "a" * 64,
+            "closed": False,
+            "active": True,
+        }
+        results = executor.check_and_redeem_settled()
+        self.assertEqual(results, [])
+        self.assertIn(self.TOK1, executor._positions)
+
+    def test_skips_when_not_resolved_on_chain(self):
+        """Market closed in API but payoutDenominator == 0 on-chain."""
+        executor = self._make_executor()
+        executor._positions[self.TOK1] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
+        executor.clob_client.get_market_by_token.return_value = {
+            "condition_id": "0x" + "a" * 64,
+            "closed": True,
+            "active": False,
+        }
+        executor.conditional_tokens.functions.payoutDenominator.return_value.call.return_value = 0
+        results = executor.check_and_redeem_settled()
+        self.assertEqual(results, [])
+
+    def test_clears_stale_position_when_no_on_chain_balance(self):
+        """If market resolved but token balance is 0, clear the stale position."""
+        executor = self._make_executor()
+        executor._positions[self.TOK1] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
+        executor.clob_client.get_market_by_token.return_value = {
+            "condition_id": "0x" + "a" * 64,
+            "closed": True,
+            "active": False,
+        }
+        executor.conditional_tokens.functions.payoutDenominator.return_value.call.return_value = 1
+        executor.conditional_tokens.functions.balanceOf.return_value.call.return_value = 0
+        results = executor.check_and_redeem_settled()
+        self.assertEqual(results, [])
+        # Position should be cleared
+        self.assertNotIn(self.TOK1, executor._positions)
+
+    def test_successful_redemption(self):
+        """Full redemption flow: resolved market with tokens redeemed to USDC."""
+        executor = self._make_executor()
+        executor._positions[self.TOK1] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
+
+        executor.clob_client.get_market_by_token.return_value = {
+            "condition_id": "0x" + "a" * 64,
+            "closed": True,
+            "active": False,
+        }
+        executor.conditional_tokens.functions.payoutDenominator.return_value.call.return_value = 1000000
+        executor.conditional_tokens.functions.balanceOf.return_value.call.return_value = 10_000000
+        executor.conditional_tokens.functions.redeemPositions.return_value.build_transaction.return_value = {}
+
+        mock_receipt = MagicMock()
+        mock_receipt.status = 1
+        mock_receipt.transactionHash.hex.return_value = "0xabc123"
+        executor._sign_and_send.return_value = mock_receipt
+
+        results = executor.check_and_redeem_settled()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "redeemed")
+        self.assertEqual(results[0]["tx_hash"], "0xabc123")
+        # Position should be cleared
+        self.assertNotIn(self.TOK1, executor._positions)
+
+    def test_redemption_tx_failure_keeps_position(self):
+        """If the redemption tx reverts, position is kept for retry."""
+        executor = self._make_executor()
+        executor._positions[self.TOK1] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
+
+        executor.clob_client.get_market_by_token.return_value = {
+            "condition_id": "0x" + "a" * 64,
+            "closed": True,
+            "active": False,
+        }
+        executor.conditional_tokens.functions.payoutDenominator.return_value.call.return_value = 1000000
+        executor.conditional_tokens.functions.balanceOf.return_value.call.return_value = 10_000000
+        executor.conditional_tokens.functions.redeemPositions.return_value.build_transaction.return_value = {}
+
+        mock_receipt = MagicMock()
+        mock_receipt.status = 0  # reverted
+        executor._sign_and_send.return_value = mock_receipt
+
+        results = executor.check_and_redeem_settled()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "failed")
+        # Position should still exist for retry
+        self.assertIn(self.TOK1, executor._positions)
+
+    def test_dry_run_skips_transaction(self):
+        """In dry-run mode, redemption is logged but no tx is sent."""
+        executor = self._make_executor(dry_run=True)
+        executor._positions[self.TOK1] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
+
+        executor.clob_client.get_market_by_token.return_value = {
+            "condition_id": "0x" + "a" * 64,
+            "closed": True,
+            "active": False,
+        }
+        executor.conditional_tokens.functions.payoutDenominator.return_value.call.return_value = 1000000
+        executor.conditional_tokens.functions.balanceOf.return_value.call.return_value = 10_000000
+
+        results = executor.check_and_redeem_settled()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "dry_run")
+        # No transaction should have been sent
+        executor._sign_and_send.assert_not_called()
+        # Position should remain (dry run)
+        self.assertIn(self.TOK1, executor._positions)
+
+    def test_multiple_positions_redeemed(self):
+        """Multiple resolved positions are redeemed in one pass."""
+        executor = self._make_executor()
+        executor._positions[self.TOK1] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
+        executor._positions[self.TOK2] = {"tokens": Decimal("5"), "entry_price": Decimal("0.70")}
+        executor._positions[self.TOK3] = {"tokens": Decimal("8"), "entry_price": Decimal("0.40")}
+
+        def mock_market(token_id):
+            if token_id == self.TOK3:
+                return {"condition_id": "0x" + "c" * 64, "closed": False, "active": True}
+            return {
+                "condition_id": "0x" + "b" * 64,
+                "closed": True,
+                "active": False,
+            }
+
+        executor.clob_client.get_market_by_token.side_effect = mock_market
+        executor.conditional_tokens.functions.payoutDenominator.return_value.call.return_value = 1000000
+        executor.conditional_tokens.functions.balanceOf.return_value.call.return_value = 10_000000
+        executor.conditional_tokens.functions.redeemPositions.return_value.build_transaction.return_value = {}
+
+        mock_receipt = MagicMock()
+        mock_receipt.status = 1
+        mock_receipt.transactionHash.hex.return_value = "0xhash"
+        executor._sign_and_send.return_value = mock_receipt
+
+        results = executor.check_and_redeem_settled()
+
+        # TOK1 and TOK2 redeemed, TOK3 still active
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(r["status"] == "redeemed" for r in results))
+        self.assertNotIn(self.TOK1, executor._positions)
+        self.assertNotIn(self.TOK2, executor._positions)
+        self.assertIn(self.TOK3, executor._positions)
+
+    def test_gamma_api_failure_skips_gracefully(self):
+        """If the Gamma API returns None, the position is skipped."""
+        executor = self._make_executor()
+        executor._positions[self.TOK1] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
+        executor.clob_client.get_market_by_token.return_value = None
+
+        results = executor.check_and_redeem_settled()
+        self.assertEqual(results, [])
+        self.assertIn(self.TOK1, executor._positions)
+
+    def test_missing_condition_id_skips(self):
+        """If market data has no condition_id, skip gracefully."""
+        executor = self._make_executor()
+        executor._positions[self.TOK1] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
+        executor.clob_client.get_market_by_token.return_value = {
+            "closed": True,
+            "active": False,
+            # no condition_id
+        }
+        results = executor.check_and_redeem_settled()
+        self.assertEqual(results, [])
+
+    def test_zero_token_position_skipped(self):
+        """Position with 0 tokens should be skipped."""
+        executor = self._make_executor()
+        executor._positions[self.TOK1] = {"tokens": Decimal("0"), "entry_price": Decimal("0.50")}
+        results = executor.check_and_redeem_settled()
+        self.assertEqual(results, [])
+
+
+class TestAutoRedeemConfig(unittest.TestCase):
+    """Test auto_redeem_settled config and constants."""
+
+    def test_default_config_has_auto_redeem(self):
+        self.assertIn("auto_redeem_settled", bot.DEFAULT_CONFIG)
+        self.assertTrue(bot.DEFAULT_CONFIG["auto_redeem_settled"])
+
+    def test_redeem_check_interval_constant(self):
+        self.assertEqual(bot.REDEEM_CHECK_INTERVAL_SECONDS, 300)
+
+    def test_conditional_tokens_abi_is_valid(self):
+        self.assertIsInstance(bot.CONDITIONAL_TOKENS_ABI, list)
+        names = {item.get("name") for item in bot.CONDITIONAL_TOKENS_ABI}
+        self.assertIn("balanceOf", names)
+        self.assertIn("payoutDenominator", names)
+        self.assertIn("redeemPositions", names)
+
+    def test_env_var_override_auto_redeem(self):
+        """AUTO_REDEEM_SETTLED env var should override the config."""
+        cfg = dict(bot.DEFAULT_CONFIG)
+        with patch.dict(os.environ, {"AUTO_REDEEM_SETTLED": "false"}):
+            if os.environ.get("AUTO_REDEEM_SETTLED"):
+                cfg["auto_redeem_settled"] = os.environ["AUTO_REDEEM_SETTLED"].lower() in ("1", "true", "yes")
+        self.assertFalse(cfg["auto_redeem_settled"])
+
+        with patch.dict(os.environ, {"AUTO_REDEEM_SETTLED": "true"}):
+            if os.environ.get("AUTO_REDEEM_SETTLED"):
+                cfg["auto_redeem_settled"] = os.environ["AUTO_REDEEM_SETTLED"].lower() in ("1", "true", "yes")
+        self.assertTrue(cfg["auto_redeem_settled"])
+
+
+class TestGetMarketByToken(unittest.TestCase):
+    """Test PolymarketCLOBClient.get_market_by_token."""
+
+    def _make_client(self):
+        cfg = dict(bot.DEFAULT_CONFIG)
+        logger = logging.getLogger("test")
+        logger.handlers = [logging.NullHandler()]
+        client = bot.PolymarketCLOBClient.__new__(bot.PolymarketCLOBClient)
+        client.cfg = cfg
+        client.base_url = bot.CLOB_API_BASE
+        client.gamma_url = bot.GAMMA_API_BASE
+        client.data_url = bot.DATA_API_BASE
+        client.session = MagicMock()
+        client.logger = logger
+        client._last_trade_ids = {}
+        client.clob_sdk = None
+        return client
+
+    def test_returns_first_market(self):
+        client = self._make_client()
+        client._get_public = MagicMock(return_value=[
+            {"condition_id": "0xabc", "closed": True, "question": "Test market?"},
+        ])
+        result = client.get_market_by_token("token123")
+        self.assertEqual(result["condition_id"], "0xabc")
+        client._get_public.assert_called_once_with(
+            f"{bot.GAMMA_API_BASE}/markets",
+            params={"clob_token_ids": "token123"},
+        )
+
+    def test_returns_none_on_empty_response(self):
+        client = self._make_client()
+        client._get_public = MagicMock(return_value=[])
+        result = client.get_market_by_token("token123")
+        self.assertIsNone(result)
+
+    def test_returns_none_on_api_failure(self):
+        client = self._make_client()
+        client._get_public = MagicMock(return_value=None)
+        result = client.get_market_by_token("token123")
+        self.assertIsNone(result)
+
+
 if __name__ == "__main__":
     unittest.main()
