@@ -152,7 +152,7 @@ class TestCLOBClient(unittest.TestCase):
 
 
 class TestPlaceOrderMinSize(unittest.TestCase):
-    """Test minimum order size enforcement in place_order."""
+    """Test minimum order size enforcement and FOK order placement."""
 
     def _make_client(self):
         cfg = dict(bot.DEFAULT_CONFIG)
@@ -167,71 +167,77 @@ class TestPlaceOrderMinSize(unittest.TestCase):
         client.logger = logger
         client._last_trade_ids = {}
         client.clob_sdk = MagicMock()
-        # get_market returns no tick size info
-        client.clob_sdk.get_market.return_value = None
-        client.clob_sdk.create_and_post_order.return_value = {"orderID": "test123"}
+        client.clob_sdk.create_market_order.return_value = {"signed": True}
+        client.clob_sdk.post_order.return_value = {"orderID": "test123"}
         return client
 
-    def _get_order_size(self, client):
-        """Extract the size kwarg passed to the OrderArgs constructor."""
-        # OrderArgs is a MagicMock; inspect the kwargs of its last call
-        call_kwargs = bot.OrderArgs.call_args[1]
-        return call_kwargs["size"]
+    def _get_order_amount(self, client):
+        """Extract the amount (USDC) kwarg passed to MarketOrderArgs."""
+        call_kwargs = bot.MarketOrderArgs.call_args[1]
+        return call_kwargs["amount"]
+
+    def _get_order_type(self, client):
+        """Extract the order_type kwarg passed to MarketOrderArgs."""
+        call_kwargs = bot.MarketOrderArgs.call_args[1]
+        return call_kwargs["order_type"]
 
     def test_normal_size_not_bumped(self):
-        """When tokens >= 5 and USDC >= $1, size is not changed."""
+        """When USDC >= $1 and tokens >= 5, amount is not changed."""
         client = self._make_client()
-        # $5 USDC at price 0.50 = 10 tokens (>5, >$1 — no bump)
+        # $5 USDC at price 0.50 -> effective = max(5, 2.5, 1) = $5
         client.place_order("token1", "BUY", 5.0, 0.50)
-        self.assertEqual(self._get_order_size(client), 10.0)
+        self.assertEqual(self._get_order_amount(client), 5.0)
 
     def test_small_tokens_bumped(self):
-        """When tokens < 5, bumped to satisfy token minimum."""
+        """When tokens < 5, USDC amount bumped to cover 5 tokens."""
         client = self._make_client()
-        # $2 USDC at price 0.90 = 2.22 tokens (<5)
-        # min_usdc_for_tokens = 5 * 0.90 = $4.50 -> 5.0 tokens
+        # $2 USDC at price 0.90 -> effective = max(2, 4.5, 1) = $4.50
         client.place_order("token1", "BUY", 2.0, 0.90)
-        self.assertEqual(self._get_order_size(client), 5.0)
+        self.assertEqual(self._get_order_amount(client), 4.5)
 
     def test_small_notional_bumped(self):
         """When USDC < $1 notional minimum, bumped to $1."""
         client = self._make_client()
-        # $0.30 USDC at price 0.05 = 6 tokens (>5 ok, but $0.30 <$1)
-        # effective_usdc = max(0.30, 5*0.05=0.25, 1.0) = $1.0 -> 20 tokens
+        # $0.30 USDC at price 0.05 -> effective = max(0.30, 0.25, 1.0) = $1.0
         client.place_order("token1", "BUY", 0.30, 0.05)
-        self.assertEqual(self._get_order_size(client), 20.0)
+        self.assertEqual(self._get_order_amount(client), 1.0)
 
     def test_both_minimums_token_wins(self):
         """When both minimums trigger, the larger USDC requirement wins."""
         client = self._make_client()
-        # $0.50 USDC at price 0.80 = 0.625 tokens (<5, and $0.50 <$1)
-        # min_usdc_for_tokens = 5 * 0.80 = $4.00 > $1.00 -> token min wins
-        # effective_usdc = $4.00 -> 5.0 tokens
+        # $0.50 at price 0.80 -> effective = max(0.50, 4.0, 1.0) = $4.0
         client.place_order("token1", "BUY", 0.50, 0.80)
-        self.assertEqual(self._get_order_size(client), 5.0)
+        self.assertEqual(self._get_order_amount(client), 4.0)
 
     def test_both_minimums_notional_wins(self):
         """When notional minimum requires more USDC than token minimum."""
         client = self._make_client()
-        # $0.50 USDC at price 0.10 = 5 tokens (=5 ok, but $0.50 <$1)
-        # min_usdc_for_tokens = 5 * 0.10 = $0.50, notional = $1.00
-        # effective_usdc = max(0.50, 0.50, 1.0) = $1.00 -> 10 tokens
+        # $0.50 at price 0.10 -> effective = max(0.50, 0.50, 1.0) = $1.0
         client.place_order("token1", "BUY", 0.50, 0.10)
-        self.assertEqual(self._get_order_size(client), 10.0)
+        self.assertEqual(self._get_order_amount(client), 1.0)
 
     def test_zero_price_returns_none(self):
         """Price of 0 should return None, not divide by zero."""
         client = self._make_client()
         result = client.place_order("token1", "BUY", 5.0, 0.0)
         self.assertIsNone(result)
-        client.clob_sdk.create_and_post_order.assert_not_called()
+        client.clob_sdk.create_market_order.assert_not_called()
 
     def test_exact_minimum_not_bumped(self):
         """Exactly 5 tokens and >= $1 USDC should not be bumped."""
         client = self._make_client()
-        # $5 USDC at price 1.0 = 5 tokens (exactly min, $5 >$1)
+        # $5 USDC at price 1.0 -> effective = max(5, 5, 1) = $5.0
         client.place_order("token1", "BUY", 5.0, 1.0)
-        self.assertEqual(self._get_order_size(client), 5.0)
+        self.assertEqual(self._get_order_amount(client), 5.0)
+
+    def test_order_uses_fok_type(self):
+        """Orders should use Fill-or-Kill order type."""
+        client = self._make_client()
+        client.place_order("token1", "BUY", 5.0, 0.50)
+        self.assertEqual(self._get_order_type(client), bot.OrderType.FOK)
+        # post_order should also be called with FOK
+        post_kwargs = client.clob_sdk.post_order.call_args[1]
+        self.assertEqual(post_kwargs["orderType"], bot.OrderType.FOK)
 
 
 class TestTradeExecutorCopyAmount(unittest.TestCase):
