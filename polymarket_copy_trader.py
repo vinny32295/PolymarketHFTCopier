@@ -1354,6 +1354,7 @@ class TradeExecutor:
         zero_balance_count = 0
         no_market_count = 0
         error_count = 0
+        unresolved_no_price = 0
 
         for token_id in token_ids:
             try:
@@ -1373,6 +1374,7 @@ class TradeExecutor:
                         token_id[:16] + "...",
                         market.get("question", "?")[:40],
                     )
+                    no_market_count += 1
                     continue
 
                 neg_risk = self._is_neg_risk_market(market)
@@ -1397,18 +1399,29 @@ class TradeExecutor:
                 if payout_denom == 0:
                     # Not resolved on-chain — seed as active position
                     if token_id not in self._positions:
+                        tokens = Decimal(ct_balance) / Decimal("1000000")
                         price = self.clob_client.get_last_trade_price(token_id)
-                        if price and price > 0:
-                            tokens = Decimal(ct_balance) / Decimal("1000000")
-                            self._positions[token_id] = {
-                                "tokens": tokens,
-                                "entry_price": Decimal(str(price)),
-                                "neg_risk": neg_risk,
-                            }
-                            active_seeded += 1
+                        # Seed even without a price — use 0 as a fallback
+                        # so the position is tracked for future redemption.
+                        entry_price = Decimal(str(price)) if price and price > 0 else Decimal("0")
+                        self._positions[token_id] = {
+                            "tokens": tokens,
+                            "entry_price": entry_price,
+                            "neg_risk": neg_risk,
+                        }
+                        active_seeded += 1
+                        if entry_price > 0:
                             self.logger.info(
                                 "Discovered active position: %s (%.2f tokens @ $%.4f, neg_risk=%s)",
                                 token_id[:16] + "...", tokens, price, neg_risk,
+                            )
+                        else:
+                            unresolved_no_price += 1
+                            self.logger.info(
+                                "Discovered active position (no price available): %s "
+                                "(%.2f tokens, balance=%d, neg_risk=%s, question=%s)",
+                                token_id[:16] + "...", tokens, ct_balance, neg_risk,
+                                market.get("question", "?")[:50],
                             )
                     continue
 
@@ -1469,9 +1482,10 @@ class TradeExecutor:
         self.logger.info(
             "Portfolio scan complete: %d token(s) scanned — "
             "%d zero-balance, %d no-market-info, %d error(s), "
-            "%d resolved (%d redeemed), %d active seeded",
+            "%d resolved (%d redeemed), %d active seeded (%d without price)",
             len(token_ids), zero_balance_count, no_market_count,
             error_count, len(results), redeemed, active_seeded,
+            unresolved_no_price,
         )
         return results
 
