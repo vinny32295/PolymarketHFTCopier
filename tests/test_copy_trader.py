@@ -151,6 +151,62 @@ class TestCLOBClient(unittest.TestCase):
         self.assertEqual(len(new2), 0)
 
 
+class TestPlaceOrderMinSize(unittest.TestCase):
+    """Test minimum order size enforcement in place_order."""
+
+    def _make_client(self):
+        cfg = dict(bot.DEFAULT_CONFIG)
+        logger = logging.getLogger("test")
+        logger.handlers = []
+        logger.addHandler(logging.NullHandler())
+        client = bot.PolymarketCLOBClient.__new__(bot.PolymarketCLOBClient)
+        client.cfg = cfg
+        client.base_url = bot.CLOB_API_BASE
+        client.gamma_url = bot.GAMMA_API_BASE
+        client.session = MagicMock()
+        client.logger = logger
+        client._last_trade_ids = {}
+        client.clob_sdk = MagicMock()
+        # get_market returns no tick size info
+        client.clob_sdk.get_market.return_value = None
+        client.clob_sdk.create_and_post_order.return_value = {"orderID": "test123"}
+        return client
+
+    def _get_order_size(self, client):
+        """Extract the size kwarg passed to the OrderArgs constructor."""
+        # OrderArgs is a MagicMock; inspect the kwargs of its last call
+        call_kwargs = bot.OrderArgs.call_args[1]
+        return call_kwargs["size"]
+
+    def test_normal_size_not_bumped(self):
+        """When tokens >= 5, size is not changed."""
+        client = self._make_client()
+        # $5 USDC at price 0.50 = 10 tokens (>5, no bump needed)
+        client.place_order("token1", "BUY", 5.0, 0.50)
+        self.assertEqual(self._get_order_size(client), 10.0)
+
+    def test_small_size_bumped_to_minimum(self):
+        """When tokens < 5, size is bumped to MIN_ORDER_SIZE_TOKENS."""
+        client = self._make_client()
+        # $2 USDC at price 0.90 = 2.22 tokens (<5, should bump to 5)
+        client.place_order("token1", "BUY", 2.0, 0.90)
+        self.assertEqual(self._get_order_size(client), 5.0)
+
+    def test_zero_price_returns_none(self):
+        """Price of 0 should return None, not divide by zero."""
+        client = self._make_client()
+        result = client.place_order("token1", "BUY", 5.0, 0.0)
+        self.assertIsNone(result)
+        client.clob_sdk.create_and_post_order.assert_not_called()
+
+    def test_exact_minimum_not_bumped(self):
+        """Exactly 5 tokens should not be bumped."""
+        client = self._make_client()
+        # $5 USDC at price 1.0 = 5 tokens (exactly min, no bump)
+        client.place_order("token1", "BUY", 5.0, 1.0)
+        self.assertEqual(self._get_order_size(client), 5.0)
+
+
 class TestTradeExecutorCopyAmount(unittest.TestCase):
     """Test compute_copy_amount scaling logic."""
 

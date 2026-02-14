@@ -82,6 +82,9 @@ USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 # Conditional Tokens contract (Gnosis)
 CONDITIONAL_TOKENS_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 
+# Minimum order size in outcome tokens enforced by Polymarket
+MIN_ORDER_SIZE_TOKENS = 5
+
 # Polymarket CLOB API base URL
 CLOB_API_BASE = "https://clob.polymarket.com"
 
@@ -469,7 +472,26 @@ class PolymarketCLOBClient:
 
             # Build order arguments — size is in shares, not USDC
             # shares = usdc_amount / price_per_share
-            size_shares = round(size_usdc / price, 2) if price > 0 else 0
+            if price <= 0:
+                self.logger.error("Invalid price %s – cannot place order", price)
+                return None
+            size_shares = round(size_usdc / price, 2)
+
+            # Enforce Polymarket minimum order size (tokens)
+            actual_usdc = size_usdc
+            if size_shares < MIN_ORDER_SIZE_TOKENS:
+                self.logger.warning(
+                    "Calculated %.2f tokens < minimum %d; "
+                    "bumping to %d tokens (USDC spend: %.2f -> %.2f)",
+                    size_shares,
+                    MIN_ORDER_SIZE_TOKENS,
+                    MIN_ORDER_SIZE_TOKENS,
+                    size_usdc,
+                    MIN_ORDER_SIZE_TOKENS * price,
+                )
+                size_shares = float(MIN_ORDER_SIZE_TOKENS)
+                actual_usdc = size_shares * price
+
             order_args = OrderArgs(
                 token_id=token_id,
                 price=round(price, 2),
@@ -480,8 +502,8 @@ class PolymarketCLOBClient:
             signed_order = self.clob_sdk.create_and_post_order(order_args)
 
             self.logger.info(
-                "CLOB order placed: %s %.2f USDC @ %.4f for token %s",
-                side, size_usdc, price, token_id[:16] + "...",
+                "CLOB order placed: %s %.2f USDC (%.2f tokens) @ %.4f for token %s",
+                side, actual_usdc, size_shares, price, token_id[:16] + "...",
             )
             return signed_order
 
