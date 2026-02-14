@@ -274,8 +274,29 @@ CONDITIONAL_TOKENS_ABI = json.loads("""[
      "type":"function"}
 ]""")
 
+# Neg Risk Adapter ABI — handles wrapped conditional tokens for Neg Risk
+# markets.  Unlike the standard ConditionalTokens.redeemPositions, the
+# adapter's redeemPositions takes only (conditionId, indexSets) because the
+# collateral token and parent collection are managed internally.
+NEG_RISK_ADAPTER_ABI = json.loads("""[
+    {"constant":true,"inputs":[{"name":"owner","type":"address"},
+     {"name":"id","type":"uint256"}],
+     "name":"balanceOf","outputs":[{"name":"","type":"uint256"}],
+     "type":"function"},
+    {"constant":false,"inputs":[
+        {"name":"conditionId","type":"bytes32"},
+        {"name":"indexSets","type":"uint256[]"}],
+     "name":"redeemPositions","outputs":[],
+     "type":"function"}
+]""")
+
 # How often to check for redeemable (settled) positions (seconds)
 REDEEM_CHECK_INTERVAL_SECONDS = 300  # 5 minutes
+
+# How often to run the full portfolio scan (more expensive than the
+# periodic check_and_redeem_settled because it queries the Data API
+# for the wallet's complete trade history).
+PORTFOLIO_SCAN_INTERVAL_SECONDS = 900  # 15 minutes
 
 # Default config file path
 CONFIG_FILE = "config.json"
@@ -996,6 +1017,10 @@ class TradeExecutor:
             address=Web3.to_checksum_address(CONDITIONAL_TOKENS_ADDRESS),
             abi=CONDITIONAL_TOKENS_ABI,
         )
+        self.neg_risk_adapter = w3.eth.contract(
+            address=Web3.to_checksum_address(NEG_RISK_ADAPTER_ADDRESS),
+            abi=NEG_RISK_ADAPTER_ABI,
+        )
 
     def _get_nonce(self):
         with self._nonce_lock:
@@ -1277,19 +1302,25 @@ class TradeExecutor:
     # ------------------------------------------------------------------
 
     def scan_and_redeem_portfolio(self):
-        """Startup scan: discover ALL wallet positions and redeem resolved ones.
+        """Discover ALL wallet positions and redeem resolved ones.
 
-        Unlike ``check_and_redeem_settled`` (which only checks positions
-        acquired during the current session), this method queries the
-        Data API for the wallet's full trade history, checks on-chain
-        balances for every token ID ever traded, and:
+        Queries the Data API for the wallet's full trade history, checks
+        on-chain balances for every token ID ever traded, and:
 
-        * **Resolved markets** → calls ``redeemPositions`` to convert
-          winning tokens back to USDC immediately.
+        * **Resolved markets** (``payoutDenominator > 0`` on-chain) →
+          calls ``redeemPositions`` to convert winning tokens back to USDC.
         * **Active markets** → seeds ``_positions`` so the periodic
           ``check_and_redeem_settled`` can monitor them going forward.
 
-        Should be called once at startup after the executor is ready.
+        **On-chain resolution is the authoritative signal.**  The Gamma
+        API's ``closed``/``active`` flags are NOT required — the oracle's
+        ``payoutDenominator`` is checked for every position that has a
+        non-zero token balance.  This handles the common case where
+        Polymarket's UI/API still shows a position as "active" after
+        the underlying market has resolved.
+
+        Called at startup and also periodically to catch newly resolved
+        markets.
         """
         if not self.clob_client:
             self.logger.info("Portfolio scan skipped — no CLOB client")
@@ -1299,8 +1330,17 @@ class TradeExecutor:
 
         self.logger.info("Scanning wallet portfolio for redeemable positions...")
 
-        # 1. Discover token IDs from trade history
+        # 1. Discover token IDs from trade history (EOA + proxy)
         token_ids = self.clob_client.get_wallet_token_ids(self.address)
+
+        # Also check the proxy wallet's trade history to catch tokens
+        # that might have been traded through it.
+        proxy_addr = self.cfg.get("proxy_address", "")
+        if proxy_addr and proxy_addr.startswith("0x") and len(proxy_addr) == 42:
+            proxy_tokens = self.clob_client.get_wallet_token_ids(proxy_addr)
+            if proxy_tokens:
+                token_ids = token_ids | proxy_tokens
+
         if not token_ids:
             self.logger.info("No trade history found for wallet — portfolio scan done")
             return []
@@ -1314,15 +1354,7 @@ class TradeExecutor:
 
         for token_id in token_ids:
             try:
-                # 2. Check on-chain balance
-                ct_balance = self.conditional_tokens.functions.balanceOf(
-                    self.address, int(token_id)
-                ).call()
-
-                if ct_balance == 0:
-                    continue
-
-                # 3. Look up market info
+                # 2. Look up market info to get condition_id and neg_risk
                 market = self.clob_client.get_market_by_token(token_id)
                 if not market:
                     continue
@@ -1331,15 +1363,26 @@ class TradeExecutor:
                 if not condition_id:
                     continue
 
-                is_closed = (
-                    market.get("closed") is True
-                    or str(market.get("closed", "")).lower() == "true"
-                    or market.get("active") is False
-                    or str(market.get("active", "")).lower() == "false"
+                neg_risk = self._is_neg_risk_market(market)
+
+                # 3. Check on-chain balance (correct contract for market type)
+                ct_balance = self._get_token_balance(
+                    self.address, token_id, neg_risk=neg_risk,
                 )
 
-                if not is_closed:
-                    # Active market — seed into _positions for ongoing monitoring
+                if ct_balance == 0:
+                    continue
+
+                # 4. On-chain resolution check (authoritative).
+                #    payoutDenominator > 0 means the oracle has reported —
+                #    the market IS resolved even if the API still says "active".
+                cond_bytes = bytes.fromhex(condition_id.replace("0x", ""))
+                payout_denom = self.conditional_tokens.functions.payoutDenominator(
+                    cond_bytes
+                ).call()
+
+                if payout_denom == 0:
+                    # Not resolved on-chain — seed as active position
                     if token_id not in self._positions:
                         price = self.clob_client.get_last_trade_price(token_id)
                         if price and price > 0:
@@ -1347,28 +1390,21 @@ class TradeExecutor:
                             self._positions[token_id] = {
                                 "tokens": tokens,
                                 "entry_price": Decimal(str(price)),
+                                "neg_risk": neg_risk,
                             }
                             active_seeded += 1
                             self.logger.info(
-                                "Discovered active position: %s (%.2f tokens @ $%.4f)",
-                                token_id[:16] + "...", tokens, price,
+                                "Discovered active position: %s (%.2f tokens @ $%.4f, neg_risk=%s)",
+                                token_id[:16] + "...", tokens, price, neg_risk,
                             )
                     continue
 
-                # 4. Verify on-chain resolution
-                cond_bytes = bytes.fromhex(condition_id.replace("0x", ""))
-                payout_denom = self.conditional_tokens.functions.payoutDenominator(
-                    cond_bytes
-                ).call()
-                if payout_denom == 0:
-                    continue
-
-                # 5. Redeem
+                # 5. Market is resolved on-chain — redeem!
                 question = market.get("question", "unknown")
                 self.logger.info(
-                    "STARTUP REDEEM: Resolved position — token %s, "
-                    "question: %s, balance: %d",
-                    token_id[:16] + "...", question[:60], ct_balance,
+                    "REDEEM: Resolved position — token %s, "
+                    "question: %s, balance: %d, neg_risk: %s",
+                    token_id[:16] + "...", question[:60], ct_balance, neg_risk,
                 )
 
                 if self.cfg.get("dry_run", False):
@@ -1383,20 +1419,17 @@ class TradeExecutor:
                     })
                     continue
 
-                tx = self.conditional_tokens.functions.redeemPositions(
-                    Web3.to_checksum_address(USDC_ADDRESS),
-                    b"\x00" * 32,
-                    cond_bytes,
-                    [1, 2],
-                ).build_transaction(self._base_tx_params())
+                tx = self._build_redeem_tx(condition_id, neg_risk=neg_risk)
 
                 receipt = self._sign_and_send(tx)
                 if receipt and receipt.status == 1:
                     self.logger.info(
-                        "Startup redemption OK: tx %s — USDC returned to wallet",
+                        "Redemption OK: tx %s — USDC returned to wallet",
                         receipt.transactionHash.hex(),
                     )
                     self.invalidate_balance_cache()
+                    # Remove from position tracker if it was there
+                    self._positions.pop(token_id, None)
                     results.append({
                         "status": "redeemed",
                         "token_id": token_id,
@@ -1405,7 +1438,7 @@ class TradeExecutor:
                     })
                 else:
                     self.logger.warning(
-                        "Startup redemption tx failed for token %s",
+                        "Redemption tx failed for token %s",
                         token_id[:16] + "...",
                     )
                     results.append({
@@ -1426,16 +1459,87 @@ class TradeExecutor:
         )
         return results
 
+    def _is_neg_risk_market(self, market):
+        """Return True if the market uses the Neg Risk framework."""
+        neg = market.get("neg_risk")
+        if isinstance(neg, bool):
+            return neg
+        if isinstance(neg, str):
+            return neg.lower() in ("true", "1", "yes")
+        # Also check neg_risk_market_id presence as a secondary signal
+        return bool(market.get("neg_risk_market_id"))
+
+    def _get_token_balance(self, owner, token_id, neg_risk=False):
+        """Return the on-chain token balance, checking the right contract.
+
+        For standard markets, tokens live on the ConditionalTokens contract.
+        For Neg Risk markets, tokens are wrapped by the NegRiskAdapter.
+        Falls back to the other contract if the primary returns 0.
+        """
+        tid = int(token_id)
+        addr = Web3.to_checksum_address(owner)
+        if neg_risk:
+            # Neg Risk: check adapter first, then conditional tokens
+            try:
+                bal = self.neg_risk_adapter.functions.balanceOf(addr, tid).call()
+                if bal > 0:
+                    return bal
+            except Exception:
+                pass
+            try:
+                return self.conditional_tokens.functions.balanceOf(addr, tid).call()
+            except Exception:
+                return 0
+        else:
+            # Standard: check conditional tokens first, then adapter as fallback
+            try:
+                bal = self.conditional_tokens.functions.balanceOf(addr, tid).call()
+                if bal > 0:
+                    return bal
+            except Exception:
+                pass
+            try:
+                return self.neg_risk_adapter.functions.balanceOf(addr, tid).call()
+            except Exception:
+                return 0
+
+    def _build_redeem_tx(self, condition_id, neg_risk=False):
+        """Build a redeemPositions transaction for the correct contract.
+
+        Standard markets: ConditionalTokens.redeemPositions(collateral, parent, cond, indexSets)
+        Neg Risk markets: NegRiskAdapter.redeemPositions(cond, indexSets)
+        """
+        cond_bytes = bytes.fromhex(condition_id.replace("0x", ""))
+        if neg_risk:
+            return self.neg_risk_adapter.functions.redeemPositions(
+                cond_bytes,
+                [1, 2],
+            ).build_transaction(self._base_tx_params())
+        else:
+            return self.conditional_tokens.functions.redeemPositions(
+                Web3.to_checksum_address(USDC_ADDRESS),
+                b"\x00" * 32,       # parentCollectionId (root)
+                cond_bytes,
+                [1, 2],             # both binary outcomes
+            ).build_transaction(self._base_tx_params())
+
     def check_and_redeem_settled(self):
         """Scan positions for resolved markets and redeem tokens back to USDC.
 
-        For each tracked position this method:
-        1. Queries the Gamma API to check if the market has resolved.
-        2. Verifies on-chain that the condition's payout denominator is
-           non-zero (meaning the oracle has reported the outcome).
+        Uses **on-chain resolution as the primary signal**.  For each tracked
+        position:
+
+        1. Looks up the market via Gamma API to get the condition_id and
+           neg_risk flag.
+        2. Checks on-chain ``payoutDenominator`` — if non-zero the oracle
+           has reported the outcome and the market IS resolved, regardless
+           of what the API's ``closed``/``active`` flags say.
         3. Checks the wallet's ERC-1155 balance of the conditional token.
-        4. Calls ``redeemPositions`` on the Conditional Tokens contract
-           to convert winning tokens back to USDC.
+        4. Calls ``redeemPositions`` on the appropriate contract.
+
+        This avoids the problem where Polymarket's API still shows a
+        position as "active" even though the market has already resolved
+        on-chain — a common situation that previously blocked redemption.
 
         Returns a list of result dicts (one per redeemed position).
         """
@@ -1452,45 +1556,36 @@ class TradeExecutor:
                 continue
 
             try:
-                # 1. Look up market via Gamma API
+                # 1. Look up market via Gamma API to get condition_id
                 market = self.clob_client.get_market_by_token(token_id)
                 if not market:
-                    continue
-
-                # Only proceed if the market is flagged as closed / resolved
-                is_closed = (
-                    market.get("closed") is True
-                    or str(market.get("closed", "")).lower() == "true"
-                    or market.get("active") is False
-                    or str(market.get("active", "")).lower() == "false"
-                )
-                if not is_closed:
                     continue
 
                 condition_id = market.get("condition_id")
                 if not condition_id:
                     self.logger.debug(
-                        "Resolved market for token %s has no condition_id, skipping",
+                        "Market for token %s has no condition_id, skipping",
                         token_id[:16] + "...",
                     )
                     continue
 
-                # 2. Verify on-chain that the oracle has finalised the result
+                neg_risk = pos.get("neg_risk", self._is_neg_risk_market(market))
+
+                # 2. On-chain resolution check (authoritative source of truth).
+                #    payoutDenominator > 0 means the oracle has reported the
+                #    outcome — the market IS resolved even if the API still
+                #    shows it as "active".
                 cond_bytes = bytes.fromhex(condition_id.replace("0x", ""))
                 payout_denom = self.conditional_tokens.functions.payoutDenominator(
                     cond_bytes
                 ).call()
                 if payout_denom == 0:
-                    self.logger.debug(
-                        "Condition %s not yet resolved on-chain, skipping",
-                        condition_id[:16] + "...",
-                    )
                     continue
 
                 # 3. Check on-chain balance of the conditional token
-                ct_balance = self.conditional_tokens.functions.balanceOf(
-                    self.address, int(token_id)
-                ).call()
+                ct_balance = self._get_token_balance(
+                    self.address, token_id, neg_risk=neg_risk,
+                )
                 if ct_balance == 0:
                     self.logger.info(
                         "Market resolved but no on-chain tokens for %s — "
@@ -1501,10 +1596,11 @@ class TradeExecutor:
                     continue
 
                 self.logger.info(
-                    "REDEEM: Market resolved for token %s (condition %s) — "
-                    "redeeming %d conditional tokens",
+                    "REDEEM: Market resolved for token %s (condition %s, "
+                    "neg_risk=%s) — redeeming %d conditional tokens",
                     token_id[:16] + "...",
                     condition_id[:16] + "...",
+                    neg_risk,
                     ct_balance,
                 )
 
@@ -1523,13 +1619,7 @@ class TradeExecutor:
                     continue
 
                 # 5. Build and send the redeemPositions transaction
-                #    indexSets [1, 2] covers both outcomes of a binary market.
-                tx = self.conditional_tokens.functions.redeemPositions(
-                    Web3.to_checksum_address(USDC_ADDRESS),
-                    b"\x00" * 32,       # parentCollectionId (root)
-                    cond_bytes,          # conditionId
-                    [1, 2],             # both binary outcomes
-                ).build_transaction(self._base_tx_params())
+                tx = self._build_redeem_tx(condition_id, neg_risk=neg_risk)
 
                 receipt = self._sign_and_send(tx)
                 if receipt and receipt.status == 1:
@@ -2082,24 +2172,34 @@ class TradeExecutor:
         ).build_transaction(self._base_tx_params())
         return self._sign_and_send(tx)
 
-    def redeem_via_proxy(self, proxy_address, condition_id):
+    def redeem_via_proxy(self, proxy_address, condition_id, neg_risk=False):
         """Redeem resolved positions held in the proxy wallet.
 
-        Encodes a ``redeemPositions`` call on the Conditional Tokens
-        contract and forwards it through the proxy's ``execute`` method.
+        Encodes a ``redeemPositions`` call and forwards it through the
+        proxy's ``execute`` method.  For Neg Risk markets the call goes
+        to the NegRiskAdapter; for standard markets it goes to the
+        ConditionalTokens contract.
         """
         cond_bytes = bytes.fromhex(condition_id.replace("0x", ""))
-        call_data = self.conditional_tokens.encodeABI(
-            fn_name="redeemPositions",
-            args=[
-                Web3.to_checksum_address(USDC_ADDRESS),
-                b"\x00" * 32,       # parentCollectionId (root)
-                cond_bytes,          # conditionId
-                [1, 2],             # both binary outcomes
-            ],
-        )
+        if neg_risk:
+            call_data = self.neg_risk_adapter.encodeABI(
+                fn_name="redeemPositions",
+                args=[cond_bytes, [1, 2]],
+            )
+            target = NEG_RISK_ADAPTER_ADDRESS
+        else:
+            call_data = self.conditional_tokens.encodeABI(
+                fn_name="redeemPositions",
+                args=[
+                    Web3.to_checksum_address(USDC_ADDRESS),
+                    b"\x00" * 32,       # parentCollectionId (root)
+                    cond_bytes,          # conditionId
+                    [1, 2],             # both binary outcomes
+                ],
+            )
+            target = CONDITIONAL_TOKENS_ADDRESS
         return self._execute_via_proxy(
-            proxy_address, CONDITIONAL_TOKENS_ADDRESS, call_data,
+            proxy_address, target, call_data,
         )
 
     def withdraw_usdc_from_proxy(self, proxy_address, amount=None):
@@ -2176,16 +2276,22 @@ class TradeExecutor:
         results = []
         for token_id in token_ids:
             try:
-                ct_balance = self.get_proxy_token_balance(proxy_address, token_id)
-                if ct_balance == 0:
-                    continue
-
+                # Look up market first to determine Neg Risk status
                 market = self.clob_client.get_market_by_token(token_id)
                 if not market:
                     continue
 
                 condition_id = market.get("condition_id")
                 if not condition_id:
+                    continue
+
+                neg_risk = self._is_neg_risk_market(market)
+
+                # Check token balance on the correct contract for the proxy
+                ct_balance = self._get_token_balance(
+                    proxy_address, token_id, neg_risk=neg_risk,
+                )
+                if ct_balance == 0:
                     continue
 
                 is_closed = (
@@ -2196,8 +2302,8 @@ class TradeExecutor:
                 )
                 if not is_closed:
                     self.logger.info(
-                        "Proxy holds active position: token %s, balance %d",
-                        token_id[:16] + "...", ct_balance,
+                        "Proxy holds active position: token %s, balance %d, neg_risk=%s",
+                        token_id[:16] + "...", ct_balance, neg_risk,
                     )
                     continue
 
@@ -2212,8 +2318,8 @@ class TradeExecutor:
                 question = market.get("question", "unknown")
                 self.logger.info(
                     "PROXY REDEEM: Resolved position — token %s, "
-                    "question: %s, proxy balance: %d",
-                    token_id[:16] + "...", question[:60], ct_balance,
+                    "question: %s, proxy balance: %d, neg_risk: %s",
+                    token_id[:16] + "...", question[:60], ct_balance, neg_risk,
                 )
 
                 if self.cfg.get("dry_run", False):
@@ -2229,7 +2335,9 @@ class TradeExecutor:
                     })
                     continue
 
-                receipt = self.redeem_via_proxy(proxy_address, condition_id)
+                receipt = self.redeem_via_proxy(
+                    proxy_address, condition_id, neg_risk=neg_risk,
+                )
                 if receipt and receipt.status == 1:
                     self.logger.info(
                         "Proxy redemption OK: tx %s — USDC now in proxy",
@@ -2431,6 +2539,17 @@ class TradeExecutor:
             )
             price = trade_info.get("price", 0.5)
 
+            # Detect whether this is a Neg Risk market (needed for correct
+            # exchange approval and later redemption).
+            neg_risk = False
+            if self.clob_client:
+                try:
+                    market = self.clob_client.get_market_by_token(token_id)
+                    if market:
+                        neg_risk = self._is_neg_risk_market(market)
+                except Exception:
+                    pass
+
             # --- Enforce Polymarket order minimums early ---
             # The CLOB API requires both ≥5 tokens AND ≥$1 USDC notional.
             # Compute the minimum viable USDC now so the balance cap and
@@ -2503,9 +2622,14 @@ class TradeExecutor:
                     "price": price,
                 }
 
-            # Ensure USDC approval on the CTF Exchange
+            # Ensure USDC approval on the correct exchange.
+            # Neg Risk markets use a different exchange contract.
             raw_amount = int(copy_amount * Decimal("1000000"))
             self.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
+            if neg_risk:
+                self.ensure_usdc_approval(
+                    NEG_RISK_CTF_EXCHANGE_ADDRESS, raw_amount,
+                )
 
             # Place order via the CLOB API (requires py-clob-client + API creds)
             if self.clob_client and self.clob_client.clob_sdk:
@@ -2549,10 +2673,12 @@ class TradeExecutor:
                             )
                             pos["tokens"] = total_tokens
                             pos["entry_price"] = avg_price
+                            pos["neg_risk"] = neg_risk
                         else:
                             self._positions[token_id] = {
                                 "tokens": tokens,
                                 "entry_price": Decimal(str(adjusted_price)),
+                                "neg_risk": neg_risk,
                             }
                     elif side == "SELL":
                         pos = self._positions.get(token_id)
@@ -2790,6 +2916,7 @@ class CopyTraderBot:
         _last_pause_log = 0  # timestamp of last "still paused" INFO log
         _last_redeem_check = 0  # timestamp of last settled-position redemption scan
         _last_proxy_check = 0   # timestamp of last proxy wallet redemption scan
+        _last_portfolio_scan = 0  # timestamp of last full portfolio scan
 
         while self.running:
             try:
@@ -2873,6 +3000,30 @@ class CopyTraderBot:
                     except Exception as redeem_exc:
                         self.logger.debug(
                             "Redemption check error: %s", redeem_exc,
+                        )
+
+                # --- Full portfolio scan (periodic) ---
+                # Re-scans the wallet's complete trade history to catch
+                # positions that resolved since the last check.  More
+                # expensive than check_and_redeem_settled (which only
+                # checks _positions dict) but catches positions that
+                # were missed or not tracked.
+                if (
+                    self.executor
+                    and self.cfg.get("auto_redeem_settled", True)
+                    and now - _last_portfolio_scan >= PORTFOLIO_SCAN_INTERVAL_SECONDS
+                ):
+                    _last_portfolio_scan = now
+                    try:
+                        scan_results = self.executor.scan_and_redeem_portfolio()
+                        if scan_results:
+                            self.logger.info(
+                                "Portfolio scan: %d position(s) processed",
+                                len(scan_results),
+                            )
+                    except Exception as scan_exc:
+                        self.logger.debug(
+                            "Portfolio scan error: %s", scan_exc,
                         )
 
                 # --- Proxy wallet redemption & withdrawal ---

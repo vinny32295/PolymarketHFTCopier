@@ -1219,6 +1219,9 @@ class TestAutoRedeemSettled(unittest.TestCase):
         mock_usdc = MagicMock()
         mock_ctf_exchange = MagicMock()
         mock_conditional_tokens = MagicMock()
+        mock_neg_risk_adapter = MagicMock()
+        # Default: neg risk adapter reports 0 balance (no wrapped tokens)
+        mock_neg_risk_adapter.functions.balanceOf.return_value.call.return_value = 0
 
         def contract_factory(address, abi):
             addr = address.lower() if hasattr(address, "lower") else address
@@ -1228,6 +1231,8 @@ class TestAutoRedeemSettled(unittest.TestCase):
                 return mock_ctf_exchange
             if addr == bot.CONDITIONAL_TOKENS_ADDRESS.lower():
                 return mock_conditional_tokens
+            if addr == bot.NEG_RISK_ADAPTER_ADDRESS.lower():
+                return mock_neg_risk_adapter
             return MagicMock()
 
         w3.eth.contract.side_effect = contract_factory
@@ -1248,6 +1253,7 @@ class TestAutoRedeemSettled(unittest.TestCase):
         executor.conditional_tokens = mock_conditional_tokens
         executor.usdc = mock_usdc
         executor.ctf_exchange = mock_ctf_exchange
+        executor.neg_risk_adapter = mock_neg_risk_adapter
 
         # Mock CLOB client with get_market_by_token
         executor.clob_client = MagicMock()
@@ -1283,7 +1289,7 @@ class TestAutoRedeemSettled(unittest.TestCase):
         self.assertEqual(results, [])
 
     def test_skips_unresolved_market(self):
-        """Positions in active (non-closed) markets are not redeemed."""
+        """Positions not resolved on-chain (payoutDenominator == 0) are not redeemed."""
         executor = self._make_executor()
         executor._positions[self.TOK1] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
         executor.clob_client.get_market_by_token.return_value = {
@@ -1291,6 +1297,8 @@ class TestAutoRedeemSettled(unittest.TestCase):
             "closed": False,
             "active": True,
         }
+        # On-chain: oracle has NOT reported yet
+        executor.conditional_tokens.functions.payoutDenominator.return_value.call.return_value = 0
         results = executor.check_and_redeem_settled()
         self.assertEqual(results, [])
         self.assertIn(self.TOK1, executor._positions)
@@ -1405,17 +1413,32 @@ class TestAutoRedeemSettled(unittest.TestCase):
         executor._positions[self.TOK2] = {"tokens": Decimal("5"), "entry_price": Decimal("0.70")}
         executor._positions[self.TOK3] = {"tokens": Decimal("8"), "entry_price": Decimal("0.40")}
 
+        cond_resolved = "0x" + "b" * 64
+        cond_active = "0x" + "c" * 64
+
         def mock_market(token_id):
             if token_id == self.TOK3:
-                return {"condition_id": "0x" + "c" * 64, "closed": False, "active": True}
+                return {"condition_id": cond_active, "closed": False, "active": True}
             return {
-                "condition_id": "0x" + "b" * 64,
+                "condition_id": cond_resolved,
                 "closed": True,
                 "active": False,
             }
 
         executor.clob_client.get_market_by_token.side_effect = mock_market
-        executor.conditional_tokens.functions.payoutDenominator.return_value.call.return_value = 1000000
+
+        # On-chain: TOK3's condition is NOT resolved, others are.
+        active_cond_bytes = bytes.fromhex(cond_active.replace("0x", ""))
+        payout_mock = MagicMock()
+        def payout_side_effect(cond_bytes):
+            result = MagicMock()
+            if cond_bytes == active_cond_bytes:
+                result.call.return_value = 0  # not resolved
+            else:
+                result.call.return_value = 1000000  # resolved
+            return result
+        executor.conditional_tokens.functions.payoutDenominator.side_effect = payout_side_effect
+
         executor.conditional_tokens.functions.balanceOf.return_value.call.return_value = 10_000000
         executor.conditional_tokens.functions.redeemPositions.return_value.build_transaction.return_value = {}
 
@@ -1426,7 +1449,7 @@ class TestAutoRedeemSettled(unittest.TestCase):
 
         results = executor.check_and_redeem_settled()
 
-        # TOK1 and TOK2 redeemed, TOK3 still active
+        # TOK1 and TOK2 redeemed, TOK3 still active (not resolved on-chain)
         self.assertEqual(len(results), 2)
         self.assertTrue(all(r["status"] == "redeemed" for r in results))
         self.assertNotIn(self.TOK1, executor._positions)
@@ -1603,6 +1626,9 @@ class TestScanAndRedeemPortfolio(unittest.TestCase):
         w3.eth.account.from_key.return_value = mock_account
 
         mock_conditional_tokens = MagicMock()
+        mock_neg_risk_adapter = MagicMock()
+        # Default: neg risk adapter reports 0 balance (no wrapped tokens)
+        mock_neg_risk_adapter.functions.balanceOf.return_value.call.return_value = 0
         w3.eth.contract.return_value = MagicMock()
 
         cfg = dict(bot.DEFAULT_CONFIG)
@@ -1617,6 +1643,7 @@ class TestScanAndRedeemPortfolio(unittest.TestCase):
         )
         executor.get_usdc_balance = MagicMock(return_value=Decimal("0.20"))
         executor.conditional_tokens = mock_conditional_tokens
+        executor.neg_risk_adapter = mock_neg_risk_adapter
 
         executor.clob_client = MagicMock()
         executor.clob_client.clob_sdk = MagicMock()
@@ -1654,6 +1681,9 @@ class TestScanAndRedeemPortfolio(unittest.TestCase):
             self.TOK_RESOLVED, self.TOK_ACTIVE, self.TOK_EMPTY,
         }
 
+        cond_resolved = "0x" + "a" * 64
+        cond_active = "0x" + "b" * 64
+
         # Token balance: resolved has 50M, active has 10M, empty has 0
         def mock_balance(addr, token_id):
             bal_mock = MagicMock()
@@ -1671,14 +1701,14 @@ class TestScanAndRedeemPortfolio(unittest.TestCase):
         def mock_market(token_id):
             if token_id == self.TOK_RESOLVED:
                 return {
-                    "condition_id": "0x" + "a" * 64,
+                    "condition_id": cond_resolved,
                     "closed": True,
                     "active": False,
                     "question": "Resolved market?",
                 }
             if token_id == self.TOK_ACTIVE:
                 return {
-                    "condition_id": "0x" + "b" * 64,
+                    "condition_id": cond_active,
                     "closed": False,
                     "active": True,
                     "question": "Active market?",
@@ -1688,8 +1718,18 @@ class TestScanAndRedeemPortfolio(unittest.TestCase):
         executor.clob_client.get_market_by_token.side_effect = mock_market
         executor.clob_client.get_last_trade_price.return_value = 0.65
 
-        # On-chain resolution check
-        executor.conditional_tokens.functions.payoutDenominator.return_value.call.return_value = 1000000
+        # On-chain: resolved market has payoutDenominator > 0,
+        # active market has payoutDenominator == 0 (not resolved yet)
+        active_cond_bytes = bytes.fromhex(cond_active.replace("0x", ""))
+        def payout_side_effect(cond_bytes):
+            result = MagicMock()
+            if cond_bytes == active_cond_bytes:
+                result.call.return_value = 0  # not resolved
+            else:
+                result.call.return_value = 1000000  # resolved
+            return result
+        executor.conditional_tokens.functions.payoutDenominator.side_effect = payout_side_effect
+
         executor.conditional_tokens.functions.redeemPositions.return_value.build_transaction.return_value = {}
 
         mock_receipt = MagicMock()
@@ -1944,6 +1984,9 @@ class TestProxyRedemptionAndWithdrawal(unittest.TestCase):
         mock_usdc = MagicMock()
         mock_ctf_exchange = MagicMock()
         mock_conditional_tokens = MagicMock()
+        mock_neg_risk_adapter = MagicMock()
+        # Default: neg risk adapter reports 0 balance (no wrapped tokens)
+        mock_neg_risk_adapter.functions.balanceOf.return_value.call.return_value = 0
 
         def contract_factory(address, abi):
             addr = address.lower() if hasattr(address, "lower") else address
@@ -1953,6 +1996,8 @@ class TestProxyRedemptionAndWithdrawal(unittest.TestCase):
                 return mock_ctf_exchange
             if addr == bot.CONDITIONAL_TOKENS_ADDRESS.lower():
                 return mock_conditional_tokens
+            if addr == bot.NEG_RISK_ADAPTER_ADDRESS.lower():
+                return mock_neg_risk_adapter
             return MagicMock()
 
         w3.eth.contract.side_effect = contract_factory
@@ -1971,6 +2016,7 @@ class TestProxyRedemptionAndWithdrawal(unittest.TestCase):
         executor.conditional_tokens = mock_conditional_tokens
         executor.usdc = mock_usdc
         executor.ctf_exchange = mock_ctf_exchange
+        executor.neg_risk_adapter = mock_neg_risk_adapter
         executor.clob_client = MagicMock()
         executor.clob_client.clob_sdk = MagicMock()
         executor._sign_and_send = MagicMock()
@@ -2069,6 +2115,9 @@ class TestScanAndRedeemProxyPortfolio(unittest.TestCase):
         mock_usdc = MagicMock()
         mock_ctf_exchange = MagicMock()
         mock_conditional_tokens = MagicMock()
+        mock_neg_risk_adapter = MagicMock()
+        # Default: neg risk adapter reports 0 balance (no wrapped tokens)
+        mock_neg_risk_adapter.functions.balanceOf.return_value.call.return_value = 0
 
         def contract_factory(address, abi):
             addr = address.lower() if hasattr(address, "lower") else address
@@ -2078,6 +2127,8 @@ class TestScanAndRedeemProxyPortfolio(unittest.TestCase):
                 return mock_ctf_exchange
             if addr == bot.CONDITIONAL_TOKENS_ADDRESS.lower():
                 return mock_conditional_tokens
+            if addr == bot.NEG_RISK_ADAPTER_ADDRESS.lower():
+                return mock_neg_risk_adapter
             return MagicMock()
 
         w3.eth.contract.side_effect = contract_factory
@@ -2096,6 +2147,7 @@ class TestScanAndRedeemProxyPortfolio(unittest.TestCase):
         executor.conditional_tokens = mock_conditional_tokens
         executor.usdc = mock_usdc
         executor.ctf_exchange = mock_ctf_exchange
+        executor.neg_risk_adapter = mock_neg_risk_adapter
         executor.clob_client = MagicMock()
         executor.clob_client.clob_sdk = MagicMock()
         executor._sign_and_send = MagicMock()
@@ -2132,8 +2184,8 @@ class TestScanAndRedeemProxyPortfolio(unittest.TestCase):
 
         executor.clob_client.get_wallet_token_ids.return_value = {self.TOK_RESOLVED}
 
-        # Mock proxy token balance
-        executor.get_proxy_token_balance = MagicMock(return_value=30_000000)
+        # Mock proxy token balance on conditional tokens contract
+        executor.conditional_tokens.functions.balanceOf.return_value.call.return_value = 30_000000
 
         executor.clob_client.get_market_by_token.return_value = {
             "condition_id": "0x" + "a" * 64,
@@ -2174,7 +2226,7 @@ class TestScanAndRedeemProxyPortfolio(unittest.TestCase):
         executor.discover_proxy_wallet = MagicMock(return_value=self.PROXY_ADDR)
         executor.get_proxy_usdc_balance = MagicMock(return_value=Decimal("0"))
         executor.clob_client.get_wallet_token_ids.return_value = {self.TOK_ACTIVE}
-        executor.get_proxy_token_balance = MagicMock(return_value=10_000000)
+        executor.conditional_tokens.functions.balanceOf.return_value.call.return_value = 10_000000
         executor.clob_client.get_market_by_token.return_value = {
             "condition_id": "0x" + "b" * 64,
             "closed": False,
@@ -2190,7 +2242,7 @@ class TestScanAndRedeemProxyPortfolio(unittest.TestCase):
         executor.discover_proxy_wallet = MagicMock(return_value=self.PROXY_ADDR)
         executor.get_proxy_usdc_balance = MagicMock(return_value=Decimal("100"))
         executor.clob_client.get_wallet_token_ids.return_value = {self.TOK_RESOLVED}
-        executor.get_proxy_token_balance = MagicMock(return_value=50_000000)
+        executor.conditional_tokens.functions.balanceOf.return_value.call.return_value = 50_000000
         executor.clob_client.get_market_by_token.return_value = {
             "condition_id": "0x" + "a" * 64,
             "closed": True,
@@ -2211,7 +2263,7 @@ class TestScanAndRedeemProxyPortfolio(unittest.TestCase):
         executor.discover_proxy_wallet = MagicMock(return_value=self.PROXY_ADDR)
         executor.get_proxy_usdc_balance = MagicMock(return_value=Decimal("100"))
         executor.clob_client.get_wallet_token_ids.return_value = {self.TOK_RESOLVED}
-        executor.get_proxy_token_balance = MagicMock(return_value=50_000000)
+        executor.conditional_tokens.functions.balanceOf.return_value.call.return_value = 50_000000
         executor.clob_client.get_market_by_token.return_value = {
             "condition_id": "0x" + "a" * 64,
             "closed": True,
