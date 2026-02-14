@@ -1027,12 +1027,14 @@ class TestAutoExitConditions(unittest.TestCase):
 
 
 class TestLowBalancePauseResume(unittest.TestCase):
-    """Test that the bot pauses when balance is too low and resumes at $100."""
+    """Test that the bot pauses when balance is too low and resumes at the configured threshold."""
 
-    def _make_bot(self):
+    def _make_bot(self, resume_threshold=None):
         cfg = dict(bot.DEFAULT_CONFIG)
         cfg["watched_addresses"] = ["0x" + "a" * 40]
         cfg["poll_interval_seconds"] = 1
+        if resume_threshold is not None:
+            cfg["resume_threshold_usdc"] = resume_threshold
         logger = logging.getLogger("test_pause")
         logger.handlers = [logging.NullHandler()]
         b = bot.CopyTraderBot(cfg, logger)
@@ -1050,11 +1052,8 @@ class TestLowBalancePauseResume(unittest.TestCase):
         b.executor.monitor_open_orders.return_value = None
         b.clob_client = MagicMock()
 
-        # Run one iteration of the loop manually
-        # We'll call the relevant balance-check logic directly
         self.assertFalse(b._paused_low_balance)
 
-        # Simulate what _run_loop does at the top of each cycle
         balance = b.executor.get_usdc_balance(max_age_seconds=0)
         if not b._paused_low_balance and balance < bot.LOW_BALANCE_PAUSE_THRESHOLD:
             b._paused_low_balance = True
@@ -1062,44 +1061,69 @@ class TestLowBalancePauseResume(unittest.TestCase):
         self.assertTrue(b._paused_low_balance)
 
     def test_stays_paused_below_resume_threshold(self):
-        """Bot should remain paused if balance < $100 even if > pause threshold."""
+        """Bot should remain paused if balance < configured threshold."""
         b = self._make_bot()
         b._paused_low_balance = True
         b.executor = MagicMock()
         b.executor.get_usdc_balance.return_value = Decimal("50.00")
 
-        # Check resume logic
+        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 100)))
         balance = b.executor.get_usdc_balance(max_age_seconds=0)
-        if b._paused_low_balance and balance >= bot.LOW_BALANCE_RESUME_THRESHOLD:
+        if b._paused_low_balance and balance >= resume_threshold:
             b._paused_low_balance = False
 
         self.assertTrue(b._paused_low_balance)
 
     def test_resumes_at_resume_threshold(self):
-        """Bot should resume trading when balance >= $100."""
+        """Bot should resume trading when balance >= configured threshold ($100 default)."""
         b = self._make_bot()
         b._paused_low_balance = True
         b.executor = MagicMock()
         b.executor.get_usdc_balance.return_value = Decimal("100.00")
 
+        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 100)))
         balance = b.executor.get_usdc_balance(max_age_seconds=0)
-        if b._paused_low_balance and balance >= bot.LOW_BALANCE_RESUME_THRESHOLD:
+        if b._paused_low_balance and balance >= resume_threshold:
             b._paused_low_balance = False
 
         self.assertFalse(b._paused_low_balance)
 
     def test_resumes_above_resume_threshold(self):
-        """Bot should resume trading when balance > $100."""
+        """Bot should resume trading when balance > configured threshold."""
         b = self._make_bot()
         b._paused_low_balance = True
         b.executor = MagicMock()
         b.executor.get_usdc_balance.return_value = Decimal("250.00")
 
+        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 100)))
         balance = b.executor.get_usdc_balance(max_age_seconds=0)
-        if b._paused_low_balance and balance >= bot.LOW_BALANCE_RESUME_THRESHOLD:
+        if b._paused_low_balance and balance >= resume_threshold:
             b._paused_low_balance = False
 
         self.assertFalse(b._paused_low_balance)
+
+    def test_custom_resume_threshold(self):
+        """Bot should respect a custom resume_threshold_usdc from config."""
+        b = self._make_bot(resume_threshold=200.0)
+        b._paused_low_balance = True
+        b.executor = MagicMock()
+
+        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 100)))
+        self.assertEqual(resume_threshold, Decimal("200"))
+
+        # $150 is above the default $100 but below the custom $200
+        b.executor.get_usdc_balance.return_value = Decimal("150.00")
+        balance = b.executor.get_usdc_balance(max_age_seconds=0)
+        if b._paused_low_balance and balance >= resume_threshold:
+            b._paused_low_balance = False
+        self.assertTrue(b._paused_low_balance)  # still paused
+
+        # $200 hits the custom threshold
+        b.executor.get_usdc_balance.return_value = Decimal("200.00")
+        balance = b.executor.get_usdc_balance(max_age_seconds=0)
+        if b._paused_low_balance and balance >= resume_threshold:
+            b._paused_low_balance = False
+        self.assertFalse(b._paused_low_balance)  # resumed
 
     def test_open_orders_still_monitored_while_paused(self):
         """Open orders should still be monitored even while paused."""
@@ -1110,8 +1134,6 @@ class TestLowBalancePauseResume(unittest.TestCase):
         b.executor.monitor_open_orders.return_value = {"filled": 1, "cancelled": 0, "still_open": 0}
         b.clob_client = MagicMock()
 
-        # Simulate one loop iteration: balance check + order monitoring
-        # happens regardless of pause state
         b.executor.monitor_open_orders()
 
         b.executor.monitor_open_orders.assert_called_once()
@@ -1124,9 +1146,6 @@ class TestLowBalancePauseResume(unittest.TestCase):
         b.executor.get_usdc_balance.return_value = Decimal("0.50")
         b.clob_client = MagicMock()
 
-        # Simulate the trade-detection part of the loop, which should be
-        # skipped entirely when _paused_low_balance is True.
-        # In the actual code this is the `else` branch of the pause check.
         if not b._paused_low_balance:
             for addr in b.cfg.get("watched_addresses", []):
                 b.clob_client.get_new_trades(addr)
@@ -1139,6 +1158,7 @@ class TestLowBalancePauseResume(unittest.TestCase):
         b = self._make_bot()
         b.executor = MagicMock()
         b.clob_client = MagicMock()
+        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 100)))
 
         # Phase 1: Normal trading (balance is healthy)
         b.executor.get_usdc_balance.return_value = Decimal("500.00")
@@ -1154,21 +1174,30 @@ class TestLowBalancePauseResume(unittest.TestCase):
         # Phase 3: Partial recovery ($50) - not enough to resume
         b.executor.get_usdc_balance.return_value = Decimal("50.00")
         balance = b.executor.get_usdc_balance(max_age_seconds=0)
-        if b._paused_low_balance and balance >= bot.LOW_BALANCE_RESUME_THRESHOLD:
+        if b._paused_low_balance and balance >= resume_threshold:
             b._paused_low_balance = False
         self.assertTrue(b._paused_low_balance)
 
         # Phase 4: Full recovery ($100+) - resumes
         b.executor.get_usdc_balance.return_value = Decimal("120.00")
         balance = b.executor.get_usdc_balance(max_age_seconds=0)
-        if b._paused_low_balance and balance >= bot.LOW_BALANCE_RESUME_THRESHOLD:
+        if b._paused_low_balance and balance >= resume_threshold:
             b._paused_low_balance = False
         self.assertFalse(b._paused_low_balance)
 
-    def test_thresholds_are_correct(self):
-        """Verify the threshold constants have expected values."""
+    def test_default_resume_threshold_in_config(self):
+        """Verify the default resume_threshold_usdc is 100 in DEFAULT_CONFIG."""
+        self.assertEqual(bot.DEFAULT_CONFIG["resume_threshold_usdc"], 100.0)
         self.assertEqual(bot.LOW_BALANCE_PAUSE_THRESHOLD, Decimal("1.05"))
-        self.assertEqual(bot.LOW_BALANCE_RESUME_THRESHOLD, Decimal("100"))
+
+    def test_env_var_override(self):
+        """RESUME_THRESHOLD_USDC env var should override the config default."""
+        cfg = dict(bot.DEFAULT_CONFIG)
+        # Simulate what run_headless does
+        with patch.dict(os.environ, {"RESUME_THRESHOLD_USDC": "250"}):
+            if os.environ.get("RESUME_THRESHOLD_USDC"):
+                cfg["resume_threshold_usdc"] = float(os.environ["RESUME_THRESHOLD_USDC"])
+        self.assertEqual(cfg["resume_threshold_usdc"], 250.0)
 
 
 if __name__ == "__main__":

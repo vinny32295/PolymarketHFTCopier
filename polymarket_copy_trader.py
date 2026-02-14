@@ -95,7 +95,6 @@ MIN_ORDER_NOTIONAL_USDC = 1.05  # slightly above $1 to stay above min after fees
 # trades and waits for open orders to settle.  Trading resumes once the
 # balance recovers to at least the resume threshold.
 LOW_BALANCE_PAUSE_THRESHOLD = Decimal("1.05")   # can't even fill the smallest order
-LOW_BALANCE_RESUME_THRESHOLD = Decimal("100")    # $100 minimum to start trading again
 
 # Auto-exit thresholds for open positions
 TAKE_PROFIT_PRICE = Decimal("0.99")   # sell when token price reaches 99c (near-certain outcome)
@@ -187,6 +186,7 @@ DEFAULT_CONFIG = {
     "dry_run": False,
     "fixed_trade_usdc": 0.0,
     "order_ttl_seconds": 30,
+    "resume_threshold_usdc": 100.0,
 }
 
 
@@ -1421,7 +1421,7 @@ class CopyTraderBot:
         # Low-balance pause state.  When the USDC balance is too low to
         # place any order the bot stops copying new trades and waits for
         # open positions to settle.  Trading resumes once the balance
-        # reaches LOW_BALANCE_RESUME_THRESHOLD ($100).
+        # reaches resume_threshold_usdc (default $100, configurable).
         self._paused_low_balance = False
 
         # Web3 connection (lazy init)
@@ -1551,6 +1551,10 @@ class CopyTraderBot:
             poll_interval,
         )
 
+        resume_threshold = Decimal(
+            str(self.cfg.get("resume_threshold_usdc", 100))
+        )
+
         while self.running:
             try:
                 # --- Low-balance pause / resume check ---
@@ -1558,18 +1562,18 @@ class CopyTraderBot:
                     try:
                         balance = self.executor.get_usdc_balance(max_age_seconds=0)
                         if self._paused_low_balance:
-                            if balance >= LOW_BALANCE_RESUME_THRESHOLD:
+                            if balance >= resume_threshold:
                                 self._paused_low_balance = False
                                 self.logger.info(
                                     "Balance recovered to $%.2f (>= $%s) "
                                     "— resuming trading",
-                                    balance, LOW_BALANCE_RESUME_THRESHOLD,
+                                    balance, resume_threshold,
                                 )
                             else:
                                 self.logger.info(
                                     "Paused (low balance $%.2f, need $%s to "
                                     "resume) — waiting for trades to settle",
-                                    balance, LOW_BALANCE_RESUME_THRESHOLD,
+                                    balance, resume_threshold,
                                 )
                         elif balance < LOW_BALANCE_PAUSE_THRESHOLD:
                             self._paused_low_balance = True
@@ -1578,7 +1582,7 @@ class CopyTraderBot:
                                 "Will resume when balance reaches $%s.",
                                 balance,
                                 LOW_BALANCE_PAUSE_THRESHOLD,
-                                LOW_BALANCE_RESUME_THRESHOLD,
+                                resume_threshold,
                             )
                     except Exception as bal_exc:
                         self.logger.debug(
@@ -2130,6 +2134,8 @@ def run_headless():
         cfg["copy_percentage"] = int(os.environ["COPY_PERCENTAGE"])
     if os.environ.get("MAX_TRADE_USDC"):
         cfg["max_trade_usdc"] = float(os.environ["MAX_TRADE_USDC"])
+    if os.environ.get("RESUME_THRESHOLD_USDC"):
+        cfg["resume_threshold_usdc"] = float(os.environ["RESUME_THRESHOLD_USDC"])
     if os.environ.get("DRY_RUN"):
         cfg["dry_run"] = os.environ["DRY_RUN"].lower() in ("1", "true", "yes")
     if os.environ.get("CLOB_API_KEY"):
@@ -2145,8 +2151,9 @@ def run_headless():
 
     logger.info("=== Polymarket Copy Trader — Headless Mode ===")
     logger.info("Watched addresses: %s", cfg["watched_addresses"])
-    logger.info("Copy %%: %s | Max trade: %s USDC | Dry run: %s",
-                cfg.get("copy_percentage"), cfg.get("max_trade_usdc"), cfg.get("dry_run", False))
+    logger.info("Copy %%: %s | Max trade: %s USDC | Resume threshold: $%s | Dry run: %s",
+                cfg.get("copy_percentage"), cfg.get("max_trade_usdc"),
+                cfg.get("resume_threshold_usdc", 100), cfg.get("dry_run", False))
 
     bot = CopyTraderBot(cfg, logger)
 
