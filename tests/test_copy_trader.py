@@ -1833,6 +1833,37 @@ class TestProxyWalletDiscovery(unittest.TestCase):
         result = executor.discover_proxy_wallet()
         self.assertEqual(result, self.PROXY_ADDR)
 
+    def test_falls_through_to_safe_factory(self):
+        """When legacy factory yields nothing, checks Safe factory events."""
+        executor = self._make_executor()
+        mock_factory = MagicMock()
+        # All legacy function calls return zero address
+        zero = "0x" + "0" * 40
+        mock_factory.functions.getProxy.return_value.call.return_value = zero
+        mock_factory.functions.proxies.return_value.call.return_value = zero
+        mock_factory.functions.proxyFor.return_value.call.return_value = zero
+        executor.w3.eth.contract.side_effect = None
+        executor.w3.eth.contract.return_value = mock_factory
+        executor.w3.eth.block_number = 50_000_000
+
+        # Legacy event logs empty, Safe factory logs return a result
+        safe_addr = self.PROXY_ADDR
+        safe_log_data = bytes.fromhex("00" * 12 + safe_addr[2:].lower())
+        call_count = [0]
+
+        def get_logs_side_effect(params):
+            call_count[0] += 1
+            addr = params.get("address", "").lower()
+            if addr == bot.SAFE_PROXY_FACTORY_ADDRESS.lower():
+                return [{"data": safe_log_data, "blockNumber": 45_000_000}]
+            return []
+
+        executor.w3.eth.get_logs.side_effect = get_logs_side_effect
+
+        result = executor.discover_proxy_wallet()
+        self.assertIsNotNone(result)
+        self.assertTrue(executor._proxy_is_safe)
+
     def test_all_methods_fail_returns_none(self):
         """When all discovery methods fail, returns None and caches failure."""
         executor = self._make_executor()
@@ -1841,8 +1872,6 @@ class TestProxyWalletDiscovery(unittest.TestCase):
         mock_factory.functions.getProxy.return_value.call.side_effect = Exception("fail")
         mock_factory.functions.proxies.return_value.call.side_effect = Exception("fail")
         mock_factory.functions.proxyFor.return_value.call.side_effect = Exception("fail")
-        # Event logs fail
-        mock_factory.events.Deploy.get_logs.side_effect = Exception("fail")
         executor.w3.eth.contract.side_effect = None
         executor.w3.eth.contract.return_value = mock_factory
         executor.w3.eth.block_number = 50_000_000
@@ -2224,6 +2253,107 @@ class TestScanAndRedeemProxyPortfolio(unittest.TestCase):
         self.assertAlmostEqual(withdrawn[0]["amount_usdc"], 75.0, places=1)
 
 
+class TestSafeExecution(unittest.TestCase):
+    """Test Gnosis Safe transaction execution."""
+
+    SAFE_ADDR = "0x" + "Bb" * 20
+
+    def _make_executor(self, is_safe=True):
+        w3 = MagicMock()
+        mock_account = MagicMock()
+        mock_account.address = "0x" + "1" * 40
+        w3.eth.account.from_key.return_value = mock_account
+
+        mock_usdc = MagicMock()
+        mock_ctf_exchange = MagicMock()
+        mock_conditional_tokens = MagicMock()
+
+        def contract_factory(address, abi):
+            addr = address.lower() if hasattr(address, "lower") else address
+            if addr == bot.USDC_ADDRESS.lower():
+                return mock_usdc
+            if addr == bot.CTF_EXCHANGE_ADDRESS.lower():
+                return mock_ctf_exchange
+            if addr == bot.CONDITIONAL_TOKENS_ADDRESS.lower():
+                return mock_conditional_tokens
+            return MagicMock()
+
+        w3.eth.contract.side_effect = contract_factory
+
+        cfg = dict(bot.DEFAULT_CONFIG)
+        executor = bot.TradeExecutor(
+            w3=w3,
+            private_key="0x" + "a" * 64,
+            cfg=cfg,
+            logger=logging.getLogger("test_safe_exec"),
+        )
+        executor.conditional_tokens = mock_conditional_tokens
+        executor.usdc = mock_usdc
+        executor._proxy_is_safe = is_safe
+        executor._sign_and_send = MagicMock()
+        executor._base_tx_params = MagicMock(return_value={
+            "from": executor.address, "nonce": 0,
+            "maxFeePerGas": 100, "maxPriorityFeePerGas": 30,
+            "chainId": 137,
+        })
+        return executor
+
+    def test_dispatch_to_safe_when_is_safe(self):
+        """_execute_via_proxy dispatches to Safe when _proxy_is_safe is True."""
+        executor = self._make_executor(is_safe=True)
+        mock_safe = MagicMock()
+        mock_safe.functions.nonce.return_value.call.return_value = 5
+        mock_safe.functions.getTransactionHash.return_value.call.return_value = b"\x00" * 32
+        mock_safe.functions.execTransaction.return_value.build_transaction.return_value = {}
+        executor.w3.eth.contract.side_effect = None
+        executor.w3.eth.contract.return_value = mock_safe
+        executor.w3.eth.account.signHash.return_value = MagicMock(r=1, s=2, v=27)
+
+        mock_receipt = MagicMock()
+        mock_receipt.status = 1
+        executor._sign_and_send.return_value = mock_receipt
+
+        result = executor._execute_via_proxy(self.SAFE_ADDR, bot.USDC_ADDRESS, b"\x01")
+        self.assertEqual(result.status, 1)
+        mock_safe.functions.execTransaction.assert_called_once()
+
+    def test_dispatch_to_legacy_when_not_safe(self):
+        """_execute_via_proxy dispatches to legacy when _proxy_is_safe is False."""
+        executor = self._make_executor(is_safe=False)
+        mock_proxy = MagicMock()
+        mock_proxy.functions.execute.return_value.build_transaction.return_value = {}
+        executor.w3.eth.contract.side_effect = None
+        executor.w3.eth.contract.return_value = mock_proxy
+
+        mock_receipt = MagicMock()
+        mock_receipt.status = 1
+        executor._sign_and_send.return_value = mock_receipt
+
+        result = executor._execute_via_proxy(self.SAFE_ADDR, bot.USDC_ADDRESS, b"\x01")
+        self.assertEqual(result.status, 1)
+        mock_proxy.functions.execute.assert_called_once()
+
+    def test_safe_signs_transaction_hash(self):
+        """Safe execution signs the hash and passes signature to execTransaction."""
+        executor = self._make_executor(is_safe=True)
+        safe_tx_hash = b"\xab" * 32
+        mock_safe = MagicMock()
+        mock_safe.functions.nonce.return_value.call.return_value = 0
+        mock_safe.functions.getTransactionHash.return_value.call.return_value = safe_tx_hash
+        mock_safe.functions.execTransaction.return_value.build_transaction.return_value = {}
+        executor.w3.eth.contract.side_effect = None
+        executor.w3.eth.contract.return_value = mock_safe
+        executor.w3.eth.account.signHash.return_value = MagicMock(r=1, s=2, v=28)
+        executor._sign_and_send.return_value = MagicMock(status=1)
+
+        executor._execute_via_safe(self.SAFE_ADDR, bot.USDC_ADDRESS, b"\x01")
+
+        # Verify signHash was called with the Safe tx hash
+        executor.w3.eth.account.signHash.assert_called_once_with(
+            safe_tx_hash, executor.private_key,
+        )
+
+
 class TestProxyConfig(unittest.TestCase):
     """Test proxy-related configuration defaults and env var overrides."""
 
@@ -2235,6 +2365,16 @@ class TestProxyConfig(unittest.TestCase):
     def test_proxy_factory_address_is_set(self):
         self.assertTrue(bot.PROXY_FACTORY_ADDRESS.startswith("0x"))
         self.assertEqual(len(bot.PROXY_FACTORY_ADDRESS), 42)
+
+    def test_safe_proxy_factory_address_is_set(self):
+        self.assertTrue(bot.SAFE_PROXY_FACTORY_ADDRESS.startswith("0x"))
+        self.assertEqual(len(bot.SAFE_PROXY_FACTORY_ADDRESS), 42)
+
+    def test_gnosis_safe_abi_has_required_functions(self):
+        names = [entry.get("name") for entry in bot.GNOSIS_SAFE_ABI]
+        self.assertIn("execTransaction", names)
+        self.assertIn("getTransactionHash", names)
+        self.assertIn("nonce", names)
 
     def test_proxy_factory_abi_has_multiple_getters(self):
         names = [entry.get("name") for entry in bot.PROXY_FACTORY_ABI]
