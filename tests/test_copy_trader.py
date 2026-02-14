@@ -179,18 +179,45 @@ class TestPlaceOrderMinSize(unittest.TestCase):
         return call_kwargs["size"]
 
     def test_normal_size_not_bumped(self):
-        """When tokens >= 5, size is not changed."""
+        """When tokens >= 5 and USDC >= $1, size is not changed."""
         client = self._make_client()
-        # $5 USDC at price 0.50 = 10 tokens (>5, no bump needed)
+        # $5 USDC at price 0.50 = 10 tokens (>5, >$1 — no bump)
         client.place_order("token1", "BUY", 5.0, 0.50)
         self.assertEqual(self._get_order_size(client), 10.0)
 
-    def test_small_size_bumped_to_minimum(self):
-        """When tokens < 5, size is bumped to MIN_ORDER_SIZE_TOKENS."""
+    def test_small_tokens_bumped(self):
+        """When tokens < 5, bumped to satisfy token minimum."""
         client = self._make_client()
-        # $2 USDC at price 0.90 = 2.22 tokens (<5, should bump to 5)
+        # $2 USDC at price 0.90 = 2.22 tokens (<5)
+        # min_usdc_for_tokens = 5 * 0.90 = $4.50 -> 5.0 tokens
         client.place_order("token1", "BUY", 2.0, 0.90)
         self.assertEqual(self._get_order_size(client), 5.0)
+
+    def test_small_notional_bumped(self):
+        """When USDC < $1 notional minimum, bumped to $1."""
+        client = self._make_client()
+        # $0.30 USDC at price 0.05 = 6 tokens (>5 ok, but $0.30 <$1)
+        # effective_usdc = max(0.30, 5*0.05=0.25, 1.0) = $1.0 -> 20 tokens
+        client.place_order("token1", "BUY", 0.30, 0.05)
+        self.assertEqual(self._get_order_size(client), 20.0)
+
+    def test_both_minimums_token_wins(self):
+        """When both minimums trigger, the larger USDC requirement wins."""
+        client = self._make_client()
+        # $0.50 USDC at price 0.80 = 0.625 tokens (<5, and $0.50 <$1)
+        # min_usdc_for_tokens = 5 * 0.80 = $4.00 > $1.00 -> token min wins
+        # effective_usdc = $4.00 -> 5.0 tokens
+        client.place_order("token1", "BUY", 0.50, 0.80)
+        self.assertEqual(self._get_order_size(client), 5.0)
+
+    def test_both_minimums_notional_wins(self):
+        """When notional minimum requires more USDC than token minimum."""
+        client = self._make_client()
+        # $0.50 USDC at price 0.10 = 5 tokens (=5 ok, but $0.50 <$1)
+        # min_usdc_for_tokens = 5 * 0.10 = $0.50, notional = $1.00
+        # effective_usdc = max(0.50, 0.50, 1.0) = $1.00 -> 10 tokens
+        client.place_order("token1", "BUY", 0.50, 0.10)
+        self.assertEqual(self._get_order_size(client), 10.0)
 
     def test_zero_price_returns_none(self):
         """Price of 0 should return None, not divide by zero."""
@@ -200,9 +227,9 @@ class TestPlaceOrderMinSize(unittest.TestCase):
         client.clob_sdk.create_and_post_order.assert_not_called()
 
     def test_exact_minimum_not_bumped(self):
-        """Exactly 5 tokens should not be bumped."""
+        """Exactly 5 tokens and >= $1 USDC should not be bumped."""
         client = self._make_client()
-        # $5 USDC at price 1.0 = 5 tokens (exactly min, no bump)
+        # $5 USDC at price 1.0 = 5 tokens (exactly min, $5 >$1)
         client.place_order("token1", "BUY", 5.0, 1.0)
         self.assertEqual(self._get_order_size(client), 5.0)
 
