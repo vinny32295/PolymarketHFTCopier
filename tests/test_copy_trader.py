@@ -1427,15 +1427,15 @@ class TestAutoRedeemSettled(unittest.TestCase):
 
         executor.clob_client.get_market_by_token.side_effect = mock_market
 
-        # On-chain: TOK3's condition is NOT resolved, others are.
-        active_cond_bytes = bytes.fromhex(cond_active.replace("0x", ""))
-        payout_mock = MagicMock()
+        # On-chain: only the resolved conditionId returns payoutDenominator > 0;
+        # everything else (including derived conditionIds) returns 0.
+        resolved_cond_bytes = bytes.fromhex(cond_resolved.replace("0x", ""))
         def payout_side_effect(cond_bytes):
             result = MagicMock()
-            if cond_bytes == active_cond_bytes:
-                result.call.return_value = 0  # not resolved
-            else:
+            if cond_bytes == resolved_cond_bytes:
                 result.call.return_value = 1000000  # resolved
+            else:
+                result.call.return_value = 0  # not resolved
             return result
         executor.conditional_tokens.functions.payoutDenominator.side_effect = payout_side_effect
 
@@ -1484,6 +1484,77 @@ class TestAutoRedeemSettled(unittest.TestCase):
         executor._positions[self.TOK1] = {"tokens": Decimal("0"), "entry_price": Decimal("0.50")}
         results = executor.check_and_redeem_settled()
         self.assertEqual(results, [])
+
+
+class TestConditionIdDerivation(unittest.TestCase):
+    """Test _derive_condition_id and _resolve_condition_id."""
+
+    def _make_executor(self):
+        """Create a minimal TradeExecutor with mocked web3."""
+        cfg = dict(bot.DEFAULT_CONFIG)
+        w3 = MagicMock()
+        w3.eth.account.from_key.return_value.address = "0x" + "1" * 40
+        w3.eth.contract.return_value = MagicMock()
+        w3.eth.get_transaction_count.return_value = 0
+        executor = bot.TradeExecutor(
+            w3, "0x" + "a" * 64, cfg, clob_client=MagicMock(),
+            logger=logging.getLogger("test_cid"),
+        )
+        return executor
+
+    def test_resolve_uses_api_value_when_it_works(self):
+        """If API conditionId has payoutDenom > 0, use it directly."""
+        executor = self._make_executor()
+        api_cid = "0x" + "ab" * 32
+        api_cond_bytes = bytes.fromhex(api_cid[2:])
+
+        def payout_side_effect(cond_bytes):
+            result = MagicMock()
+            if cond_bytes == api_cond_bytes:
+                result.call.return_value = 500  # resolved with API value
+            else:
+                result.call.return_value = 0
+            return result
+
+        executor.conditional_tokens.functions.payoutDenominator.side_effect = payout_side_effect
+
+        resolved_cid, pd = executor._resolve_condition_id(api_cid, neg_risk=True)
+        self.assertEqual(pd, 500)
+        self.assertEqual(resolved_cid, api_cid)
+
+    def test_resolve_falls_back_to_derived(self):
+        """When API conditionId has payoutDenom=0, derived conditionId is tried."""
+        executor = self._make_executor()
+        api_cid = "0x" + "ab" * 32
+
+        # Simulate: getConditionId returns a derived conditionId
+        derived_bytes = b"\xdd" * 32
+        executor.conditional_tokens.functions.getConditionId.return_value.call.return_value = derived_bytes
+
+        def payout_side_effect(cond_bytes):
+            result = MagicMock()
+            if cond_bytes == derived_bytes:
+                result.call.return_value = 999  # resolved via derivation
+            else:
+                result.call.return_value = 0  # not resolved
+            return result
+
+        executor.conditional_tokens.functions.payoutDenominator.side_effect = payout_side_effect
+
+        resolved_cid, pd = executor._resolve_condition_id(api_cid, neg_risk=True)
+        self.assertEqual(pd, 999)
+        self.assertEqual(resolved_cid, "0x" + "dd" * 32)
+
+    def test_resolve_returns_zero_when_nothing_works(self):
+        """When no conditionId resolves, returns 0."""
+        executor = self._make_executor()
+        api_cid = "0x" + "ab" * 32
+        executor.conditional_tokens.functions.payoutDenominator.return_value.call.return_value = 0
+        executor.conditional_tokens.functions.getConditionId.return_value.call.return_value = b"\xee" * 32
+
+        resolved_cid, pd = executor._resolve_condition_id(api_cid, neg_risk=False)
+        self.assertEqual(pd, 0)
+        self.assertEqual(resolved_cid, api_cid)
 
 
 class TestAutoRedeemConfig(unittest.TestCase):
@@ -1718,15 +1789,15 @@ class TestScanAndRedeemPortfolio(unittest.TestCase):
         executor.clob_client.get_market_by_token.side_effect = mock_market
         executor.clob_client.get_last_trade_price.return_value = 0.65
 
-        # On-chain: resolved market has payoutDenominator > 0,
-        # active market has payoutDenominator == 0 (not resolved yet)
-        active_cond_bytes = bytes.fromhex(cond_active.replace("0x", ""))
+        # On-chain: only the resolved conditionId returns payoutDenominator > 0;
+        # everything else (including derived conditionIds) returns 0.
+        resolved_cond_bytes = bytes.fromhex(cond_resolved.replace("0x", ""))
         def payout_side_effect(cond_bytes):
             result = MagicMock()
-            if cond_bytes == active_cond_bytes:
-                result.call.return_value = 0  # not resolved
-            else:
+            if cond_bytes == resolved_cond_bytes:
                 result.call.return_value = 1000000  # resolved
+            else:
+                result.call.return_value = 0  # not resolved
             return result
         executor.conditional_tokens.functions.payoutDenominator.side_effect = payout_side_effect
 
