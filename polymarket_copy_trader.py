@@ -293,6 +293,11 @@ NEG_RISK_ADAPTER_ABI = json.loads("""[
 # How often to check for redeemable (settled) positions (seconds)
 REDEEM_CHECK_INTERVAL_SECONDS = 300  # 5 minutes
 
+# How often to run the full portfolio scan (more expensive than the
+# periodic check_and_redeem_settled because it queries the Data API
+# for the wallet's complete trade history).
+PORTFOLIO_SCAN_INTERVAL_SECONDS = 900  # 15 minutes
+
 # Default config file path
 CONFIG_FILE = "config.json"
 LOG_FILE = "bot.log"
@@ -1297,19 +1302,25 @@ class TradeExecutor:
     # ------------------------------------------------------------------
 
     def scan_and_redeem_portfolio(self):
-        """Startup scan: discover ALL wallet positions and redeem resolved ones.
+        """Discover ALL wallet positions and redeem resolved ones.
 
-        Unlike ``check_and_redeem_settled`` (which only checks positions
-        acquired during the current session), this method queries the
-        Data API for the wallet's full trade history, checks on-chain
-        balances for every token ID ever traded, and:
+        Queries the Data API for the wallet's full trade history, checks
+        on-chain balances for every token ID ever traded, and:
 
-        * **Resolved markets** → calls ``redeemPositions`` to convert
-          winning tokens back to USDC immediately.
+        * **Resolved markets** (``payoutDenominator > 0`` on-chain) →
+          calls ``redeemPositions`` to convert winning tokens back to USDC.
         * **Active markets** → seeds ``_positions`` so the periodic
           ``check_and_redeem_settled`` can monitor them going forward.
 
-        Should be called once at startup after the executor is ready.
+        **On-chain resolution is the authoritative signal.**  The Gamma
+        API's ``closed``/``active`` flags are NOT required — the oracle's
+        ``payoutDenominator`` is checked for every position that has a
+        non-zero token balance.  This handles the common case where
+        Polymarket's UI/API still shows a position as "active" after
+        the underlying market has resolved.
+
+        Called at startup and also periodically to catch newly resolved
+        markets.
         """
         if not self.clob_client:
             self.logger.info("Portfolio scan skipped — no CLOB client")
@@ -1319,8 +1330,17 @@ class TradeExecutor:
 
         self.logger.info("Scanning wallet portfolio for redeemable positions...")
 
-        # 1. Discover token IDs from trade history
+        # 1. Discover token IDs from trade history (EOA + proxy)
         token_ids = self.clob_client.get_wallet_token_ids(self.address)
+
+        # Also check the proxy wallet's trade history to catch tokens
+        # that might have been traded through it.
+        proxy_addr = self.cfg.get("proxy_address", "")
+        if proxy_addr and proxy_addr.startswith("0x") and len(proxy_addr) == 42:
+            proxy_tokens = self.clob_client.get_wallet_token_ids(proxy_addr)
+            if proxy_tokens:
+                token_ids = token_ids | proxy_tokens
+
         if not token_ids:
             self.logger.info("No trade history found for wallet — portfolio scan done")
             return []
@@ -1334,7 +1354,7 @@ class TradeExecutor:
 
         for token_id in token_ids:
             try:
-                # 2. Look up market info first so we know if it's Neg Risk
+                # 2. Look up market info to get condition_id and neg_risk
                 market = self.clob_client.get_market_by_token(token_id)
                 if not market:
                     continue
@@ -1353,15 +1373,16 @@ class TradeExecutor:
                 if ct_balance == 0:
                     continue
 
-                is_closed = (
-                    market.get("closed") is True
-                    or str(market.get("closed", "")).lower() == "true"
-                    or market.get("active") is False
-                    or str(market.get("active", "")).lower() == "false"
-                )
+                # 4. On-chain resolution check (authoritative).
+                #    payoutDenominator > 0 means the oracle has reported —
+                #    the market IS resolved even if the API still says "active".
+                cond_bytes = bytes.fromhex(condition_id.replace("0x", ""))
+                payout_denom = self.conditional_tokens.functions.payoutDenominator(
+                    cond_bytes
+                ).call()
 
-                if not is_closed:
-                    # Active market — seed into _positions for ongoing monitoring
+                if payout_denom == 0:
+                    # Not resolved on-chain — seed as active position
                     if token_id not in self._positions:
                         price = self.clob_client.get_last_trade_price(token_id)
                         if price and price > 0:
@@ -1378,18 +1399,10 @@ class TradeExecutor:
                             )
                     continue
 
-                # 4. Verify on-chain resolution
-                cond_bytes = bytes.fromhex(condition_id.replace("0x", ""))
-                payout_denom = self.conditional_tokens.functions.payoutDenominator(
-                    cond_bytes
-                ).call()
-                if payout_denom == 0:
-                    continue
-
-                # 5. Redeem
+                # 5. Market is resolved on-chain — redeem!
                 question = market.get("question", "unknown")
                 self.logger.info(
-                    "STARTUP REDEEM: Resolved position — token %s, "
+                    "REDEEM: Resolved position — token %s, "
                     "question: %s, balance: %d, neg_risk: %s",
                     token_id[:16] + "...", question[:60], ct_balance, neg_risk,
                 )
@@ -1411,10 +1424,12 @@ class TradeExecutor:
                 receipt = self._sign_and_send(tx)
                 if receipt and receipt.status == 1:
                     self.logger.info(
-                        "Startup redemption OK: tx %s — USDC returned to wallet",
+                        "Redemption OK: tx %s — USDC returned to wallet",
                         receipt.transactionHash.hex(),
                     )
                     self.invalidate_balance_cache()
+                    # Remove from position tracker if it was there
+                    self._positions.pop(token_id, None)
                     results.append({
                         "status": "redeemed",
                         "token_id": token_id,
@@ -1423,7 +1438,7 @@ class TradeExecutor:
                     })
                 else:
                     self.logger.warning(
-                        "Startup redemption tx failed for token %s",
+                        "Redemption tx failed for token %s",
                         token_id[:16] + "...",
                     )
                     results.append({
@@ -1511,15 +1526,20 @@ class TradeExecutor:
     def check_and_redeem_settled(self):
         """Scan positions for resolved markets and redeem tokens back to USDC.
 
-        For each tracked position this method:
-        1. Queries the Gamma API to check if the market has resolved.
-        2. Verifies on-chain that the condition's payout denominator is
-           non-zero (meaning the oracle has reported the outcome).
-        3. Checks the wallet's ERC-1155 balance of the conditional token
-           on the correct contract (ConditionalTokens for standard markets,
-           NegRiskAdapter for Neg Risk markets).
-        4. Calls ``redeemPositions`` on the appropriate contract to convert
-           winning tokens back to USDC.
+        Uses **on-chain resolution as the primary signal**.  For each tracked
+        position:
+
+        1. Looks up the market via Gamma API to get the condition_id and
+           neg_risk flag.
+        2. Checks on-chain ``payoutDenominator`` — if non-zero the oracle
+           has reported the outcome and the market IS resolved, regardless
+           of what the API's ``closed``/``active`` flags say.
+        3. Checks the wallet's ERC-1155 balance of the conditional token.
+        4. Calls ``redeemPositions`` on the appropriate contract.
+
+        This avoids the problem where Polymarket's API still shows a
+        position as "active" even though the market has already resolved
+        on-chain — a common situation that previously blocked redemption.
 
         Returns a list of result dicts (one per redeemed position).
         """
@@ -1536,46 +1556,33 @@ class TradeExecutor:
                 continue
 
             try:
-                # 1. Look up market via Gamma API
+                # 1. Look up market via Gamma API to get condition_id
                 market = self.clob_client.get_market_by_token(token_id)
                 if not market:
-                    continue
-
-                # Only proceed if the market is flagged as closed / resolved
-                is_closed = (
-                    market.get("closed") is True
-                    or str(market.get("closed", "")).lower() == "true"
-                    or market.get("active") is False
-                    or str(market.get("active", "")).lower() == "false"
-                )
-                if not is_closed:
                     continue
 
                 condition_id = market.get("condition_id")
                 if not condition_id:
                     self.logger.debug(
-                        "Resolved market for token %s has no condition_id, skipping",
+                        "Market for token %s has no condition_id, skipping",
                         token_id[:16] + "...",
                     )
                     continue
 
-                neg_risk = self._is_neg_risk_market(market)
+                neg_risk = pos.get("neg_risk", self._is_neg_risk_market(market))
 
-                # 2. Verify on-chain that the oracle has finalised the result
+                # 2. On-chain resolution check (authoritative source of truth).
+                #    payoutDenominator > 0 means the oracle has reported the
+                #    outcome — the market IS resolved even if the API still
+                #    shows it as "active".
                 cond_bytes = bytes.fromhex(condition_id.replace("0x", ""))
                 payout_denom = self.conditional_tokens.functions.payoutDenominator(
                     cond_bytes
                 ).call()
                 if payout_denom == 0:
-                    self.logger.debug(
-                        "Condition %s not yet resolved on-chain, skipping",
-                        condition_id[:16] + "...",
-                    )
                     continue
 
                 # 3. Check on-chain balance of the conditional token
-                #    Standard markets: tokens on ConditionalTokens contract
-                #    Neg Risk markets: tokens wrapped by NegRiskAdapter
                 ct_balance = self._get_token_balance(
                     self.address, token_id, neg_risk=neg_risk,
                 )
@@ -1612,9 +1619,6 @@ class TradeExecutor:
                     continue
 
                 # 5. Build and send the redeemPositions transaction
-                #    indexSets [1, 2] covers both outcomes of a binary market.
-                #    Neg Risk markets go through the adapter; standard markets
-                #    go through the ConditionalTokens contract directly.
                 tx = self._build_redeem_tx(condition_id, neg_risk=neg_risk)
 
                 receipt = self._sign_and_send(tx)
@@ -2912,6 +2916,7 @@ class CopyTraderBot:
         _last_pause_log = 0  # timestamp of last "still paused" INFO log
         _last_redeem_check = 0  # timestamp of last settled-position redemption scan
         _last_proxy_check = 0   # timestamp of last proxy wallet redemption scan
+        _last_portfolio_scan = 0  # timestamp of last full portfolio scan
 
         while self.running:
             try:
@@ -2995,6 +3000,30 @@ class CopyTraderBot:
                     except Exception as redeem_exc:
                         self.logger.debug(
                             "Redemption check error: %s", redeem_exc,
+                        )
+
+                # --- Full portfolio scan (periodic) ---
+                # Re-scans the wallet's complete trade history to catch
+                # positions that resolved since the last check.  More
+                # expensive than check_and_redeem_settled (which only
+                # checks _positions dict) but catches positions that
+                # were missed or not tracked.
+                if (
+                    self.executor
+                    and self.cfg.get("auto_redeem_settled", True)
+                    and now - _last_portfolio_scan >= PORTFOLIO_SCAN_INTERVAL_SECONDS
+                ):
+                    _last_portfolio_scan = now
+                    try:
+                        scan_results = self.executor.scan_and_redeem_portfolio()
+                        if scan_results:
+                            self.logger.info(
+                                "Portfolio scan: %d position(s) processed",
+                                len(scan_results),
+                            )
+                    except Exception as scan_exc:
+                        self.logger.debug(
+                            "Portfolio scan error: %s", scan_exc,
                         )
 
                 # --- Proxy wallet redemption & withdrawal ---
