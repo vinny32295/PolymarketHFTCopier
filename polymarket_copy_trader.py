@@ -461,13 +461,10 @@ class PolymarketCLOBClient:
                 token_id=token_id,
                 price=round(price, 2),
                 size=round(size_usdc, 2),
+                side=side.upper(),
             )
 
-            # Determine buy/sell
-            if side.upper() == "BUY":
-                signed_order = self.clob_sdk.create_and_post_order(order_args)
-            else:
-                signed_order = self.clob_sdk.create_and_post_order(order_args)
+            signed_order = self.clob_sdk.create_and_post_order(order_args)
 
             self.logger.info(
                 "CLOB order placed: %s %.2f USDC @ %.4f for token %s",
