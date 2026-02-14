@@ -1554,6 +1554,7 @@ class CopyTraderBot:
         resume_threshold = Decimal(
             str(self.cfg.get("resume_threshold_usdc", 100))
         )
+        _last_pause_log = 0  # timestamp of last "still paused" INFO log
 
         while self.running:
             try:
@@ -1570,13 +1571,20 @@ class CopyTraderBot:
                                     balance, resume_threshold,
                                 )
                             else:
-                                self.logger.info(
-                                    "Paused (low balance $%.2f, need $%s to "
-                                    "resume) — waiting for trades to settle",
-                                    balance, resume_threshold,
-                                )
+                                # Log at INFO only every 5 minutes to
+                                # avoid flooding the logs while idle.
+                                now = time.time()
+                                if now - _last_pause_log >= 300:
+                                    self.logger.info(
+                                        "Paused (low balance $%.2f, need $%s "
+                                        "to resume) — waiting for trades to "
+                                        "settle",
+                                        balance, resume_threshold,
+                                    )
+                                    _last_pause_log = now
                         elif balance < LOW_BALANCE_PAUSE_THRESHOLD:
                             self._paused_low_balance = True
+                            _last_pause_log = time.time()
                             self.logger.warning(
                                 "Balance $%.2f below $%s — pausing new trades. "
                                 "Will resume when balance reaches $%s.",
