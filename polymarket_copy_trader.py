@@ -209,7 +209,7 @@ DEFAULT_CONFIG = {
     "dry_run": False,
     "fixed_trade_usdc": 0.0,
     "order_ttl_seconds": 30,
-    "resume_threshold_usdc": 100.0,
+    "resume_threshold_usdc": 150.0,
     "auto_redeem_settled": True,
 }
 
@@ -470,6 +470,34 @@ class PolymarketCLOBClient:
         if data and isinstance(data, list) and len(data) > 0:
             return data[0]
         return None
+
+    def get_wallet_token_ids(self, address, limit=200):
+        """Discover all unique token IDs the wallet has ever traded.
+
+        Queries the Data API activity feed and extracts token IDs from
+        each trade record.  Returns a set of token-ID strings.
+        """
+        url = f"{self.data_url}/activity"
+        params = {"user": address.lower(), "limit": limit}
+        data = self._get_public(url, params=params)
+        if not data:
+            return set()
+
+        trades = data if isinstance(data, list) else data.get(
+            "data", data.get("history", [])
+        )
+        token_ids = set()
+        for trade in trades:
+            tid = (
+                trade.get("asset")
+                or trade.get("asset_id")
+                or trade.get("tokenId")
+                or trade.get("token_id")
+                or trade.get("makerAssetId")
+            )
+            if tid:
+                token_ids.add(str(tid))
+        return token_ids
 
     def get_order_book(self, token_id):
         """Fetch the order book for a token (public endpoint)."""
@@ -1147,8 +1175,158 @@ class TradeExecutor:
         return results
 
     # ------------------------------------------------------------------
-    # Auto-redeem settled positions
+    # Portfolio scan & auto-redeem settled positions
     # ------------------------------------------------------------------
+
+    def scan_and_redeem_portfolio(self):
+        """Startup scan: discover ALL wallet positions and redeem resolved ones.
+
+        Unlike ``check_and_redeem_settled`` (which only checks positions
+        acquired during the current session), this method queries the
+        Data API for the wallet's full trade history, checks on-chain
+        balances for every token ID ever traded, and:
+
+        * **Resolved markets** → calls ``redeemPositions`` to convert
+          winning tokens back to USDC immediately.
+        * **Active markets** → seeds ``_positions`` so the periodic
+          ``check_and_redeem_settled`` can monitor them going forward.
+
+        Should be called once at startup after the executor is ready.
+        """
+        if not self.clob_client:
+            self.logger.info("Portfolio scan skipped — no CLOB client")
+            return []
+        if not self.cfg.get("auto_redeem_settled", True):
+            return []
+
+        self.logger.info("Scanning wallet portfolio for redeemable positions...")
+
+        # 1. Discover token IDs from trade history
+        token_ids = self.clob_client.get_wallet_token_ids(self.address)
+        if not token_ids:
+            self.logger.info("No trade history found for wallet — portfolio scan done")
+            return []
+
+        self.logger.info(
+            "Found %d unique token IDs in wallet trade history", len(token_ids),
+        )
+
+        results = []
+        active_seeded = 0
+
+        for token_id in token_ids:
+            try:
+                # 2. Check on-chain balance
+                ct_balance = self.conditional_tokens.functions.balanceOf(
+                    self.address, int(token_id)
+                ).call()
+
+                if ct_balance == 0:
+                    continue
+
+                # 3. Look up market info
+                market = self.clob_client.get_market_by_token(token_id)
+                if not market:
+                    continue
+
+                condition_id = market.get("condition_id")
+                if not condition_id:
+                    continue
+
+                is_closed = (
+                    market.get("closed") is True
+                    or str(market.get("closed", "")).lower() == "true"
+                    or market.get("active") is False
+                    or str(market.get("active", "")).lower() == "false"
+                )
+
+                if not is_closed:
+                    # Active market — seed into _positions for ongoing monitoring
+                    if token_id not in self._positions:
+                        price = self.clob_client.get_last_trade_price(token_id)
+                        if price and price > 0:
+                            tokens = Decimal(ct_balance) / Decimal("1000000")
+                            self._positions[token_id] = {
+                                "tokens": tokens,
+                                "entry_price": Decimal(str(price)),
+                            }
+                            active_seeded += 1
+                            self.logger.info(
+                                "Discovered active position: %s (%.2f tokens @ $%.4f)",
+                                token_id[:16] + "...", tokens, price,
+                            )
+                    continue
+
+                # 4. Verify on-chain resolution
+                cond_bytes = bytes.fromhex(condition_id.replace("0x", ""))
+                payout_denom = self.conditional_tokens.functions.payoutDenominator(
+                    cond_bytes
+                ).call()
+                if payout_denom == 0:
+                    continue
+
+                # 5. Redeem
+                question = market.get("question", "unknown")
+                self.logger.info(
+                    "STARTUP REDEEM: Resolved position — token %s, "
+                    "question: %s, balance: %d",
+                    token_id[:16] + "...", question[:60], ct_balance,
+                )
+
+                if self.cfg.get("dry_run", False):
+                    self.logger.info(
+                        "[DRY RUN] Would redeem for condition %s",
+                        condition_id[:16] + "...",
+                    )
+                    results.append({
+                        "status": "dry_run",
+                        "token_id": token_id,
+                        "balance": ct_balance,
+                    })
+                    continue
+
+                tx = self.conditional_tokens.functions.redeemPositions(
+                    Web3.to_checksum_address(USDC_ADDRESS),
+                    b"\x00" * 32,
+                    cond_bytes,
+                    [1, 2],
+                ).build_transaction(self._base_tx_params())
+
+                receipt = self._sign_and_send(tx)
+                if receipt and receipt.status == 1:
+                    self.logger.info(
+                        "Startup redemption OK: tx %s — USDC returned to wallet",
+                        receipt.transactionHash.hex(),
+                    )
+                    self.invalidate_balance_cache()
+                    results.append({
+                        "status": "redeemed",
+                        "token_id": token_id,
+                        "balance": ct_balance,
+                        "tx_hash": receipt.transactionHash.hex(),
+                    })
+                else:
+                    self.logger.warning(
+                        "Startup redemption tx failed for token %s",
+                        token_id[:16] + "...",
+                    )
+                    results.append({
+                        "status": "failed",
+                        "token_id": token_id,
+                    })
+
+            except Exception as exc:
+                self.logger.debug(
+                    "Error scanning token %s: %s", token_id[:16] + "...", exc,
+                )
+
+        redeemed = sum(1 for r in results if r["status"] == "redeemed")
+        self.logger.info(
+            "Portfolio scan complete: %d resolved position(s) processed, "
+            "%d redeemed, %d active position(s) loaded for monitoring",
+            len(results), redeemed, active_seeded,
+        )
+        return results
 
     def check_and_redeem_settled(self):
         """Scan positions for resolved markets and redeem tokens back to USDC.
@@ -1734,6 +1912,18 @@ class CopyTraderBot:
             self._init_executor()
             watched = self.cfg.get("watched_addresses", [])
             self.on_chain_monitor = OnChainMonitor(self.w3, watched, self.logger)
+
+            # Startup portfolio scan — discover and redeem any settled
+            # positions from the wallet's trade history, and seed active
+            # positions into the tracker.
+            if self.executor and self.cfg.get("auto_redeem_settled", True):
+                try:
+                    self.executor.scan_and_redeem_portfolio()
+                except Exception as scan_exc:
+                    self.logger.warning(
+                        "Startup portfolio scan failed (non-fatal): %s",
+                        scan_exc,
+                    )
 
         poll_interval = self.cfg.get("poll_interval_seconds", 15)
         self.logger.info(
