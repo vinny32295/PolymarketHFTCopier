@@ -1,0 +1,12 @@
+{
+  "rpc_url": "",
+  "ws_rpc_url": "",
+  "private_key_file": ".private_key",
+  "watched_addresses": [],
+  "copy_percentage": 50,
+  "max_trade_usdc": 100.0,
+  "slippage_tolerance_bps": 100,
+  "gas_multiplier": 1.2,
+  "poll_interval_seconds": 10,
+  "use_clob_api": true
+}
