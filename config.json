@@ -7,7 +7,7 @@
   "max_trade_usdc": 100.0,
   "slippage_tolerance_bps": 100,
   "gas_multiplier": 1.2,
-  "poll_interval_seconds": 10,
+  "poll_interval_seconds": 15,
   "use_clob_api": true,
   "clob_api_key": "",
   "clob_api_secret": "",

@@ -160,7 +160,7 @@ DEFAULT_CONFIG = {
     "max_trade_usdc": 100.0,
     "slippage_tolerance_bps": 100,
     "gas_multiplier": 1.2,
-    "poll_interval_seconds": 10,
+    "poll_interval_seconds": 15,
     "use_clob_api": True,
     "clob_api_key": "",
     "clob_api_secret": "",
@@ -704,6 +704,10 @@ class TradeExecutor:
         self._nonce_lock = threading.Lock()
         self._nonce = None
 
+        # Balance cache – avoid hitting the RPC on every trade
+        self._cached_balance = None
+        self._balance_timestamp = 0
+
         # Contract handles
         self.usdc = w3.eth.contract(
             address=Web3.to_checksum_address(USDC_ADDRESS), abi=ERC20_ABI
@@ -725,10 +729,30 @@ class TradeExecutor:
         with self._nonce_lock:
             self._nonce = None
 
-    def get_usdc_balance(self):
-        """Return USDC balance as a Decimal (6 decimals)."""
+    def get_usdc_balance(self, max_age_seconds=300):
+        """Return USDC balance as a Decimal (6 decimals).
+
+        Results are cached for *max_age_seconds* (default 5 min) to reduce
+        RPC load.  Pass ``max_age_seconds=0`` to force a fresh fetch.
+        """
+        now = time.time()
+        if (
+            self._cached_balance is not None
+            and max_age_seconds > 0
+            and now - self._balance_timestamp < max_age_seconds
+        ):
+            self.logger.debug("Using cached USDC balance")
+            return self._cached_balance
+
         raw = self.usdc.functions.balanceOf(self.address).call()
-        return Decimal(raw) / Decimal("1000000")
+        self._cached_balance = Decimal(raw) / Decimal("1000000")
+        self._balance_timestamp = now
+        return self._cached_balance
+
+    def invalidate_balance_cache(self):
+        """Clear the cached balance so the next call fetches fresh data."""
+        self._cached_balance = None
+        self._balance_timestamp = 0
 
     def get_matic_balance(self):
         """Return native MATIC/POL balance in ether."""
@@ -886,6 +910,7 @@ class TradeExecutor:
                 )
                 if result:
                     self.logger.info("Order submitted to CLOB: %s", result)
+                    self.invalidate_balance_cache()
                     return {
                         "status": "submitted",
                         "side": side,
@@ -1002,8 +1027,11 @@ class CopyTraderBot:
             cfg=self.cfg, private_key=pk, logger=self.logger,
         )
         # Seed existing trades so we don't copy old history
-        for addr in self.cfg.get("watched_addresses", []):
+        watched = self.cfg.get("watched_addresses", [])
+        for i, addr in enumerate(watched):
             self.clob_client.seed_seen_trades(addr)
+            if i < len(watched) - 1:
+                time.sleep(0.5)  # throttle API calls between addresses
 
     def start(self):
         if self.running:
@@ -1029,7 +1057,7 @@ class CopyTraderBot:
             watched = self.cfg.get("watched_addresses", [])
             self.on_chain_monitor = OnChainMonitor(self.w3, watched, self.logger)
 
-        poll_interval = self.cfg.get("poll_interval_seconds", 10)
+        poll_interval = self.cfg.get("poll_interval_seconds", 15)
         self.logger.info(
             "Monitoring %d address(es), poll interval %ds",
             len(self.cfg.get("watched_addresses", [])),
@@ -1344,7 +1372,7 @@ class CopyTraderGUI:
         self.max_trade_entry.insert(0, str(self.cfg.get("max_trade_usdc", 100)))
         self.fixed_trade_entry.insert(0, str(self.cfg.get("fixed_trade_usdc", 0)))
         self.slippage_entry.insert(0, str(self.cfg.get("slippage_tolerance_bps", 100)))
-        self.poll_entry.insert(0, str(self.cfg.get("poll_interval_seconds", 10)))
+        self.poll_entry.insert(0, str(self.cfg.get("poll_interval_seconds", 15)))
         self.use_clob_var.set(self.cfg.get("use_clob_api", True))
         self.dry_run_var.set(self.cfg.get("dry_run", False))
         # API credentials
@@ -1654,7 +1682,7 @@ POLYMARKET COPY TRADER BOT — USAGE INSTRUCTIONS
      "max_trade_usdc": 100.0,
      "slippage_tolerance_bps": 100,
      "gas_multiplier": 1.2,
-     "poll_interval_seconds": 10,
+     "poll_interval_seconds": 15,
      "use_clob_api": true,
      "clob_api_key": "",
      "clob_api_secret": "",
