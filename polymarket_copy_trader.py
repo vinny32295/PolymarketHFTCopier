@@ -912,6 +912,38 @@ class TradeExecutor:
             )
             price = trade_info.get("price", 0.5)
 
+            # --- Enforce Polymarket order minimums early ---
+            # The CLOB API requires both ≥5 tokens AND ≥$1 USDC notional.
+            # Compute the minimum viable USDC now so the balance cap and
+            # allowance approval use the real order size (not the pre-bump
+            # amount that place_order would silently inflate).
+            price_f = float(price) if not isinstance(price, float) else price
+            if price_f > 0:
+                min_viable_usdc = max(
+                    MIN_ORDER_SIZE_TOKENS * price_f,
+                    MIN_ORDER_NOTIONAL_USDC,
+                )
+                if float(copy_amount) < min_viable_usdc:
+                    # Check balance before committing to the bumped amount
+                    try:
+                        balance = float(self.get_usdc_balance())
+                        if min_viable_usdc > balance * 0.95:
+                            self.logger.info(
+                                "Min viable order $%.2f exceeds 95%% of balance $%.2f, "
+                                "skipping trade",
+                                min_viable_usdc, balance,
+                            )
+                            return None
+                    except Exception:
+                        pass  # let it proceed; place_order will fail gracefully
+                    self.logger.info(
+                        "Bumping copy amount from $%.2f to min viable $%.2f "
+                        "(price=%.4f, min_tokens=%d, min_notional=$%.0f)",
+                        copy_amount, min_viable_usdc,
+                        price_f, MIN_ORDER_SIZE_TOKENS, MIN_ORDER_NOTIONAL_USDC,
+                    )
+                    copy_amount = Decimal(str(round(min_viable_usdc, 6)))
+
             self.logger.info(
                 "COPY TRADE: %s %.2f USDC of token %s (original: %.2f USDC, price: %s)",
                 side, copy_amount, token_id[:16] + "..." if len(token_id) > 16 else token_id,

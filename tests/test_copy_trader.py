@@ -358,6 +358,37 @@ class TestTradeExecutorDryRun(unittest.TestCase):
         })
         self.assertIsNone(result)
 
+    def test_min_viable_bump_before_balance_check(self):
+        """copy_amount is bumped to min viable USDC before order placement."""
+        executor = self._make_executor(dry_run=True)
+        # Small original trade: 50% of $0.10 = $0.05
+        # Price 0.80 → min viable = max(5*0.80, 1.0) = $4.00
+        # Balance is $1000, so bump should succeed
+        result = executor.execute_copy_trade({
+            "side": "BUY",
+            "size": "0.10",
+            "asset_id": "token123",
+            "price": 0.80,
+        })
+        self.assertIsNotNone(result)
+        self.assertEqual(result["status"], "dry_run")
+        self.assertAlmostEqual(result["amount_usdc"], 4.0, places=1)
+
+    def test_min_viable_skips_when_balance_insufficient(self):
+        """Skip trade when min viable USDC exceeds available balance."""
+        # Balance = $2.00 → 95% = $1.90
+        # Price 0.80 → min viable = $4.00 > $1.90 → skip
+        executor = self._make_executor(dry_run=False)
+        executor.get_usdc_balance = MagicMock(return_value=Decimal("2.0"))
+        result = executor.execute_copy_trade({
+            "side": "BUY",
+            "size": "0.10",
+            "asset_id": "token123",
+            "price": 0.80,
+        })
+        self.assertIsNone(result)
+        executor.ensure_usdc_approval.assert_not_called()
+
 
 class TestOnChainMonitor(unittest.TestCase):
     """Test on-chain monitor address filtering."""
