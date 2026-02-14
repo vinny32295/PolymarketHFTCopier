@@ -365,6 +365,66 @@ class TestCopyTraderBot(unittest.TestCase):
         logger.warning.assert_called_with("Bot is already running")
 
 
+class TestBalanceCaching(unittest.TestCase):
+    """Test USDC balance caching in TradeExecutor."""
+
+    def _make_executor(self):
+        w3 = MagicMock()
+        mock_account = MagicMock()
+        mock_account.address = "0x" + "1" * 40
+        w3.eth.account.from_key.return_value = mock_account
+
+        mock_contract = MagicMock()
+        mock_contract.functions.balanceOf.return_value.call.return_value = 500_000_000  # 500 USDC
+        w3.eth.contract.return_value = mock_contract
+
+        cfg = dict(bot.DEFAULT_CONFIG)
+        executor = bot.TradeExecutor(
+            w3=w3,
+            private_key="0x" + "a" * 64,
+            cfg=cfg,
+            logger=logging.getLogger("test"),
+        )
+        return executor, mock_contract
+
+    def test_balance_is_cached(self):
+        executor, mock_contract = self._make_executor()
+        b1 = executor.get_usdc_balance()
+        b2 = executor.get_usdc_balance()
+        self.assertEqual(b1, b2)
+        # balanceOf should only be called once (cached on second call)
+        self.assertEqual(
+            mock_contract.functions.balanceOf.return_value.call.call_count, 1
+        )
+
+    def test_cache_bypass_with_zero_max_age(self):
+        executor, mock_contract = self._make_executor()
+        executor.get_usdc_balance()
+        executor.get_usdc_balance(max_age_seconds=0)
+        self.assertEqual(
+            mock_contract.functions.balanceOf.return_value.call.call_count, 2
+        )
+
+    def test_invalidate_balance_cache(self):
+        executor, mock_contract = self._make_executor()
+        executor.get_usdc_balance()
+        executor.invalidate_balance_cache()
+        executor.get_usdc_balance()
+        self.assertEqual(
+            mock_contract.functions.balanceOf.return_value.call.call_count, 2
+        )
+
+    def test_cache_expiry(self):
+        executor, mock_contract = self._make_executor()
+        executor.get_usdc_balance(max_age_seconds=1)
+        # Manually expire the cache
+        executor._balance_timestamp -= 2
+        executor.get_usdc_balance(max_age_seconds=1)
+        self.assertEqual(
+            mock_contract.functions.balanceOf.return_value.call.call_count, 2
+        )
+
+
 class TestConstants(unittest.TestCase):
     """Verify contract addresses and ABIs are well-formed."""
 
