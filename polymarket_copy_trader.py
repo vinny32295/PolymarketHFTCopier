@@ -97,6 +97,10 @@ MIN_ORDER_NOTIONAL_USDC = 1.05  # slightly above $1 to stay above min after fees
 LOW_BALANCE_PAUSE_THRESHOLD = Decimal("1.05")   # can't even fill the smallest order
 LOW_BALANCE_RESUME_THRESHOLD = Decimal("100")    # $100 minimum to start trading again
 
+# Auto-exit thresholds for open positions
+TAKE_PROFIT_PRICE = Decimal("0.99")   # sell when token price reaches 99c (near-certain outcome)
+STOP_LOSS_PCT = Decimal("0.50")       # sell when price drops to 50% of entry price
+
 # Polymarket CLOB API base URL
 CLOB_API_BASE = "https://clob.polymarket.com"
 
@@ -812,10 +816,10 @@ class TradeExecutor:
         self._open_orders = {}
         self._order_ttl = cfg.get("order_ttl_seconds", 300)
 
-        # Position tracker: token_id -> Decimal tokens owned.
-        # Prevents selling tokens we never bought and caps sells to what
-        # we actually hold.
-        self._positions = {}  # type: dict[str, Decimal]
+        # Position tracker: token_id -> {tokens: Decimal, entry_price: Decimal}
+        # Prevents selling tokens we never bought, caps sells to what we
+        # actually hold, and enables take-profit / stop-loss exits.
+        self._positions = {}  # type: dict[str, dict]
 
         # Contract handles
         self.usdc = w3.eth.contract(
@@ -984,6 +988,123 @@ class TradeExecutor:
 
         return {"filled": filled, "cancelled": cancelled, "still_open": still_open}
 
+    # ------------------------------------------------------------------
+    # Auto-exit: take-profit & stop-loss
+    # ------------------------------------------------------------------
+
+    def check_exit_conditions(self):
+        """Scan all open positions and sell any that hit exit thresholds.
+
+        - **Take-profit**: current price >= 0.99  (near-certain outcome)
+        - **Stop-loss**:   current price <= 50% of entry price
+
+        Requires a CLOB client to fetch live prices and place sell orders.
+        Returns a list of sell results (one per exited position), or an
+        empty list when there is nothing to do.
+        """
+        if not self.clob_client:
+            return []
+        if not self._positions:
+            return []
+
+        results = []
+        # Iterate over a snapshot so we can mutate _positions safely
+        for token_id, pos in list(self._positions.items()):
+            tokens = pos["tokens"]
+            entry_price = pos["entry_price"]
+            if tokens <= 0:
+                continue
+
+            current_price = self.clob_client.get_last_trade_price(token_id)
+            if current_price is None:
+                continue
+            current_price_d = Decimal(str(current_price))
+
+            reason = None
+            if current_price_d >= TAKE_PROFIT_PRICE:
+                reason = "take-profit"
+            elif entry_price > 0 and current_price_d <= entry_price * STOP_LOSS_PCT:
+                reason = "stop-loss"
+
+            if reason is None:
+                continue
+
+            sell_usdc = float(tokens * current_price_d)
+            self.logger.warning(
+                "AUTO-EXIT (%s): selling %.2f tokens of %s "
+                "(entry=%.4f, current=%.4f, value=$%.2f)",
+                reason,
+                tokens,
+                token_id[:16] + "..." if len(token_id) > 16 else token_id,
+                entry_price,
+                current_price_d,
+                sell_usdc,
+            )
+
+            if self.cfg.get("dry_run", False):
+                self.logger.info(
+                    "[DRY RUN] Would auto-exit %s: SELL $%.2f of token %s",
+                    reason, sell_usdc, token_id[:20],
+                )
+                results.append({
+                    "status": "dry_run",
+                    "reason": reason,
+                    "side": "SELL",
+                    "amount_usdc": sell_usdc,
+                    "token_id": token_id,
+                    "price": float(current_price_d),
+                })
+                continue
+
+            # Place a SELL order for the full position
+            slippage_mult = Decimal(str(self.slippage_bps)) / Decimal("10000")
+            adjusted_price = float(current_price_d * (Decimal("1") - slippage_mult))
+            adjusted_price = max(adjusted_price, 0.01)
+
+            result = self.clob_client.place_order(
+                token_id=token_id,
+                side="SELL",
+                size_usdc=sell_usdc,
+                price=adjusted_price,
+            )
+            if result:
+                self.logger.info(
+                    "Auto-exit %s order submitted: %s", reason, result,
+                )
+                self.invalidate_balance_cache()
+                # Clear the position
+                del self._positions[token_id]
+
+                order_id = None
+                if isinstance(result, dict):
+                    order_id = (
+                        result.get("orderID")
+                        or result.get("id")
+                        or result.get("order_id")
+                    )
+                if order_id:
+                    self.track_order(
+                        order_id, "SELL", token_id,
+                        adjusted_price, sell_usdc,
+                    )
+
+                results.append({
+                    "status": "submitted",
+                    "reason": reason,
+                    "side": "SELL",
+                    "amount_usdc": sell_usdc,
+                    "token_id": token_id,
+                    "price": adjusted_price,
+                    "clob_response": result,
+                })
+            else:
+                self.logger.warning(
+                    "Auto-exit %s order failed for token %s",
+                    reason, token_id[:16] + "...",
+                )
+
+        return results
+
     def compute_copy_amount(self, original_usdc_amount):
         """Return the copy amount in USDC.
 
@@ -1134,7 +1255,8 @@ class TradeExecutor:
 
             # --- SELL guard: only sell tokens we actually hold ---
             if side == "SELL":
-                held = self._positions.get(token_id, Decimal("0"))
+                pos = self._positions.get(token_id)
+                held = pos["tokens"] if pos else Decimal("0")
                 if held <= 0:
                     self.logger.info(
                         "SELL skipped – no position in token %s",
@@ -1203,16 +1325,41 @@ class TradeExecutor:
                         else Decimal("0")
                     )
                     if side == "BUY":
-                        self._positions[token_id] = (
-                            self._positions.get(token_id, Decimal("0")) + tokens
-                        )
+                        pos = self._positions.get(token_id)
+                        if pos:
+                            # Weighted-average entry price
+                            old_tokens = pos["tokens"]
+                            old_cost = old_tokens * pos["entry_price"]
+                            new_cost = tokens * Decimal(str(adjusted_price))
+                            total_tokens = old_tokens + tokens
+                            avg_price = (
+                                (old_cost + new_cost) / total_tokens
+                                if total_tokens > 0
+                                else Decimal(str(adjusted_price))
+                            )
+                            pos["tokens"] = total_tokens
+                            pos["entry_price"] = avg_price
+                        else:
+                            self._positions[token_id] = {
+                                "tokens": tokens,
+                                "entry_price": Decimal(str(adjusted_price)),
+                            }
                     elif side == "SELL":
-                        held = self._positions.get(token_id, Decimal("0"))
-                        self._positions[token_id] = max(held - tokens, Decimal("0"))
+                        pos = self._positions.get(token_id)
+                        if pos:
+                            pos["tokens"] = max(pos["tokens"] - tokens, Decimal("0"))
+                            # Remove position entirely if fully closed
+                            if pos["tokens"] <= 0:
+                                del self._positions[token_id]
+                    cur_tokens = (
+                        self._positions[token_id]["tokens"]
+                        if token_id in self._positions
+                        else Decimal("0")
+                    )
                     self.logger.info(
                         "Position updated: token %s now %.2f tokens",
                         token_id[:16] + "...",
-                        self._positions.get(token_id, Decimal("0")),
+                        cur_tokens,
                     )
 
                     # Track the order for fill monitoring
@@ -1447,6 +1594,16 @@ class CopyTraderBot:
                     except Exception as mon_exc:
                         self.logger.debug(
                             "Order monitor error: %s", mon_exc,
+                        )
+
+                # --- Auto-exit positions at take-profit / stop-loss ---
+                # Runs even while paused so we protect existing positions.
+                if self.executor:
+                    try:
+                        self.executor.check_exit_conditions()
+                    except Exception as exit_exc:
+                        self.logger.debug(
+                            "Exit condition check error: %s", exit_exc,
                         )
 
                 # --- Skip trade detection & execution while paused ---

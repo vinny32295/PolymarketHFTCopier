@@ -436,7 +436,7 @@ class TestPositionTracking(unittest.TestCase):
         """After a BUY, a subsequent SELL on the same token should proceed."""
         executor = self._make_executor()
         # Simulate a buy that records a position
-        executor._positions["token_abc"] = Decimal("20")
+        executor._positions["token_abc"] = {"tokens": Decimal("20"), "entry_price": Decimal("0.50")}
         result = executor.execute_copy_trade({
             "side": "SELL",
             "size": "5.0",
@@ -450,7 +450,7 @@ class TestPositionTracking(unittest.TestCase):
         """SELL amount is capped to the tokens we actually hold."""
         executor = self._make_executor()
         # We hold 10 tokens at price 0.50 = $5 worth
-        executor._positions["token_abc"] = Decimal("10")
+        executor._positions["token_abc"] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
         result = executor.execute_copy_trade({
             "side": "SELL",
             "size": "100.0",  # Try to sell $100 worth
@@ -829,6 +829,201 @@ class TestCLOBClientOrderMethods(unittest.TestCase):
         client = self._make_client()
         client.clob_sdk = None
         self.assertIsNone(client.cancel_order("order1"))
+
+
+class TestAutoExitConditions(unittest.TestCase):
+    """Test take-profit (>= .99) and stop-loss (<= 50% of entry) auto-exits."""
+
+    def _make_executor(self, dry_run=False):
+        w3 = MagicMock()
+        mock_account = MagicMock()
+        mock_account.address = "0x" + "1" * 40
+        w3.eth.account.from_key.return_value = mock_account
+        w3.eth.contract.return_value = MagicMock()
+
+        cfg = dict(bot.DEFAULT_CONFIG)
+        cfg["dry_run"] = dry_run
+        cfg["slippage_tolerance_bps"] = 100
+
+        executor = bot.TradeExecutor(
+            w3=w3,
+            private_key="0x" + "a" * 64,
+            cfg=cfg,
+            logger=logging.getLogger("test_exit"),
+        )
+        executor.get_usdc_balance = MagicMock(return_value=Decimal("1000"))
+        executor.ensure_usdc_approval = MagicMock()
+
+        # Mock CLOB client
+        executor.clob_client = MagicMock()
+        executor.clob_client.clob_sdk = MagicMock()
+        executor.clob_client.place_order.return_value = {"orderID": "exit_order_1"}
+        return executor
+
+    def test_no_positions_returns_empty(self):
+        executor = self._make_executor()
+        results = executor.check_exit_conditions()
+        self.assertEqual(results, [])
+
+    def test_no_clob_client_returns_empty(self):
+        executor = self._make_executor()
+        executor._positions["tok1"] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
+        executor.clob_client = None
+        results = executor.check_exit_conditions()
+        self.assertEqual(results, [])
+
+    def test_take_profit_at_99(self):
+        """Position should be sold when price reaches 0.99."""
+        executor = self._make_executor()
+        executor._positions["tok1"] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
+        executor.clob_client.get_last_trade_price.return_value = 0.99
+
+        results = executor.check_exit_conditions()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["reason"], "take-profit")
+        self.assertEqual(results[0]["side"], "SELL")
+        self.assertEqual(results[0]["status"], "submitted")
+        # Position should be cleared
+        self.assertNotIn("tok1", executor._positions)
+
+    def test_take_profit_above_99(self):
+        """Position should be sold when price exceeds 0.99."""
+        executor = self._make_executor()
+        executor._positions["tok1"] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
+        executor.clob_client.get_last_trade_price.return_value = 1.0
+
+        results = executor.check_exit_conditions()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["reason"], "take-profit")
+
+    def test_stop_loss_at_50_pct(self):
+        """Position should be sold when price drops to 50% of entry."""
+        executor = self._make_executor()
+        # Entry at 0.60, stop-loss triggers at 0.30
+        executor._positions["tok1"] = {"tokens": Decimal("10"), "entry_price": Decimal("0.60")}
+        executor.clob_client.get_last_trade_price.return_value = 0.30
+
+        results = executor.check_exit_conditions()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["reason"], "stop-loss")
+        self.assertEqual(results[0]["side"], "SELL")
+        self.assertNotIn("tok1", executor._positions)
+
+    def test_stop_loss_below_50_pct(self):
+        """Position should be sold when price drops well below 50% of entry."""
+        executor = self._make_executor()
+        executor._positions["tok1"] = {"tokens": Decimal("10"), "entry_price": Decimal("0.80")}
+        # 50% of 0.80 = 0.40; price is 0.10
+        executor.clob_client.get_last_trade_price.return_value = 0.10
+
+        results = executor.check_exit_conditions()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["reason"], "stop-loss")
+
+    def test_no_exit_in_normal_range(self):
+        """No exit when price is between stop-loss and take-profit."""
+        executor = self._make_executor()
+        executor._positions["tok1"] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
+        # 50% of 0.50 = 0.25; price 0.45 is above 0.25 and below 0.99
+        executor.clob_client.get_last_trade_price.return_value = 0.45
+
+        results = executor.check_exit_conditions()
+
+        self.assertEqual(results, [])
+        # Position should still exist
+        self.assertIn("tok1", executor._positions)
+
+    def test_no_exit_just_above_stop_loss(self):
+        """No exit when price is just above the 50% stop-loss level."""
+        executor = self._make_executor()
+        executor._positions["tok1"] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
+        # 50% of 0.50 = 0.25; price is 0.26 (just above)
+        executor.clob_client.get_last_trade_price.return_value = 0.26
+
+        results = executor.check_exit_conditions()
+        self.assertEqual(results, [])
+
+    def test_no_exit_just_below_take_profit(self):
+        """No exit when price is just below 0.99."""
+        executor = self._make_executor()
+        executor._positions["tok1"] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
+        executor.clob_client.get_last_trade_price.return_value = 0.98
+
+        results = executor.check_exit_conditions()
+        self.assertEqual(results, [])
+
+    def test_dry_run_does_not_place_order(self):
+        """In dry-run mode, exit is logged but no order is placed."""
+        executor = self._make_executor(dry_run=True)
+        executor._positions["tok1"] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
+        executor.clob_client.get_last_trade_price.return_value = 0.99
+
+        results = executor.check_exit_conditions()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "dry_run")
+        self.assertEqual(results[0]["reason"], "take-profit")
+        # CLOB place_order should NOT have been called
+        executor.clob_client.place_order.assert_not_called()
+        # Position should still exist in dry run
+        self.assertIn("tok1", executor._positions)
+
+    def test_multiple_positions_exits(self):
+        """Multiple positions can exit in the same check cycle."""
+        executor = self._make_executor()
+        # tok1: take-profit (price at 0.99)
+        executor._positions["tok1"] = {"tokens": Decimal("5"), "entry_price": Decimal("0.50")}
+        # tok2: stop-loss (entry 0.80, price at 0.30 — below 50%)
+        executor._positions["tok2"] = {"tokens": Decimal("8"), "entry_price": Decimal("0.80")}
+        # tok3: normal range (no exit)
+        executor._positions["tok3"] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
+
+        def mock_price(token_id):
+            prices = {"tok1": 0.99, "tok2": 0.30, "tok3": 0.60}
+            return prices.get(token_id)
+
+        executor.clob_client.get_last_trade_price.side_effect = mock_price
+
+        results = executor.check_exit_conditions()
+
+        self.assertEqual(len(results), 2)
+        reasons = {r["reason"] for r in results}
+        self.assertEqual(reasons, {"take-profit", "stop-loss"})
+        # tok1 and tok2 should be gone, tok3 should remain
+        self.assertNotIn("tok1", executor._positions)
+        self.assertNotIn("tok2", executor._positions)
+        self.assertIn("tok3", executor._positions)
+
+    def test_price_fetch_failure_skips_position(self):
+        """If price fetch returns None, skip that position gracefully."""
+        executor = self._make_executor()
+        executor._positions["tok1"] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
+        executor.clob_client.get_last_trade_price.return_value = None
+
+        results = executor.check_exit_conditions()
+        self.assertEqual(results, [])
+        self.assertIn("tok1", executor._positions)
+
+    def test_order_failure_keeps_position(self):
+        """If the sell order fails, the position should remain."""
+        executor = self._make_executor()
+        executor._positions["tok1"] = {"tokens": Decimal("10"), "entry_price": Decimal("0.50")}
+        executor.clob_client.get_last_trade_price.return_value = 0.99
+        executor.clob_client.place_order.return_value = None  # order fails
+
+        results = executor.check_exit_conditions()
+        self.assertEqual(results, [])
+        # Position should still exist since the order failed
+        self.assertIn("tok1", executor._positions)
+
+    def test_exit_thresholds_are_correct(self):
+        """Verify the exit threshold constants have expected values."""
+        self.assertEqual(bot.TAKE_PROFIT_PRICE, Decimal("0.99"))
+        self.assertEqual(bot.STOP_LOSS_PCT, Decimal("0.50"))
 
 
 class TestLowBalancePauseResume(unittest.TestCase):
