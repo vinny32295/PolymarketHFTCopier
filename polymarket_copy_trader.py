@@ -82,6 +82,10 @@ USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 # Conditional Tokens contract (Gnosis)
 CONDITIONAL_TOKENS_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 
+# Polymarket minimum order constraints
+MIN_ORDER_SIZE_TOKENS = 5    # minimum outcome tokens per order
+MIN_ORDER_NOTIONAL_USDC = 1.0  # minimum USDC notional for marketable orders
+
 # Polymarket CLOB API base URL
 CLOB_API_BASE = "https://clob.polymarket.com"
 
@@ -469,7 +473,28 @@ class PolymarketCLOBClient:
 
             # Build order arguments — size is in shares, not USDC
             # shares = usdc_amount / price_per_share
-            size_shares = round(size_usdc / price, 2) if price > 0 else 0
+            if price <= 0:
+                self.logger.error("Invalid price %s – cannot place order", price)
+                return None
+
+            # Compute the minimum USDC needed to satisfy both Polymarket
+            # constraints: ≥5 outcome tokens AND ≥$1 USDC notional.
+            min_usdc_for_tokens = MIN_ORDER_SIZE_TOKENS * price
+            effective_usdc = max(size_usdc, min_usdc_for_tokens,
+                                MIN_ORDER_NOTIONAL_USDC)
+            size_shares = round(effective_usdc / price, 2)
+
+            if effective_usdc > size_usdc:
+                self.logger.warning(
+                    "Order size %.2f USDC (%.2f tokens) below minimums; "
+                    "bumped to %.2f USDC (%.2f tokens) "
+                    "(min tokens=%d, min notional=$%.0f)",
+                    size_usdc, round(size_usdc / price, 2),
+                    effective_usdc, size_shares,
+                    MIN_ORDER_SIZE_TOKENS, MIN_ORDER_NOTIONAL_USDC,
+                )
+            actual_usdc = effective_usdc
+
             order_args = OrderArgs(
                 token_id=token_id,
                 price=round(price, 2),
@@ -480,8 +505,8 @@ class PolymarketCLOBClient:
             signed_order = self.clob_sdk.create_and_post_order(order_args)
 
             self.logger.info(
-                "CLOB order placed: %s %.2f USDC @ %.4f for token %s",
-                side, size_usdc, price, token_id[:16] + "...",
+                "CLOB order placed: %s %.2f USDC (%.2f tokens) @ %.4f for token %s",
+                side, actual_usdc, size_shares, price, token_id[:16] + "...",
             )
             return signed_order
 
@@ -734,6 +759,10 @@ class TradeExecutor:
 
         Results are cached for *max_age_seconds* (default 5 min) to reduce
         RPC load.  Pass ``max_age_seconds=0`` to force a fresh fetch.
+
+        If the RPC call fails and a (possibly stale) cached value exists it
+        is returned with a warning.  When no cached value is available the
+        exception propagates.
         """
         now = time.time()
         if (
@@ -744,9 +773,17 @@ class TradeExecutor:
             self.logger.debug("Using cached USDC balance")
             return self._cached_balance
 
-        raw = self.usdc.functions.balanceOf(self.address).call()
-        self._cached_balance = Decimal(raw) / Decimal("1000000")
-        self._balance_timestamp = now
+        try:
+            raw = self.usdc.functions.balanceOf(self.address).call()
+            self._cached_balance = Decimal(raw) / Decimal("1000000")
+            self._balance_timestamp = now
+        except Exception as exc:
+            if self._cached_balance is not None:
+                self.logger.warning(
+                    "USDC balance RPC failed (%s); using stale cached value", exc
+                )
+                return self._cached_balance
+            raise
         return self._cached_balance
 
     def invalidate_balance_cache(self):
@@ -764,14 +801,22 @@ class TradeExecutor:
 
         If fixed_trade_usdc > 0, use that flat amount for every trade.
         Otherwise scale the original by copy_percentage, capped to max_trade.
-        Always capped to 95% of available balance.
+        When the balance is available, also capped to 95% of it.
         """
         if self.fixed_trade > 0:
             base = self.fixed_trade
         else:
             base = Decimal(str(original_usdc_amount)) * self.copy_pct
-        balance = self.get_usdc_balance()
-        amount = min(base, self.max_trade, balance * Decimal("0.95"))
+        amount = min(base, self.max_trade)
+        try:
+            balance = self.get_usdc_balance()
+            amount = min(amount, balance * Decimal("0.95"))
+        except Exception as exc:
+            self.logger.warning(
+                "Could not fetch USDC balance for cap check (%s); "
+                "proceeding with max_trade cap only",
+                exc,
+            )
         return max(amount, Decimal("0"))
 
     def ensure_usdc_approval(self, spender, amount_raw):
@@ -1008,13 +1053,19 @@ class CopyTraderBot:
                 logger=self.logger,
             )
             self.logger.info("Executor initialized – wallet: %s", self.executor.address)
-            balance = self.executor.get_usdc_balance()
-            matic = self.executor.get_matic_balance()
-            self.logger.info("Balances – USDC: %.2f | MATIC: %.4f", balance, matic)
-            return True
         except Exception as exc:
             self.logger.error("Failed to initialize executor: %s", exc)
             return False
+        # Balance check is informational — don't let it block the executor
+        try:
+            balance = self.executor.get_usdc_balance()
+            matic = self.executor.get_matic_balance()
+            self.logger.info("Balances – USDC: %.2f | MATIC: %.4f", balance, matic)
+        except Exception as exc:
+            self.logger.warning(
+                "Could not fetch startup balances (will retry later): %s", exc
+            )
+        return True
 
     def _init_clob(self):
         if not self.cfg.get("use_clob_api", True):

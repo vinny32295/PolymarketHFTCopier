@@ -151,6 +151,89 @@ class TestCLOBClient(unittest.TestCase):
         self.assertEqual(len(new2), 0)
 
 
+class TestPlaceOrderMinSize(unittest.TestCase):
+    """Test minimum order size enforcement in place_order."""
+
+    def _make_client(self):
+        cfg = dict(bot.DEFAULT_CONFIG)
+        logger = logging.getLogger("test")
+        logger.handlers = []
+        logger.addHandler(logging.NullHandler())
+        client = bot.PolymarketCLOBClient.__new__(bot.PolymarketCLOBClient)
+        client.cfg = cfg
+        client.base_url = bot.CLOB_API_BASE
+        client.gamma_url = bot.GAMMA_API_BASE
+        client.session = MagicMock()
+        client.logger = logger
+        client._last_trade_ids = {}
+        client.clob_sdk = MagicMock()
+        # get_market returns no tick size info
+        client.clob_sdk.get_market.return_value = None
+        client.clob_sdk.create_and_post_order.return_value = {"orderID": "test123"}
+        return client
+
+    def _get_order_size(self, client):
+        """Extract the size kwarg passed to the OrderArgs constructor."""
+        # OrderArgs is a MagicMock; inspect the kwargs of its last call
+        call_kwargs = bot.OrderArgs.call_args[1]
+        return call_kwargs["size"]
+
+    def test_normal_size_not_bumped(self):
+        """When tokens >= 5 and USDC >= $1, size is not changed."""
+        client = self._make_client()
+        # $5 USDC at price 0.50 = 10 tokens (>5, >$1 — no bump)
+        client.place_order("token1", "BUY", 5.0, 0.50)
+        self.assertEqual(self._get_order_size(client), 10.0)
+
+    def test_small_tokens_bumped(self):
+        """When tokens < 5, bumped to satisfy token minimum."""
+        client = self._make_client()
+        # $2 USDC at price 0.90 = 2.22 tokens (<5)
+        # min_usdc_for_tokens = 5 * 0.90 = $4.50 -> 5.0 tokens
+        client.place_order("token1", "BUY", 2.0, 0.90)
+        self.assertEqual(self._get_order_size(client), 5.0)
+
+    def test_small_notional_bumped(self):
+        """When USDC < $1 notional minimum, bumped to $1."""
+        client = self._make_client()
+        # $0.30 USDC at price 0.05 = 6 tokens (>5 ok, but $0.30 <$1)
+        # effective_usdc = max(0.30, 5*0.05=0.25, 1.0) = $1.0 -> 20 tokens
+        client.place_order("token1", "BUY", 0.30, 0.05)
+        self.assertEqual(self._get_order_size(client), 20.0)
+
+    def test_both_minimums_token_wins(self):
+        """When both minimums trigger, the larger USDC requirement wins."""
+        client = self._make_client()
+        # $0.50 USDC at price 0.80 = 0.625 tokens (<5, and $0.50 <$1)
+        # min_usdc_for_tokens = 5 * 0.80 = $4.00 > $1.00 -> token min wins
+        # effective_usdc = $4.00 -> 5.0 tokens
+        client.place_order("token1", "BUY", 0.50, 0.80)
+        self.assertEqual(self._get_order_size(client), 5.0)
+
+    def test_both_minimums_notional_wins(self):
+        """When notional minimum requires more USDC than token minimum."""
+        client = self._make_client()
+        # $0.50 USDC at price 0.10 = 5 tokens (=5 ok, but $0.50 <$1)
+        # min_usdc_for_tokens = 5 * 0.10 = $0.50, notional = $1.00
+        # effective_usdc = max(0.50, 0.50, 1.0) = $1.00 -> 10 tokens
+        client.place_order("token1", "BUY", 0.50, 0.10)
+        self.assertEqual(self._get_order_size(client), 10.0)
+
+    def test_zero_price_returns_none(self):
+        """Price of 0 should return None, not divide by zero."""
+        client = self._make_client()
+        result = client.place_order("token1", "BUY", 5.0, 0.0)
+        self.assertIsNone(result)
+        client.clob_sdk.create_and_post_order.assert_not_called()
+
+    def test_exact_minimum_not_bumped(self):
+        """Exactly 5 tokens and >= $1 USDC should not be bumped."""
+        client = self._make_client()
+        # $5 USDC at price 1.0 = 5 tokens (exactly min, $5 >$1)
+        client.place_order("token1", "BUY", 5.0, 1.0)
+        self.assertEqual(self._get_order_size(client), 5.0)
+
+
 class TestTradeExecutorCopyAmount(unittest.TestCase):
     """Test compute_copy_amount scaling logic."""
 
@@ -205,6 +288,14 @@ class TestTradeExecutorCopyAmount(unittest.TestCase):
         # 10% of 5 = 0.5
         amount = executor.compute_copy_amount(Decimal("5"))
         self.assertEqual(amount, Decimal("0.5"))
+
+    def test_balance_fetch_failure_uses_max_trade_cap(self):
+        executor = self._make_executor(copy_pct=100, max_trade=50, usdc_balance=1000)
+        # Make balance fetch fail
+        executor.get_usdc_balance = MagicMock(side_effect=Exception("RPC down"))
+        # 100% of 200 = 200, capped by max_trade=50 (balance cap skipped)
+        amount = executor.compute_copy_amount(Decimal("200"))
+        self.assertEqual(amount, Decimal("50"))
 
 
 class TestTradeExecutorDryRun(unittest.TestCase):
@@ -423,6 +514,25 @@ class TestBalanceCaching(unittest.TestCase):
         self.assertEqual(
             mock_contract.functions.balanceOf.return_value.call.call_count, 2
         )
+
+    def test_rpc_failure_returns_stale_cache(self):
+        executor, mock_contract = self._make_executor()
+        # First call succeeds and populates cache
+        balance = executor.get_usdc_balance()
+        self.assertEqual(balance, Decimal("500"))
+        # Expire cache, then make RPC fail
+        executor._balance_timestamp -= 600
+        mock_contract.functions.balanceOf.return_value.call.side_effect = Exception("RPC down")
+        # Should return stale cached value instead of raising
+        result = executor.get_usdc_balance()
+        self.assertEqual(result, Decimal("500"))
+
+    def test_rpc_failure_no_cache_raises(self):
+        executor, mock_contract = self._make_executor()
+        # Make RPC fail on the very first call (no cache yet)
+        mock_contract.functions.balanceOf.return_value.call.side_effect = Exception("RPC down")
+        with self.assertRaises(Exception):
+            executor.get_usdc_balance()
 
 
 class TestConstants(unittest.TestCase):
