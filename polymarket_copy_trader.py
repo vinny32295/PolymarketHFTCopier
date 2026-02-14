@@ -41,7 +41,7 @@ except ImportError:
 # Polymarket official Python CLOB client (for authenticated API access)
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, OrderType
+    from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
     HAS_CLOB_SDK = True
 except ImportError:
     ClobClient = None
@@ -289,11 +289,11 @@ class PolymarketCLOBClient:
                     host=CLOB_API_BASE,
                     chain_id=137,
                     key=private_key if private_key else None,
-                    creds={
-                        "apiKey": api_key,
-                        "secret": api_secret,
-                        "passphrase": api_passphrase,
-                    },
+                    creds=ApiCreds(
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        api_passphrase=api_passphrase,
+                    ),
                 )
                 self.logger.info("CLOB SDK initialized with stored API credentials")
                 return
@@ -323,11 +323,7 @@ class PolymarketCLOBClient:
                     host=CLOB_API_BASE,
                     chain_id=137,
                     key=private_key,
-                    creds={
-                        "apiKey": creds.api_key,
-                        "secret": creds.api_secret,
-                        "passphrase": creds.api_passphrase,
-                    },
+                    creds=creds,
                 )
                 self.logger.info("CLOB SDK fully initialized with derived credentials")
             except Exception as exc:
@@ -801,7 +797,7 @@ class TradeExecutor:
           - price: the price per share (0-1 range)
         """
         try:
-            self.logger.info("Raw trade_info keys=%s data=%s", list(trade_info.keys()), json.dumps(trade_info, default=str)[:500])
+            self.logger.debug("Raw trade_info: %s", json.dumps(trade_info, default=str)[:500])
             side = str(trade_info.get("side", "BUY")).upper()
             # CLOB API: prefer usdcSize (actual USDC spent), fall back to size/amount
             clob_size = (
@@ -814,7 +810,7 @@ class TradeExecutor:
             else:
                 raw = Decimal(str(trade_info.get("makerAmountFilled", "0")))
                 original_usdc = raw / Decimal("1000000")
-            self.logger.info("Trade size parsing: raw=%s -> original_usdc=%s", clob_size or trade_info.get("makerAmountFilled"), original_usdc)
+            self.logger.debug("Trade size parsing: raw=%s -> original_usdc=%s", clob_size or trade_info.get("makerAmountFilled"), original_usdc)
             if original_usdc <= 0:
                 self.logger.warning("Skipping trade with zero/negative size")
                 return None
