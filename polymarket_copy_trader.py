@@ -456,11 +456,13 @@ class PolymarketCLOBClient:
             except Exception:
                 pass
 
-            # Build order arguments
+            # Build order arguments — size is in shares, not USDC
+            # shares = usdc_amount / price_per_share
+            size_shares = round(size_usdc / price, 2) if price > 0 else 0
             order_args = OrderArgs(
                 token_id=token_id,
                 price=round(price, 2),
-                size=round(size_usdc, 2),
+                size=size_shares,
                 side=side.upper(),
             )
 
@@ -801,8 +803,12 @@ class TradeExecutor:
         try:
             self.logger.info("Raw trade_info keys=%s data=%s", list(trade_info.keys()), json.dumps(trade_info, default=str)[:500])
             side = str(trade_info.get("side", "BUY")).upper()
-            # CLOB API returns size/amount in USDC; on-chain returns raw units (6 decimals)
-            clob_size = trade_info.get("size") or trade_info.get("amount")
+            # CLOB API: prefer usdcSize (actual USDC spent), fall back to size/amount
+            clob_size = (
+                trade_info.get("usdcSize")
+                or trade_info.get("size")
+                or trade_info.get("amount")
+            )
             if clob_size:
                 original_usdc = Decimal(str(clob_size))
             else:
@@ -819,7 +825,8 @@ class TradeExecutor:
                 return None
 
             token_id = str(
-                trade_info.get("asset_id")
+                trade_info.get("asset")
+                or trade_info.get("asset_id")
                 or trade_info.get("tokenId")
                 or trade_info.get("makerAssetId", "")
             )
