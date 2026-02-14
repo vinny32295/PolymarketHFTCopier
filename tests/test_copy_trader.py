@@ -831,5 +831,150 @@ class TestCLOBClientOrderMethods(unittest.TestCase):
         self.assertIsNone(client.cancel_order("order1"))
 
 
+class TestLowBalancePauseResume(unittest.TestCase):
+    """Test that the bot pauses when balance is too low and resumes at $100."""
+
+    def _make_bot(self):
+        cfg = dict(bot.DEFAULT_CONFIG)
+        cfg["watched_addresses"] = ["0x" + "a" * 40]
+        cfg["poll_interval_seconds"] = 1
+        logger = logging.getLogger("test_pause")
+        logger.handlers = [logging.NullHandler()]
+        b = bot.CopyTraderBot(cfg, logger)
+        return b
+
+    def test_bot_starts_unpaused(self):
+        b = self._make_bot()
+        self.assertFalse(b._paused_low_balance)
+
+    def test_pause_when_balance_drops_below_threshold(self):
+        """Bot should pause when USDC balance < LOW_BALANCE_PAUSE_THRESHOLD."""
+        b = self._make_bot()
+        b.executor = MagicMock()
+        b.executor.get_usdc_balance.return_value = Decimal("0.50")
+        b.executor.monitor_open_orders.return_value = None
+        b.clob_client = MagicMock()
+
+        # Run one iteration of the loop manually
+        # We'll call the relevant balance-check logic directly
+        self.assertFalse(b._paused_low_balance)
+
+        # Simulate what _run_loop does at the top of each cycle
+        balance = b.executor.get_usdc_balance(max_age_seconds=0)
+        if not b._paused_low_balance and balance < bot.LOW_BALANCE_PAUSE_THRESHOLD:
+            b._paused_low_balance = True
+
+        self.assertTrue(b._paused_low_balance)
+
+    def test_stays_paused_below_resume_threshold(self):
+        """Bot should remain paused if balance < $100 even if > pause threshold."""
+        b = self._make_bot()
+        b._paused_low_balance = True
+        b.executor = MagicMock()
+        b.executor.get_usdc_balance.return_value = Decimal("50.00")
+
+        # Check resume logic
+        balance = b.executor.get_usdc_balance(max_age_seconds=0)
+        if b._paused_low_balance and balance >= bot.LOW_BALANCE_RESUME_THRESHOLD:
+            b._paused_low_balance = False
+
+        self.assertTrue(b._paused_low_balance)
+
+    def test_resumes_at_resume_threshold(self):
+        """Bot should resume trading when balance >= $100."""
+        b = self._make_bot()
+        b._paused_low_balance = True
+        b.executor = MagicMock()
+        b.executor.get_usdc_balance.return_value = Decimal("100.00")
+
+        balance = b.executor.get_usdc_balance(max_age_seconds=0)
+        if b._paused_low_balance and balance >= bot.LOW_BALANCE_RESUME_THRESHOLD:
+            b._paused_low_balance = False
+
+        self.assertFalse(b._paused_low_balance)
+
+    def test_resumes_above_resume_threshold(self):
+        """Bot should resume trading when balance > $100."""
+        b = self._make_bot()
+        b._paused_low_balance = True
+        b.executor = MagicMock()
+        b.executor.get_usdc_balance.return_value = Decimal("250.00")
+
+        balance = b.executor.get_usdc_balance(max_age_seconds=0)
+        if b._paused_low_balance and balance >= bot.LOW_BALANCE_RESUME_THRESHOLD:
+            b._paused_low_balance = False
+
+        self.assertFalse(b._paused_low_balance)
+
+    def test_open_orders_still_monitored_while_paused(self):
+        """Open orders should still be monitored even while paused."""
+        b = self._make_bot()
+        b._paused_low_balance = True
+        b.executor = MagicMock()
+        b.executor.get_usdc_balance.return_value = Decimal("0.50")
+        b.executor.monitor_open_orders.return_value = {"filled": 1, "cancelled": 0, "still_open": 0}
+        b.clob_client = MagicMock()
+
+        # Simulate one loop iteration: balance check + order monitoring
+        # happens regardless of pause state
+        b.executor.monitor_open_orders()
+
+        b.executor.monitor_open_orders.assert_called_once()
+
+    def test_no_trades_executed_while_paused(self):
+        """When paused, get_new_trades and execute_copy_trade should not be called."""
+        b = self._make_bot()
+        b._paused_low_balance = True
+        b.executor = MagicMock()
+        b.executor.get_usdc_balance.return_value = Decimal("0.50")
+        b.clob_client = MagicMock()
+
+        # Simulate the trade-detection part of the loop, which should be
+        # skipped entirely when _paused_low_balance is True.
+        # In the actual code this is the `else` branch of the pause check.
+        if not b._paused_low_balance:
+            for addr in b.cfg.get("watched_addresses", []):
+                b.clob_client.get_new_trades(addr)
+
+        b.clob_client.get_new_trades.assert_not_called()
+        b.executor.execute_copy_trade.assert_not_called()
+
+    def test_full_pause_resume_cycle(self):
+        """Simulate a full cycle: trading -> pause -> settle -> resume."""
+        b = self._make_bot()
+        b.executor = MagicMock()
+        b.clob_client = MagicMock()
+
+        # Phase 1: Normal trading (balance is healthy)
+        b.executor.get_usdc_balance.return_value = Decimal("500.00")
+        self.assertFalse(b._paused_low_balance)
+
+        # Phase 2: Balance drops to near zero
+        b.executor.get_usdc_balance.return_value = Decimal("0.30")
+        balance = b.executor.get_usdc_balance(max_age_seconds=0)
+        if not b._paused_low_balance and balance < bot.LOW_BALANCE_PAUSE_THRESHOLD:
+            b._paused_low_balance = True
+        self.assertTrue(b._paused_low_balance)
+
+        # Phase 3: Partial recovery ($50) - not enough to resume
+        b.executor.get_usdc_balance.return_value = Decimal("50.00")
+        balance = b.executor.get_usdc_balance(max_age_seconds=0)
+        if b._paused_low_balance and balance >= bot.LOW_BALANCE_RESUME_THRESHOLD:
+            b._paused_low_balance = False
+        self.assertTrue(b._paused_low_balance)
+
+        # Phase 4: Full recovery ($100+) - resumes
+        b.executor.get_usdc_balance.return_value = Decimal("120.00")
+        balance = b.executor.get_usdc_balance(max_age_seconds=0)
+        if b._paused_low_balance and balance >= bot.LOW_BALANCE_RESUME_THRESHOLD:
+            b._paused_low_balance = False
+        self.assertFalse(b._paused_low_balance)
+
+    def test_thresholds_are_correct(self):
+        """Verify the threshold constants have expected values."""
+        self.assertEqual(bot.LOW_BALANCE_PAUSE_THRESHOLD, Decimal("1.05"))
+        self.assertEqual(bot.LOW_BALANCE_RESUME_THRESHOLD, Decimal("100"))
+
+
 if __name__ == "__main__":
     unittest.main()

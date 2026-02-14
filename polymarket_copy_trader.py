@@ -90,6 +90,13 @@ CONDITIONAL_TOKENS_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 MIN_ORDER_SIZE_TOKENS = 5    # minimum outcome tokens per order
 MIN_ORDER_NOTIONAL_USDC = 1.05  # slightly above $1 to stay above min after fees
 
+# Low-balance pause/resume thresholds (USDC)
+# When balance drops below the pause threshold the bot stops placing new
+# trades and waits for open orders to settle.  Trading resumes once the
+# balance recovers to at least the resume threshold.
+LOW_BALANCE_PAUSE_THRESHOLD = Decimal("1.05")   # can't even fill the smallest order
+LOW_BALANCE_RESUME_THRESHOLD = Decimal("100")    # $100 minimum to start trading again
+
 # Polymarket CLOB API base URL
 CLOB_API_BASE = "https://clob.polymarket.com"
 
@@ -1264,6 +1271,12 @@ class CopyTraderBot:
         self.running = False
         self._thread = None
 
+        # Low-balance pause state.  When the USDC balance is too low to
+        # place any order the bot stops copying new trades and waits for
+        # open positions to settle.  Trading resumes once the balance
+        # reaches LOW_BALANCE_RESUME_THRESHOLD ($100).
+        self._paused_low_balance = False
+
         # Web3 connection (lazy init)
         self.w3 = None
         self.on_chain_monitor = None
@@ -1393,42 +1406,41 @@ class CopyTraderBot:
 
         while self.running:
             try:
-                new_trades = []
-
-                # --- CLOB API polling (primary) ---
-                if self.clob_client:
-                    for addr in self.cfg.get("watched_addresses", []):
-                        api_trades = self.clob_client.get_new_trades(addr)
-                        if api_trades:
-                            self.logger.info(
-                                "CLOB API: %d new trade(s) from %s",
-                                len(api_trades), addr[:10] + "...",
+                # --- Low-balance pause / resume check ---
+                if self.executor:
+                    try:
+                        balance = self.executor.get_usdc_balance(max_age_seconds=0)
+                        if self._paused_low_balance:
+                            if balance >= LOW_BALANCE_RESUME_THRESHOLD:
+                                self._paused_low_balance = False
+                                self.logger.info(
+                                    "Balance recovered to $%.2f (>= $%s) "
+                                    "— resuming trading",
+                                    balance, LOW_BALANCE_RESUME_THRESHOLD,
+                                )
+                            else:
+                                self.logger.info(
+                                    "Paused (low balance $%.2f, need $%s to "
+                                    "resume) — waiting for trades to settle",
+                                    balance, LOW_BALANCE_RESUME_THRESHOLD,
+                                )
+                        elif balance < LOW_BALANCE_PAUSE_THRESHOLD:
+                            self._paused_low_balance = True
+                            self.logger.warning(
+                                "Balance $%.2f below $%s — pausing new trades. "
+                                "Will resume when balance reaches $%s.",
+                                balance,
+                                LOW_BALANCE_PAUSE_THRESHOLD,
+                                LOW_BALANCE_RESUME_THRESHOLD,
                             )
-                            new_trades.extend(api_trades)
-
-                # --- On-chain polling (fallback) ---
-                if self.on_chain_monitor and web3_ok:
-                    self.on_chain_monitor.update_watched(
-                        self.cfg.get("watched_addresses", [])
-                    )
-                    chain_trades = self.on_chain_monitor.poll_new_blocks()
-                    if chain_trades:
-                        self.logger.info(
-                            "On-chain: %d trade(s) detected", len(chain_trades)
-                        )
-                        new_trades.extend(chain_trades)
-
-                # --- Execute copies ---
-                for trade in new_trades:
-                    if self.executor:
-                        self.executor.execute_copy_trade(trade)
-                    else:
-                        self.logger.warning(
-                            "Trade detected but executor not ready: %s",
-                            json.dumps(trade, default=str)[:200],
+                    except Exception as bal_exc:
+                        self.logger.debug(
+                            "Balance check failed: %s", bal_exc,
                         )
 
-                # --- Monitor open orders (fill status / stale cancellation) ---
+                # --- Monitor open orders regardless of pause state ---
+                # Orders must still be tracked so they can settle and
+                # free up balance for the resume check.
                 if self.executor:
                     try:
                         self.executor.monitor_open_orders()
@@ -1436,6 +1448,46 @@ class CopyTraderBot:
                         self.logger.debug(
                             "Order monitor error: %s", mon_exc,
                         )
+
+                # --- Skip trade detection & execution while paused ---
+                if self._paused_low_balance:
+                    pass  # just wait for balance to recover
+                else:
+                    new_trades = []
+
+                    # --- CLOB API polling (primary) ---
+                    if self.clob_client:
+                        for addr in self.cfg.get("watched_addresses", []):
+                            api_trades = self.clob_client.get_new_trades(addr)
+                            if api_trades:
+                                self.logger.info(
+                                    "CLOB API: %d new trade(s) from %s",
+                                    len(api_trades), addr[:10] + "...",
+                                )
+                                new_trades.extend(api_trades)
+
+                    # --- On-chain polling (fallback) ---
+                    if self.on_chain_monitor and web3_ok:
+                        self.on_chain_monitor.update_watched(
+                            self.cfg.get("watched_addresses", [])
+                        )
+                        chain_trades = self.on_chain_monitor.poll_new_blocks()
+                        if chain_trades:
+                            self.logger.info(
+                                "On-chain: %d trade(s) detected",
+                                len(chain_trades),
+                            )
+                            new_trades.extend(chain_trades)
+
+                    # --- Execute copies ---
+                    for trade in new_trades:
+                        if self.executor:
+                            self.executor.execute_copy_trade(trade)
+                        else:
+                            self.logger.warning(
+                                "Trade detected but executor not ready: %s",
+                                json.dumps(trade, default=str)[:200],
+                            )
 
             except Exception as exc:
                 self.logger.error("Error in monitoring loop: %s", exc, exc_info=True)
