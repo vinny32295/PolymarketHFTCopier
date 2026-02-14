@@ -155,6 +155,50 @@ PROXY_WALLET_ABI = json.loads("""[
      "type":"function"}
 ]""")
 
+# Polymarket Safe Proxy Factory on Polygon (Gnosis Safe based).
+# Newer accounts use Safe wallets instead of lightweight proxies.
+SAFE_PROXY_FACTORY_ADDRESS = "0xaacFeEa03eb1561C4e67d661e40682Bd20e3541b"
+
+# Minimal Gnosis Safe ABI – enough to execute arbitrary calls through
+# a 1-of-1 multisig Safe owned by our EOA.
+GNOSIS_SAFE_ABI = json.loads("""[
+    {"constant":false,
+     "inputs":[
+        {"name":"to","type":"address"},
+        {"name":"value","type":"uint256"},
+        {"name":"data","type":"bytes"},
+        {"name":"operation","type":"uint8"},
+        {"name":"safeTxGas","type":"uint256"},
+        {"name":"baseGas","type":"uint256"},
+        {"name":"gasPrice","type":"uint256"},
+        {"name":"gasToken","type":"address"},
+        {"name":"refundReceiver","type":"address"},
+        {"name":"signatures","type":"bytes"}],
+     "name":"execTransaction",
+     "outputs":[{"name":"success","type":"bool"}],
+     "type":"function"},
+    {"constant":true,
+     "inputs":[
+        {"name":"to","type":"address"},
+        {"name":"value","type":"uint256"},
+        {"name":"data","type":"bytes"},
+        {"name":"operation","type":"uint8"},
+        {"name":"safeTxGas","type":"uint256"},
+        {"name":"baseGas","type":"uint256"},
+        {"name":"gasPrice","type":"uint256"},
+        {"name":"gasToken","type":"address"},
+        {"name":"refundReceiver","type":"address"},
+        {"name":"_nonce","type":"uint256"}],
+     "name":"getTransactionHash",
+     "outputs":[{"name":"","type":"bytes32"}],
+     "type":"function"},
+    {"constant":true,
+     "inputs":[],
+     "name":"nonce",
+     "outputs":[{"name":"","type":"uint256"}],
+     "type":"function"}
+]""")
+
 # Minimal ERC20 ABI for USDC balance/approval checks
 ERC20_ABI = json.loads("""[
     {"constant":true,"inputs":[{"name":"_owner","type":"address"}],
@@ -933,6 +977,7 @@ class TradeExecutor:
         # Cached proxy wallet address (discovered once, reused)
         self._proxy_address = None
         self._proxy_discovery_done = False
+        self._proxy_is_safe = False  # True when proxy is a Gnosis Safe
 
         # Position tracker: token_id -> {tokens: Decimal, entry_price: Decimal}
         # Prevents selling tokens we never bought, caps sells to what we
@@ -1531,14 +1576,74 @@ class TradeExecutor:
     # Proxy wallet discovery, redemption & withdrawal
     # ------------------------------------------------------------------
 
+    def _search_factory_events(self, factory_addr, is_safe=False):
+        """Search a factory contract's event logs for a proxy deployed by this EOA.
+
+        For the legacy proxy factory, looks for ``Deploy(deployer, proxy)`` events.
+        For the Safe factory, scans raw logs with the EOA as an indexed topic
+        (the ``ProxyCreation`` event encodes the proxy address in the data).
+
+        Returns the proxy address as a checksummed string, or ``None``.
+        """
+        eoa_padded = "0x" + self.address[2:].lower().zfill(64)
+        start_block = 25_000_000
+        chunk_size = 5_000_000
+        label = "Safe" if is_safe else "legacy"
+
+        try:
+            latest_block = self.w3.eth.block_number
+            self.logger.info(
+                "Searching %s factory (%s) event logs for EOA %s...",
+                label, factory_addr[:12] + "...", self.address,
+            )
+            for from_blk in range(start_block, latest_block + 1, chunk_size):
+                to_blk = min(from_blk + chunk_size - 1, latest_block)
+                try:
+                    logs = self.w3.eth.get_logs({
+                        "address": Web3.to_checksum_address(factory_addr),
+                        "fromBlock": from_blk,
+                        "toBlock": to_blk,
+                        "topics": [None, eoa_padded],
+                    })
+                    if logs:
+                        last_log = logs[-1]
+                        raw_data = last_log.get("data", b"")
+                        if isinstance(raw_data, bytes):
+                            raw_hex = raw_data.hex()
+                        else:
+                            raw_hex = raw_data.replace("0x", "")
+                        if len(raw_hex) >= 40:
+                            addr = Web3.to_checksum_address(
+                                "0x" + raw_hex[-40:]
+                            )
+                            self.logger.info(
+                                "Discovered %s proxy via event log: %s "
+                                "(block %d)",
+                                label, addr, last_log.get("blockNumber", 0),
+                            )
+                            return addr
+                except Exception as chunk_exc:
+                    self.logger.debug(
+                        "%s event chunk %d-%d failed: %s",
+                        label, from_blk, to_blk, chunk_exc,
+                    )
+        except Exception as exc:
+            self.logger.info(
+                "%s factory event search failed: %s", label, exc,
+            )
+        return None
+
     def discover_proxy_wallet(self):
         """Discover the Polymarket proxy wallet address for this EOA.
 
         Tries multiple methods in order of reliability:
         1. Config override (``proxy_address`` in config / ``PROXY_ADDRESS`` env).
         2. Cached result from a previous call.
-        3. Factory view functions (``getProxy``, ``proxies``, ``proxyFor``).
-        4. Factory ``Deploy`` event logs (scans on-chain history).
+        3. Legacy Proxy Factory — view functions then event logs.
+        4. Safe Proxy Factory — event logs (``ProxyCreation``).
+        5. Raw topic-scan on both factories.
+
+        Sets ``self._proxy_is_safe`` when the wallet comes from the Safe factory.
 
         Returns the proxy address as a checksummed string, or ``None``.
         """
@@ -1553,16 +1658,19 @@ class TradeExecutor:
         if cfg_addr and cfg_addr.startswith("0x") and len(cfg_addr) == 42:
             addr = Web3.to_checksum_address(cfg_addr)
             self.logger.info("Using configured proxy address: %s", addr)
+            # Detect if it's a Safe by checking if execTransaction exists
+            self._proxy_is_safe = self._check_is_safe(addr)
             self._proxy_address = addr
             self._proxy_discovery_done = True
             return addr
 
+        # ------ Legacy Proxy Factory ------
         factory_addr = Web3.to_checksum_address(PROXY_FACTORY_ADDRESS)
         factory = self.w3.eth.contract(
             address=factory_addr, abi=PROXY_FACTORY_ABI,
         )
 
-        # 2. Try factory view functions (different contracts use different names)
+        # 2. Try legacy factory view functions
         for fn_name in ("getProxy", "proxies", "proxyFor"):
             try:
                 fn = getattr(factory.functions, fn_name)
@@ -1573,6 +1681,7 @@ class TradeExecutor:
                         "Discovered proxy wallet via factory.%s: %s",
                         fn_name, addr,
                     )
+                    self._proxy_is_safe = False
                     self._proxy_address = addr
                     self._proxy_discovery_done = True
                     return addr
@@ -1586,85 +1695,30 @@ class TradeExecutor:
                     fn_name, exc,
                 )
 
-        # 3. Search factory event logs for Deploy(deployer, proxy)
+        # 3. Search legacy factory event logs
+        result = self._search_factory_events(PROXY_FACTORY_ADDRESS, is_safe=False)
+        if result:
+            self._proxy_is_safe = False
+            self._proxy_address = result
+            self._proxy_discovery_done = True
+            return result
+
+        # ------ Safe Proxy Factory ------
+        # 4. Search Safe factory event logs (ProxyCreation events)
         self.logger.info(
-            "Searching factory event logs for proxy deployed by %s...",
-            self.address,
+            "Legacy factory had no results. Checking Safe Proxy Factory...",
         )
-        try:
-            # Polymarket launched on Polygon around block 25M (late 2022).
-            # Use a generous start block to keep the query manageable.
-            start_block = 25_000_000
-            latest_block = self.w3.eth.block_number
-
-            # Some RPC providers limit log range; paginate in 5M-block chunks
-            chunk_size = 5_000_000
-            for from_blk in range(start_block, latest_block + 1, chunk_size):
-                to_blk = min(from_blk + chunk_size - 1, latest_block)
-                try:
-                    logs = factory.events.Deploy.get_logs(
-                        fromBlock=from_blk,
-                        toBlock=to_blk,
-                        argument_filters={"deployer": self.address},
-                    )
-                    if logs:
-                        addr = Web3.to_checksum_address(logs[-1].args.proxy)
-                        self.logger.info(
-                            "Discovered proxy wallet via Deploy event: %s "
-                            "(block %d)", addr, logs[-1].blockNumber,
-                        )
-                        self._proxy_address = addr
-                        self._proxy_discovery_done = True
-                        return addr
-                except Exception as chunk_exc:
-                    self.logger.debug(
-                        "Event log chunk %d-%d failed: %s",
-                        from_blk, to_blk, chunk_exc,
-                    )
-        except Exception as evt_exc:
-            self.logger.info("Event-based proxy discovery failed: %s", evt_exc)
-
-        # 4. Brute-force: scan ALL factory logs and match by data
-        #    (handles non-indexed deployer parameter)
-        try:
+        result = self._search_factory_events(
+            SAFE_PROXY_FACTORY_ADDRESS, is_safe=True,
+        )
+        if result:
+            self._proxy_is_safe = True
+            self._proxy_address = result
+            self._proxy_discovery_done = True
             self.logger.info(
-                "Trying raw log scan on factory for EOA %s...", self.address,
+                "Wallet is a Gnosis Safe — will use execTransaction for proxy ops",
             )
-            eoa_padded = "0x" + self.address[2:].lower().zfill(64)
-            start_block = 25_000_000
-            latest_block = self.w3.eth.block_number
-            for from_blk in range(start_block, latest_block + 1, chunk_size):
-                to_blk = min(from_blk + chunk_size - 1, latest_block)
-                try:
-                    logs = self.w3.eth.get_logs({
-                        "address": factory_addr,
-                        "fromBlock": from_blk,
-                        "toBlock": to_blk,
-                        "topics": [None, eoa_padded],
-                    })
-                    if logs:
-                        last_log = logs[-1]
-                        # Proxy address is in the data field (non-indexed param)
-                        if last_log.get("data") and len(last_log["data"]) >= 32:
-                            raw = last_log["data"]
-                            if isinstance(raw, bytes):
-                                raw = raw.hex()
-                            else:
-                                raw = raw.replace("0x", "")
-                            addr = Web3.to_checksum_address("0x" + raw[-40:])
-                            self.logger.info(
-                                "Discovered proxy wallet via raw log: %s", addr,
-                            )
-                            self._proxy_address = addr
-                            self._proxy_discovery_done = True
-                            return addr
-                except Exception as raw_exc:
-                    self.logger.debug(
-                        "Raw log chunk %d-%d failed: %s",
-                        from_blk, to_blk, raw_exc,
-                    )
-        except Exception as raw_evt_exc:
-            self.logger.info("Raw log proxy discovery failed: %s", raw_evt_exc)
+            return result
 
         self.logger.warning(
             "Could not discover proxy wallet for EOA %s. "
@@ -1674,6 +1728,22 @@ class TradeExecutor:
         )
         self._proxy_discovery_done = True  # don't retry every 5 min
         return None
+
+    def _check_is_safe(self, address):
+        """Probe whether *address* is a Gnosis Safe by calling ``nonce()``."""
+        try:
+            safe = self.w3.eth.contract(
+                address=Web3.to_checksum_address(address),
+                abi=GNOSIS_SAFE_ABI,
+            )
+            safe.functions.nonce().call()
+            self.logger.info(
+                "Address %s responds to nonce() — treating as Gnosis Safe",
+                address[:12] + "...",
+            )
+            return True
+        except Exception:
+            return False
 
     def get_proxy_usdc_balance(self, proxy_address):
         """Return the USDC balance held by *proxy_address* (Decimal, 6 dp)."""
@@ -1689,13 +1759,19 @@ class TradeExecutor:
         ).call()
 
     def _execute_via_proxy(self, proxy_address, to, call_data):
-        """Send a transaction through the proxy wallet's ``execute`` function.
+        """Send a transaction through the proxy wallet.
 
-        Builds, signs and broadcasts a tx that calls
-        ``proxy.execute(to, 0, call_data)`` from this EOA.
+        Dispatches to the appropriate execution method based on whether the
+        wallet is a Gnosis Safe or a legacy Polymarket proxy.
 
         Returns the transaction receipt, or ``None`` on failure.
         """
+        if self._proxy_is_safe:
+            return self._execute_via_safe(proxy_address, to, call_data)
+        return self._execute_via_legacy_proxy(proxy_address, to, call_data)
+
+    def _execute_via_legacy_proxy(self, proxy_address, to, call_data):
+        """Execute through a legacy Polymarket proxy wallet."""
         proxy = self.w3.eth.contract(
             address=Web3.to_checksum_address(proxy_address),
             abi=PROXY_WALLET_ABI,
@@ -1704,6 +1780,57 @@ class TradeExecutor:
             Web3.to_checksum_address(to),
             0,  # value — no native token transfer
             call_data,
+        ).build_transaction(self._base_tx_params())
+        return self._sign_and_send(tx)
+
+    def _execute_via_safe(self, safe_address, to, call_data):
+        """Execute a transaction through a Gnosis Safe (1-of-1 multisig).
+
+        Builds the Safe transaction hash, signs it with this EOA's key,
+        and calls ``execTransaction`` on the Safe contract.
+        """
+        safe_addr = Web3.to_checksum_address(safe_address)
+        to_addr = Web3.to_checksum_address(to)
+        safe = self.w3.eth.contract(address=safe_addr, abi=GNOSIS_SAFE_ABI)
+
+        zero_addr = Web3.to_checksum_address("0x" + "0" * 40)
+        safe_nonce = safe.functions.nonce().call()
+
+        # Build the Safe transaction hash
+        safe_tx_hash = safe.functions.getTransactionHash(
+            to_addr,        # to
+            0,              # value
+            call_data,      # data
+            0,              # operation (Call)
+            0,              # safeTxGas
+            0,              # baseGas
+            0,              # gasPrice
+            zero_addr,      # gasToken
+            zero_addr,      # refundReceiver
+            safe_nonce,     # _nonce
+        ).call()
+
+        # Sign the hash with our EOA private key
+        signed = self.w3.eth.account.signHash(safe_tx_hash, self.private_key)
+        # Encode signature as r + s + v (65 bytes)
+        signature = (
+            signed.r.to_bytes(32, "big")
+            + signed.s.to_bytes(32, "big")
+            + signed.v.to_bytes(1, "big")
+        )
+
+        # Build and send the execTransaction call
+        tx = safe.functions.execTransaction(
+            to_addr,        # to
+            0,              # value
+            call_data,      # data
+            0,              # operation (Call)
+            0,              # safeTxGas
+            0,              # baseGas
+            0,              # gasPrice
+            zero_addr,      # gasToken
+            zero_addr,      # refundReceiver
+            signature,      # signatures
         ).build_transaction(self._base_tx_params())
         return self._sign_and_send(tx)
 
