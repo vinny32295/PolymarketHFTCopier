@@ -21,11 +21,26 @@ import os
 import sys
 import threading
 import time
-import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+
+# Tkinter is optional — only needed for the GUI, not for headless/server mode.
+# Import is deferred so the bot can run on servers without Tk installed.
+tk = None
+ttk = None
+scrolledtext = None
+messagebox = None
+
+def _import_tkinter():
+    """Lazy-import tkinter modules. Called only when GUI mode is used."""
+    global tk, ttk, scrolledtext, messagebox
+    import tkinter as _tk
+    from tkinter import ttk as _ttk, scrolledtext as _scrolledtext, messagebox as _messagebox
+    tk = _tk
+    ttk = _ttk
+    scrolledtext = _scrolledtext
+    messagebox = _messagebox
 
 try:
     import requests
@@ -1101,6 +1116,8 @@ class CopyTraderGUI:
     """Main application window."""
 
     def __init__(self):
+        _import_tkinter()
+
         self.cfg = load_config()
         self.bot = None
         self.logger = None
