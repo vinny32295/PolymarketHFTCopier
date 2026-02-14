@@ -1075,13 +1075,13 @@ class TestLowBalancePauseResume(unittest.TestCase):
         self.assertTrue(b._paused_low_balance)
 
     def test_resumes_at_resume_threshold(self):
-        """Bot should resume trading when balance >= configured threshold ($100 default)."""
+        """Bot should resume trading when balance >= configured threshold ($150 default)."""
         b = self._make_bot()
         b._paused_low_balance = True
         b.executor = MagicMock()
-        b.executor.get_usdc_balance.return_value = Decimal("100.00")
+        b.executor.get_usdc_balance.return_value = Decimal("150.00")
 
-        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 100)))
+        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 150)))
         balance = b.executor.get_usdc_balance(max_age_seconds=0)
         if b._paused_low_balance and balance >= resume_threshold:
             b._paused_low_balance = False
@@ -1178,16 +1178,16 @@ class TestLowBalancePauseResume(unittest.TestCase):
             b._paused_low_balance = False
         self.assertTrue(b._paused_low_balance)
 
-        # Phase 4: Full recovery ($100+) - resumes
-        b.executor.get_usdc_balance.return_value = Decimal("120.00")
+        # Phase 4: Full recovery ($150+) - resumes
+        b.executor.get_usdc_balance.return_value = Decimal("160.00")
         balance = b.executor.get_usdc_balance(max_age_seconds=0)
         if b._paused_low_balance and balance >= resume_threshold:
             b._paused_low_balance = False
         self.assertFalse(b._paused_low_balance)
 
     def test_default_resume_threshold_in_config(self):
-        """Verify the default resume_threshold_usdc is 100 in DEFAULT_CONFIG."""
-        self.assertEqual(bot.DEFAULT_CONFIG["resume_threshold_usdc"], 100.0)
+        """Verify the default resume_threshold_usdc is 150 in DEFAULT_CONFIG."""
+        self.assertEqual(bot.DEFAULT_CONFIG["resume_threshold_usdc"], 150.0)
         self.assertEqual(bot.LOW_BALANCE_PAUSE_THRESHOLD, Decimal("1.05"))
 
     def test_env_var_override(self):
@@ -1535,6 +1535,210 @@ class TestGetMarketByToken(unittest.TestCase):
         client._get_public = MagicMock(return_value=None)
         result = client.get_market_by_token("token123")
         self.assertIsNone(result)
+
+
+class TestGetWalletTokenIds(unittest.TestCase):
+    """Test PolymarketCLOBClient.get_wallet_token_ids."""
+
+    def _make_client(self):
+        cfg = dict(bot.DEFAULT_CONFIG)
+        logger = logging.getLogger("test")
+        logger.handlers = [logging.NullHandler()]
+        client = bot.PolymarketCLOBClient.__new__(bot.PolymarketCLOBClient)
+        client.cfg = cfg
+        client.base_url = bot.CLOB_API_BASE
+        client.gamma_url = bot.GAMMA_API_BASE
+        client.data_url = bot.DATA_API_BASE
+        client.session = MagicMock()
+        client.logger = logger
+        client._last_trade_ids = {}
+        client.clob_sdk = None
+        return client
+
+    def test_extracts_token_ids_from_list(self):
+        client = self._make_client()
+        client._get_public = MagicMock(return_value=[
+            {"asset_id": "111", "side": "BUY"},
+            {"asset_id": "222", "side": "SELL"},
+            {"asset_id": "111", "side": "BUY"},  # duplicate
+        ])
+        ids = client.get_wallet_token_ids("0xabc")
+        self.assertEqual(ids, {"111", "222"})
+
+    def test_extracts_from_nested_data(self):
+        client = self._make_client()
+        client._get_public = MagicMock(return_value={
+            "data": [
+                {"asset": "333"},
+                {"token_id": "444"},
+            ]
+        })
+        ids = client.get_wallet_token_ids("0xabc")
+        self.assertEqual(ids, {"333", "444"})
+
+    def test_returns_empty_on_failure(self):
+        client = self._make_client()
+        client._get_public = MagicMock(return_value=None)
+        ids = client.get_wallet_token_ids("0xabc")
+        self.assertEqual(ids, set())
+
+    def test_returns_empty_on_empty_list(self):
+        client = self._make_client()
+        client._get_public = MagicMock(return_value=[])
+        ids = client.get_wallet_token_ids("0xabc")
+        self.assertEqual(ids, set())
+
+
+class TestScanAndRedeemPortfolio(unittest.TestCase):
+    """Test the startup portfolio scan that discovers and redeems all positions."""
+
+    TOK_RESOLVED = "11111111111111111111"
+    TOK_ACTIVE = "22222222222222222222"
+    TOK_EMPTY = "33333333333333333333"
+
+    def _make_executor(self, dry_run=False, auto_redeem=True):
+        w3 = MagicMock()
+        mock_account = MagicMock()
+        mock_account.address = "0x" + "1" * 40
+        w3.eth.account.from_key.return_value = mock_account
+
+        mock_conditional_tokens = MagicMock()
+        w3.eth.contract.return_value = MagicMock()
+
+        cfg = dict(bot.DEFAULT_CONFIG)
+        cfg["dry_run"] = dry_run
+        cfg["auto_redeem_settled"] = auto_redeem
+
+        executor = bot.TradeExecutor(
+            w3=w3,
+            private_key="0x" + "a" * 64,
+            cfg=cfg,
+            logger=logging.getLogger("test_scan"),
+        )
+        executor.get_usdc_balance = MagicMock(return_value=Decimal("0.20"))
+        executor.conditional_tokens = mock_conditional_tokens
+
+        executor.clob_client = MagicMock()
+        executor.clob_client.clob_sdk = MagicMock()
+
+        executor._sign_and_send = MagicMock()
+        executor._base_tx_params = MagicMock(return_value={
+            "from": executor.address, "nonce": 0,
+            "maxFeePerGas": 100, "maxPriorityFeePerGas": 30,
+            "chainId": 137,
+        })
+
+        return executor
+
+    def test_no_clob_client_skips(self):
+        executor = self._make_executor()
+        executor.clob_client = None
+        results = executor.scan_and_redeem_portfolio()
+        self.assertEqual(results, [])
+
+    def test_disabled_via_config(self):
+        executor = self._make_executor(auto_redeem=False)
+        results = executor.scan_and_redeem_portfolio()
+        self.assertEqual(results, [])
+
+    def test_no_trade_history(self):
+        executor = self._make_executor()
+        executor.clob_client.get_wallet_token_ids.return_value = set()
+        results = executor.scan_and_redeem_portfolio()
+        self.assertEqual(results, [])
+
+    def test_redeems_resolved_and_seeds_active(self):
+        """Resolved positions are redeemed; active ones are seeded into _positions."""
+        executor = self._make_executor()
+        executor.clob_client.get_wallet_token_ids.return_value = {
+            self.TOK_RESOLVED, self.TOK_ACTIVE, self.TOK_EMPTY,
+        }
+
+        # Token balance: resolved has 50M, active has 10M, empty has 0
+        def mock_balance(addr, token_id):
+            bal_mock = MagicMock()
+            if token_id == int(self.TOK_RESOLVED):
+                bal_mock.call.return_value = 50_000000
+            elif token_id == int(self.TOK_ACTIVE):
+                bal_mock.call.return_value = 10_000000
+            else:
+                bal_mock.call.return_value = 0
+            return bal_mock
+
+        executor.conditional_tokens.functions.balanceOf.side_effect = mock_balance
+
+        # Market info
+        def mock_market(token_id):
+            if token_id == self.TOK_RESOLVED:
+                return {
+                    "condition_id": "0x" + "a" * 64,
+                    "closed": True,
+                    "active": False,
+                    "question": "Resolved market?",
+                }
+            if token_id == self.TOK_ACTIVE:
+                return {
+                    "condition_id": "0x" + "b" * 64,
+                    "closed": False,
+                    "active": True,
+                    "question": "Active market?",
+                }
+            return None
+
+        executor.clob_client.get_market_by_token.side_effect = mock_market
+        executor.clob_client.get_last_trade_price.return_value = 0.65
+
+        # On-chain resolution check
+        executor.conditional_tokens.functions.payoutDenominator.return_value.call.return_value = 1000000
+        executor.conditional_tokens.functions.redeemPositions.return_value.build_transaction.return_value = {}
+
+        mock_receipt = MagicMock()
+        mock_receipt.status = 1
+        mock_receipt.transactionHash.hex.return_value = "0xredeemed"
+        executor._sign_and_send.return_value = mock_receipt
+
+        results = executor.scan_and_redeem_portfolio()
+
+        # Resolved position should be redeemed
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "redeemed")
+
+        # Active position should be seeded into _positions
+        self.assertIn(self.TOK_ACTIVE, executor._positions)
+        self.assertEqual(
+            executor._positions[self.TOK_ACTIVE]["entry_price"],
+            Decimal("0.65"),
+        )
+
+        # Empty-balance token should be skipped entirely
+        self.assertNotIn(self.TOK_EMPTY, executor._positions)
+
+    def test_dry_run_does_not_redeem(self):
+        executor = self._make_executor(dry_run=True)
+        executor.clob_client.get_wallet_token_ids.return_value = {self.TOK_RESOLVED}
+        executor.conditional_tokens.functions.balanceOf.return_value.call.return_value = 50_000000
+        executor.clob_client.get_market_by_token.return_value = {
+            "condition_id": "0x" + "a" * 64,
+            "closed": True,
+            "active": False,
+            "question": "Test?",
+        }
+        executor.conditional_tokens.functions.payoutDenominator.return_value.call.return_value = 1000000
+
+        results = executor.scan_and_redeem_portfolio()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "dry_run")
+        executor._sign_and_send.assert_not_called()
+
+    def test_api_failure_skips_gracefully(self):
+        executor = self._make_executor()
+        executor.clob_client.get_wallet_token_ids.return_value = {self.TOK_RESOLVED}
+        executor.conditional_tokens.functions.balanceOf.return_value.call.return_value = 50_000000
+        executor.clob_client.get_market_by_token.return_value = None
+
+        results = executor.scan_and_redeem_portfolio()
+        self.assertEqual(results, [])
 
 
 if __name__ == "__main__":
