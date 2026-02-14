@@ -109,6 +109,35 @@ GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 # Polymarket Data API (user activity, positions, trades)
 DATA_API_BASE = "https://data-api.polymarket.com"
 
+# Polymarket Proxy Wallet Factory on Polygon
+# Deploys lightweight proxy wallets for Polymarket users; each EOA has
+# at most one proxy.  The factory exposes a mapping to look up the proxy
+# address from the owner EOA.
+PROXY_FACTORY_ADDRESS = "0xaB45c5A4B0c941a2F231C04C3f49182e1A254052"
+
+# Minimal Proxy Factory ABI – getProxy(address) returns the proxy address
+PROXY_FACTORY_ABI = json.loads("""[
+    {"constant":true,
+     "inputs":[{"name":"owner","type":"address"}],
+     "name":"getProxy",
+     "outputs":[{"name":"","type":"address"}],
+     "type":"function"}
+]""")
+
+# Minimal Proxy Wallet ABI – execute(address,uint256,bytes) forwards a
+# call through the proxy.  Only the owner EOA may call this.
+PROXY_WALLET_ABI = json.loads("""[
+    {"constant":false,
+     "inputs":[
+        {"name":"to","type":"address"},
+        {"name":"value","type":"uint256"},
+        {"name":"data","type":"bytes"}],
+     "name":"execute",
+     "outputs":[{"name":"success","type":"bool"},
+                {"name":"returnData","type":"bytes"}],
+     "type":"function"}
+]""")
+
 # Minimal ERC20 ABI for USDC balance/approval checks
 ERC20_ABI = json.loads("""[
     {"constant":true,"inputs":[{"name":"_owner","type":"address"}],
@@ -211,6 +240,8 @@ DEFAULT_CONFIG = {
     "order_ttl_seconds": 30,
     "resume_threshold_usdc": 150.0,
     "auto_redeem_settled": True,
+    "proxy_redeem": True,
+    "proxy_withdraw": True,
 }
 
 
@@ -1474,6 +1505,296 @@ class TradeExecutor:
             )
         return results
 
+    # ------------------------------------------------------------------
+    # Proxy wallet discovery, redemption & withdrawal
+    # ------------------------------------------------------------------
+
+    def discover_proxy_wallet(self):
+        """Query the Polymarket Proxy Factory for this EOA's proxy address.
+
+        Returns the proxy address as a checksummed string, or ``None`` if
+        the EOA has no proxy deployed.
+        """
+        try:
+            factory = self.w3.eth.contract(
+                address=Web3.to_checksum_address(PROXY_FACTORY_ADDRESS),
+                abi=PROXY_FACTORY_ABI,
+            )
+            proxy_addr = factory.functions.getProxy(self.address).call()
+            # A zero-address means no proxy has been deployed for this EOA
+            if proxy_addr and proxy_addr != "0x" + "0" * 40:
+                proxy_addr = Web3.to_checksum_address(proxy_addr)
+                self.logger.info("Discovered proxy wallet: %s", proxy_addr)
+                return proxy_addr
+        except Exception as exc:
+            self.logger.debug("Proxy factory query failed: %s", exc)
+        return None
+
+    def get_proxy_usdc_balance(self, proxy_address):
+        """Return the USDC balance held by *proxy_address* (Decimal, 6 dp)."""
+        raw = self.usdc.functions.balanceOf(
+            Web3.to_checksum_address(proxy_address)
+        ).call()
+        return Decimal(raw) / Decimal("1000000")
+
+    def get_proxy_token_balance(self, proxy_address, token_id):
+        """Return the conditional-token balance for *token_id* in the proxy."""
+        return self.conditional_tokens.functions.balanceOf(
+            Web3.to_checksum_address(proxy_address), int(token_id)
+        ).call()
+
+    def _execute_via_proxy(self, proxy_address, to, call_data):
+        """Send a transaction through the proxy wallet's ``execute`` function.
+
+        Builds, signs and broadcasts a tx that calls
+        ``proxy.execute(to, 0, call_data)`` from this EOA.
+
+        Returns the transaction receipt, or ``None`` on failure.
+        """
+        proxy = self.w3.eth.contract(
+            address=Web3.to_checksum_address(proxy_address),
+            abi=PROXY_WALLET_ABI,
+        )
+        tx = proxy.functions.execute(
+            Web3.to_checksum_address(to),
+            0,  # value — no native token transfer
+            call_data,
+        ).build_transaction(self._base_tx_params())
+        return self._sign_and_send(tx)
+
+    def redeem_via_proxy(self, proxy_address, condition_id):
+        """Redeem resolved positions held in the proxy wallet.
+
+        Encodes a ``redeemPositions`` call on the Conditional Tokens
+        contract and forwards it through the proxy's ``execute`` method.
+        """
+        cond_bytes = bytes.fromhex(condition_id.replace("0x", ""))
+        call_data = self.conditional_tokens.encodeABI(
+            fn_name="redeemPositions",
+            args=[
+                Web3.to_checksum_address(USDC_ADDRESS),
+                b"\x00" * 32,       # parentCollectionId (root)
+                cond_bytes,          # conditionId
+                [1, 2],             # both binary outcomes
+            ],
+        )
+        return self._execute_via_proxy(
+            proxy_address, CONDITIONAL_TOKENS_ADDRESS, call_data,
+        )
+
+    def withdraw_usdc_from_proxy(self, proxy_address, amount=None):
+        """Transfer USDC from the proxy wallet to this EOA.
+
+        If *amount* is ``None``, the entire proxy USDC balance is withdrawn.
+        *amount* should be a ``Decimal`` in human-readable units (e.g. 150.0).
+
+        Returns the transaction receipt, or ``None`` on failure.
+        """
+        if amount is None:
+            amount = self.get_proxy_usdc_balance(proxy_address)
+        if amount <= 0:
+            self.logger.debug("No USDC to withdraw from proxy %s", proxy_address)
+            return None
+
+        raw_amount = int(amount * Decimal("1000000"))
+        call_data = self.usdc.encodeABI(
+            fn_name="transfer",
+            args=[self.address, raw_amount],
+        )
+        self.logger.info(
+            "Withdrawing $%.2f USDC from proxy %s → EOA %s",
+            amount, proxy_address[:12] + "...", self.address[:12] + "...",
+        )
+        return self._execute_via_proxy(proxy_address, USDC_ADDRESS, call_data)
+
+    def scan_and_redeem_proxy_portfolio(self):
+        """Discover the proxy wallet, redeem settled positions, and withdraw USDC.
+
+        Mirrors ``scan_and_redeem_portfolio`` but operates on the proxy
+        wallet instead of the EOA directly.  Steps:
+
+        1. Discover proxy address from the factory.
+        2. For each token ID in the wallet's trade history, check if the
+           proxy holds a balance.
+        3. If the market is resolved → redeem via proxy.
+        4. If ``proxy_withdraw`` is enabled → transfer USDC to EOA.
+
+        Returns a list of result dicts.
+        """
+        if not self.cfg.get("proxy_redeem", True):
+            return []
+        if not self.clob_client:
+            self.logger.info("Proxy scan skipped — no CLOB client")
+            return []
+
+        proxy_address = self.discover_proxy_wallet()
+        if not proxy_address:
+            self.logger.info("No proxy wallet found for this EOA — skipping proxy scan")
+            return []
+
+        # Report proxy balances
+        try:
+            proxy_usdc = self.get_proxy_usdc_balance(proxy_address)
+            self.logger.info("Proxy %s USDC balance: $%.2f", proxy_address[:12] + "...", proxy_usdc)
+        except Exception as exc:
+            self.logger.warning("Could not fetch proxy USDC balance: %s", exc)
+            proxy_usdc = Decimal("0")
+
+        # Discover token IDs from trade history
+        token_ids = self.clob_client.get_wallet_token_ids(self.address)
+        if not token_ids:
+            self.logger.info("No trade history — proxy redemption scan done")
+            # Still attempt withdrawal if there's USDC sitting in the proxy
+            if proxy_usdc > 0 and self.cfg.get("proxy_withdraw", True):
+                return self._maybe_withdraw_proxy_usdc(proxy_address)
+            return []
+
+        self.logger.info(
+            "Scanning %d token IDs for proxy-held positions...", len(token_ids),
+        )
+
+        results = []
+        for token_id in token_ids:
+            try:
+                ct_balance = self.get_proxy_token_balance(proxy_address, token_id)
+                if ct_balance == 0:
+                    continue
+
+                market = self.clob_client.get_market_by_token(token_id)
+                if not market:
+                    continue
+
+                condition_id = market.get("condition_id")
+                if not condition_id:
+                    continue
+
+                is_closed = (
+                    market.get("closed") is True
+                    or str(market.get("closed", "")).lower() == "true"
+                    or market.get("active") is False
+                    or str(market.get("active", "")).lower() == "false"
+                )
+                if not is_closed:
+                    self.logger.info(
+                        "Proxy holds active position: token %s, balance %d",
+                        token_id[:16] + "...", ct_balance,
+                    )
+                    continue
+
+                # Verify on-chain resolution
+                cond_bytes = bytes.fromhex(condition_id.replace("0x", ""))
+                payout_denom = self.conditional_tokens.functions.payoutDenominator(
+                    cond_bytes
+                ).call()
+                if payout_denom == 0:
+                    continue
+
+                question = market.get("question", "unknown")
+                self.logger.info(
+                    "PROXY REDEEM: Resolved position — token %s, "
+                    "question: %s, proxy balance: %d",
+                    token_id[:16] + "...", question[:60], ct_balance,
+                )
+
+                if self.cfg.get("dry_run", False):
+                    self.logger.info(
+                        "[DRY RUN] Would redeem proxy position for condition %s",
+                        condition_id[:16] + "...",
+                    )
+                    results.append({
+                        "status": "dry_run",
+                        "source": "proxy",
+                        "token_id": token_id,
+                        "balance": ct_balance,
+                    })
+                    continue
+
+                receipt = self.redeem_via_proxy(proxy_address, condition_id)
+                if receipt and receipt.status == 1:
+                    self.logger.info(
+                        "Proxy redemption OK: tx %s — USDC now in proxy",
+                        receipt.transactionHash.hex(),
+                    )
+                    results.append({
+                        "status": "redeemed",
+                        "source": "proxy",
+                        "token_id": token_id,
+                        "balance": ct_balance,
+                        "tx_hash": receipt.transactionHash.hex(),
+                    })
+                else:
+                    self.logger.warning(
+                        "Proxy redemption tx failed for token %s",
+                        token_id[:16] + "...",
+                    )
+                    results.append({
+                        "status": "failed",
+                        "source": "proxy",
+                        "token_id": token_id,
+                    })
+
+            except Exception as exc:
+                self.logger.debug(
+                    "Error scanning proxy token %s: %s", token_id[:16] + "...", exc,
+                )
+
+        redeemed = sum(1 for r in results if r["status"] == "redeemed")
+        self.logger.info(
+            "Proxy scan complete: %d resolved position(s) processed, %d redeemed",
+            len(results), redeemed,
+        )
+
+        # Withdraw any USDC accumulated in the proxy back to the EOA
+        if self.cfg.get("proxy_withdraw", True) and not self.cfg.get("dry_run", False):
+            withdraw_results = self._maybe_withdraw_proxy_usdc(proxy_address)
+            results.extend(withdraw_results)
+
+        return results
+
+    def _maybe_withdraw_proxy_usdc(self, proxy_address):
+        """Withdraw all USDC from the proxy to the EOA if balance > 0."""
+        results = []
+        try:
+            balance = self.get_proxy_usdc_balance(proxy_address)
+            if balance <= 0:
+                return results
+
+            if self.cfg.get("dry_run", False):
+                self.logger.info(
+                    "[DRY RUN] Would withdraw $%.2f USDC from proxy %s",
+                    balance, proxy_address[:12] + "...",
+                )
+                results.append({
+                    "status": "dry_run",
+                    "source": "proxy_withdrawal",
+                    "amount_usdc": float(balance),
+                })
+                return results
+
+            receipt = self.withdraw_usdc_from_proxy(proxy_address)
+            if receipt and receipt.status == 1:
+                self.logger.info(
+                    "Proxy USDC withdrawal OK: $%.2f → EOA, tx %s",
+                    balance, receipt.transactionHash.hex(),
+                )
+                self.invalidate_balance_cache()
+                results.append({
+                    "status": "withdrawn",
+                    "source": "proxy_withdrawal",
+                    "amount_usdc": float(balance),
+                    "tx_hash": receipt.transactionHash.hex(),
+                })
+            else:
+                self.logger.warning("Proxy USDC withdrawal tx failed")
+                results.append({
+                    "status": "failed",
+                    "source": "proxy_withdrawal",
+                    "amount_usdc": float(balance),
+                })
+        except Exception as exc:
+            self.logger.warning("Proxy USDC withdrawal error: %s", exc)
+        return results
+
     def compute_copy_amount(self, original_usdc_amount):
         """Return the copy amount in USDC.
 
@@ -1925,6 +2246,17 @@ class CopyTraderBot:
                         scan_exc,
                     )
 
+            # Proxy wallet scan — redeem resolved positions held in the
+            # Polymarket proxy wallet and withdraw USDC to the EOA.
+            if self.executor and self.cfg.get("proxy_redeem", True):
+                try:
+                    self.executor.scan_and_redeem_proxy_portfolio()
+                except Exception as proxy_exc:
+                    self.logger.warning(
+                        "Startup proxy scan failed (non-fatal): %s",
+                        proxy_exc,
+                    )
+
         poll_interval = self.cfg.get("poll_interval_seconds", 15)
         self.logger.info(
             "Monitoring %d address(es), poll interval %ds",
@@ -1937,6 +2269,7 @@ class CopyTraderBot:
         )
         _last_pause_log = 0  # timestamp of last "still paused" INFO log
         _last_redeem_check = 0  # timestamp of last settled-position redemption scan
+        _last_proxy_check = 0   # timestamp of last proxy wallet redemption scan
 
         while self.running:
             try:
@@ -2020,6 +2353,27 @@ class CopyTraderBot:
                     except Exception as redeem_exc:
                         self.logger.debug(
                             "Redemption check error: %s", redeem_exc,
+                        )
+
+                # --- Proxy wallet redemption & withdrawal ---
+                # Runs on the same cadence as auto-redeem.  Recovering
+                # USDC from the proxy helps the bot resume trading.
+                if (
+                    self.executor
+                    and self.cfg.get("proxy_redeem", True)
+                    and now - _last_proxy_check >= REDEEM_CHECK_INTERVAL_SECONDS
+                ):
+                    _last_proxy_check = now
+                    try:
+                        proxy_results = self.executor.scan_and_redeem_proxy_portfolio()
+                        if proxy_results:
+                            self.logger.info(
+                                "Proxy check: %d result(s) processed",
+                                len(proxy_results),
+                            )
+                    except Exception as proxy_exc:
+                        self.logger.debug(
+                            "Proxy redemption check error: %s", proxy_exc,
                         )
 
                 # --- Skip trade detection & execution while paused ---
@@ -2569,6 +2923,10 @@ def run_headless():
         cfg["clob_api_passphrase"] = os.environ["CLOB_API_PASSPHRASE"]
     if os.environ.get("AUTO_REDEEM_SETTLED"):
         cfg["auto_redeem_settled"] = os.environ["AUTO_REDEEM_SETTLED"].lower() in ("1", "true", "yes")
+    if os.environ.get("PROXY_REDEEM"):
+        cfg["proxy_redeem"] = os.environ["PROXY_REDEEM"].lower() in ("1", "true", "yes")
+    if os.environ.get("PROXY_WITHDRAW"):
+        cfg["proxy_withdraw"] = os.environ["PROXY_WITHDRAW"].lower() in ("1", "true", "yes")
 
     if not cfg.get("watched_addresses"):
         logger.error("No watched addresses configured. Set WATCHED_ADDRESSES env var or edit config.json.")
@@ -2580,6 +2938,8 @@ def run_headless():
                 cfg.get("copy_percentage"), cfg.get("max_trade_usdc"),
                 cfg.get("resume_threshold_usdc", 100), cfg.get("dry_run", False),
                 cfg.get("auto_redeem_settled", True))
+    logger.info("Proxy redeem: %s | Proxy withdraw: %s",
+                cfg.get("proxy_redeem", True), cfg.get("proxy_withdraw", True))
 
     bot = CopyTraderBot(cfg, logger)
 
