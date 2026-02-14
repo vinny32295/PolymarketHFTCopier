@@ -424,6 +424,25 @@ class TestBalanceCaching(unittest.TestCase):
             mock_contract.functions.balanceOf.return_value.call.call_count, 2
         )
 
+    def test_rpc_failure_returns_stale_cache(self):
+        executor, mock_contract = self._make_executor()
+        # First call succeeds and populates cache
+        balance = executor.get_usdc_balance()
+        self.assertEqual(balance, Decimal("500"))
+        # Expire cache, then make RPC fail
+        executor._balance_timestamp -= 600
+        mock_contract.functions.balanceOf.return_value.call.side_effect = Exception("RPC down")
+        # Should return stale cached value instead of raising
+        result = executor.get_usdc_balance()
+        self.assertEqual(result, Decimal("500"))
+
+    def test_rpc_failure_no_cache_raises(self):
+        executor, mock_contract = self._make_executor()
+        # Make RPC fail on the very first call (no cache yet)
+        mock_contract.functions.balanceOf.return_value.call.side_effect = Exception("RPC down")
+        with self.assertRaises(Exception):
+            executor.get_usdc_balance()
+
 
 class TestConstants(unittest.TestCase):
     """Verify contract addresses and ABIs are well-formed."""

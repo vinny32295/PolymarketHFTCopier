@@ -734,6 +734,10 @@ class TradeExecutor:
 
         Results are cached for *max_age_seconds* (default 5 min) to reduce
         RPC load.  Pass ``max_age_seconds=0`` to force a fresh fetch.
+
+        If the RPC call fails and a (possibly stale) cached value exists it
+        is returned with a warning.  When no cached value is available the
+        exception propagates.
         """
         now = time.time()
         if (
@@ -744,9 +748,17 @@ class TradeExecutor:
             self.logger.debug("Using cached USDC balance")
             return self._cached_balance
 
-        raw = self.usdc.functions.balanceOf(self.address).call()
-        self._cached_balance = Decimal(raw) / Decimal("1000000")
-        self._balance_timestamp = now
+        try:
+            raw = self.usdc.functions.balanceOf(self.address).call()
+            self._cached_balance = Decimal(raw) / Decimal("1000000")
+            self._balance_timestamp = now
+        except Exception as exc:
+            if self._cached_balance is not None:
+                self.logger.warning(
+                    "USDC balance RPC failed (%s); using stale cached value", exc
+                )
+                return self._cached_balance
+            raise
         return self._cached_balance
 
     def invalidate_balance_cache(self):
@@ -1008,13 +1020,19 @@ class CopyTraderBot:
                 logger=self.logger,
             )
             self.logger.info("Executor initialized – wallet: %s", self.executor.address)
-            balance = self.executor.get_usdc_balance()
-            matic = self.executor.get_matic_balance()
-            self.logger.info("Balances – USDC: %.2f | MATIC: %.4f", balance, matic)
-            return True
         except Exception as exc:
             self.logger.error("Failed to initialize executor: %s", exc)
             return False
+        # Balance check is informational — don't let it block the executor
+        try:
+            balance = self.executor.get_usdc_balance()
+            matic = self.executor.get_matic_balance()
+            self.logger.info("Balances – USDC: %.2f | MATIC: %.4f", balance, matic)
+        except Exception as exc:
+            self.logger.warning(
+                "Could not fetch startup balances (will retry later): %s", exc
+            )
+        return True
 
     def _init_clob(self):
         if not self.cfg.get("use_clob_api", True):
