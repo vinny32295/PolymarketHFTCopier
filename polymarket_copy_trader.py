@@ -802,6 +802,7 @@ class TradeExecutor:
           - price: the price per share (0-1 range)
         """
         try:
+            self.logger.debug("Raw trade_info: %s", json.dumps(trade_info, default=str)[:500])
             side = str(trade_info.get("side", "BUY")).upper()
             # CLOB API returns size/amount in USDC; on-chain returns raw units (6 decimals)
             clob_size = trade_info.get("size") or trade_info.get("amount")
@@ -810,6 +811,7 @@ class TradeExecutor:
             else:
                 raw = Decimal(str(trade_info.get("makerAmountFilled", "0")))
                 original_usdc = raw / Decimal("1000000")
+            self.logger.info("Trade size parsing: raw=%s -> original_usdc=%s", clob_size or trade_info.get("makerAmountFilled"), original_usdc)
             if original_usdc <= 0:
                 self.logger.warning("Skipping trade with zero/negative size")
                 return None
