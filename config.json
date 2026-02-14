@@ -8,5 +8,8 @@
   "slippage_tolerance_bps": 100,
   "gas_multiplier": 1.2,
   "poll_interval_seconds": 10,
-  "use_clob_api": true
+  "use_clob_api": true,
+  "clob_api_key": "",
+  "clob_api_secret": "",
+  "clob_api_passphrase": ""
 }

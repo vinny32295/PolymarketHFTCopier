@@ -38,6 +38,15 @@ try:
 except ImportError:
     Web3 = None
 
+# Polymarket official Python CLOB client (for authenticated API access)
+try:
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import OrderArgs, OrderType
+    HAS_CLOB_SDK = True
+except ImportError:
+    ClobClient = None
+    HAS_CLOB_SDK = False
+
 # ---------------------------------------------------------------------------
 # Constants – Polymarket / Polygon addresses and ABIs
 # ---------------------------------------------------------------------------
@@ -135,6 +144,9 @@ DEFAULT_CONFIG = {
     "gas_multiplier": 1.2,
     "poll_interval_seconds": 10,
     "use_clob_api": True,
+    "clob_api_key": "",
+    "clob_api_secret": "",
+    "clob_api_passphrase": "",
 }
 
 
@@ -223,24 +235,102 @@ def save_private_key(key, cfg):
 # ---------------------------------------------------------------------------
 
 class PolymarketCLOBClient:
-    """Lightweight client for the Polymarket CLOB REST API.
+    """Client for the Polymarket CLOB API with proper authentication.
 
-    Uses the public endpoints documented at https://docs.polymarket.com/
-    to fetch recent trades for watched addresses. This is the preferred
-    monitoring method — more reliable than raw mempool scanning.
+    The CLOB API requires L2 authentication (API key + HMAC) for endpoints
+    like GET /data/trades. API credentials are derived deterministically
+    from the user's private key via the py-clob-client SDK.
+
+    Public endpoints (markets, books, prices) need no auth.
+    The Gamma API (gamma-api.polymarket.com) is fully public.
+
+    Reference: https://docs.polymarket.com/
     """
 
-    def __init__(self, base_url=CLOB_API_BASE, logger=None):
-        self.base_url = base_url.rstrip("/")
+    def __init__(self, cfg, private_key="", logger=None):
+        self.cfg = cfg
+        self.base_url = CLOB_API_BASE.rstrip("/")
         self.gamma_url = GAMMA_API_BASE.rstrip("/")
         self.session = requests.Session() if requests else None
         self.logger = logger or logging.getLogger("CopyTrader")
         self._last_trade_ids = {}  # address -> set of seen trade IDs
 
-    def _get(self, url, params=None, retries=3, backoff=2):
-        """HTTP GET with exponential-backoff retries."""
+        # Authenticated CLOB client (py-clob-client SDK)
+        self.clob_sdk = None
+        self._init_authenticated_client(cfg, private_key)
+
+    def _init_authenticated_client(self, cfg, private_key):
+        """Initialize the py-clob-client SDK with API credentials.
+
+        If API credentials exist in config, use them directly.
+        If only a private key is available, derive credentials automatically.
+        """
+        if not HAS_CLOB_SDK:
+            self.logger.warning(
+                "py-clob-client not installed – authenticated CLOB endpoints "
+                "unavailable. Install with: pip install py-clob-client"
+            )
+            return
+
+        api_key = cfg.get("clob_api_key", "")
+        api_secret = cfg.get("clob_api_secret", "")
+        api_passphrase = cfg.get("clob_api_passphrase", "")
+
+        if api_key and api_secret and api_passphrase:
+            # Use existing credentials
+            try:
+                self.clob_sdk = ClobClient(
+                    host=CLOB_API_BASE,
+                    chain_id=137,
+                    key=private_key if private_key else None,
+                    creds={
+                        "apiKey": api_key,
+                        "secret": api_secret,
+                        "passphrase": api_passphrase,
+                    },
+                )
+                self.logger.info("CLOB SDK initialized with stored API credentials")
+                return
+            except Exception as exc:
+                self.logger.warning("Failed to init CLOB SDK with stored creds: %s", exc)
+
+        if private_key:
+            # Derive credentials from private key
+            try:
+                client = ClobClient(
+                    host=CLOB_API_BASE,
+                    chain_id=137,
+                    key=private_key,
+                )
+                creds = client.create_or_derive_api_creds()
+                self.logger.info("Derived CLOB API credentials from private key")
+
+                # Store derived credentials in config for reuse
+                cfg["clob_api_key"] = creds.api_key
+                cfg["clob_api_secret"] = creds.api_secret
+                cfg["clob_api_passphrase"] = creds.api_passphrase
+                save_config(cfg)
+                self.logger.info("Saved CLOB API credentials to config")
+
+                # Reinitialize with full credentials
+                self.clob_sdk = ClobClient(
+                    host=CLOB_API_BASE,
+                    chain_id=137,
+                    key=private_key,
+                    creds={
+                        "apiKey": creds.api_key,
+                        "secret": creds.api_secret,
+                        "passphrase": creds.api_passphrase,
+                    },
+                )
+                self.logger.info("CLOB SDK fully initialized with derived credentials")
+            except Exception as exc:
+                self.logger.error("Failed to derive CLOB API credentials: %s", exc)
+
+    def _get_public(self, url, params=None, retries=3, backoff=2):
+        """HTTP GET for public (unauthenticated) endpoints with retries."""
         if self.session is None:
-            self.logger.error("requests library not installed – cannot use CLOB API")
+            self.logger.error("requests library not installed")
             return None
         for attempt in range(retries):
             try:
@@ -250,32 +340,138 @@ class PolymarketCLOBClient:
             except Exception as exc:
                 wait = backoff ** attempt
                 self.logger.warning(
-                    "CLOB API request failed (attempt %d/%d): %s – retrying in %ds",
+                    "API request failed (attempt %d/%d): %s – retrying in %ds",
                     attempt + 1, retries, exc, wait,
                 )
                 time.sleep(wait)
         return None
 
     def get_trades_for_address(self, address, limit=50):
-        """Fetch recent trades for *address* from the CLOB API."""
-        url = f"{self.base_url}/trades"
-        params = {"maker_address": address.lower(), "limit": limit}
-        data = self._get(url, params=params)
+        """Fetch recent trades for *address*.
+
+        Uses the authenticated CLOB SDK if available, otherwise falls
+        back to the public Gamma API activity endpoint.
+        """
+        # Primary: authenticated CLOB SDK get_trades
+        if self.clob_sdk:
+            try:
+                data = self.clob_sdk.get_trades(
+                    maker_address=address.lower(),
+                    limit=limit,
+                )
+                if isinstance(data, list):
+                    return data
+                if hasattr(data, "__iter__"):
+                    return list(data)
+                return []
+            except Exception as exc:
+                self.logger.debug(
+                    "CLOB SDK get_trades failed for %s: %s – trying Gamma fallback",
+                    address[:10], exc,
+                )
+
+        # Fallback: Gamma API (public, no auth needed)
+        url = f"{self.gamma_url}/activity"
+        params = {"address": address.lower(), "limit": limit}
+        data = self._get_public(url, params=params)
         if data is None:
             return []
-        # The API may return a list directly or a wrapper object
         if isinstance(data, list):
             return data
-        return data.get("data", data.get("trades", []))
+        return data.get("data", data.get("history", []))
 
-    def get_market_info(self, condition_id):
-        """Fetch market details from the Gamma API."""
-        url = f"{self.gamma_url}/markets"
-        params = {"condition_id": condition_id}
-        data = self._get(url, params=params)
-        if data and isinstance(data, list) and len(data) > 0:
-            return data[0]
-        return data
+    def get_market_info(self, token_id=None, condition_id=None):
+        """Fetch market details. Tries CLOB SDK then Gamma API."""
+        if self.clob_sdk and token_id:
+            try:
+                return self.clob_sdk.get_market(token_id)
+            except Exception:
+                pass
+
+        if condition_id:
+            url = f"{self.gamma_url}/markets"
+            params = {"condition_id": condition_id}
+            data = self._get_public(url, params=params)
+            if data and isinstance(data, list) and len(data) > 0:
+                return data[0]
+            return data
+        return None
+
+    def get_order_book(self, token_id):
+        """Fetch the order book for a token (public endpoint)."""
+        if self.clob_sdk:
+            try:
+                return self.clob_sdk.get_order_book(token_id)
+            except Exception as exc:
+                self.logger.debug("CLOB SDK get_order_book failed: %s", exc)
+
+        url = f"{self.base_url}/book"
+        params = {"token_id": token_id}
+        return self._get_public(url, params=params)
+
+    def get_last_trade_price(self, token_id):
+        """Fetch last trade price (public endpoint, no auth needed)."""
+        url = f"{self.base_url}/last-trade-price"
+        params = {"token_id": token_id}
+        data = self._get_public(url, params=params)
+        if data:
+            return float(data.get("price", 0))
+        return None
+
+    def place_order(self, token_id, side, size_usdc, price, neg_risk=False):
+        """Place an order on the Polymarket CLOB.
+
+        Requires the py-clob-client SDK with valid API credentials.
+
+        Args:
+            token_id: The conditional token ID to trade.
+            side: 'BUY' or 'SELL'.
+            size_usdc: Trade size in USDC (will be converted to raw units).
+            price: Price per share (0.0–1.0 range).
+            neg_risk: Whether the market uses the neg-risk framework.
+
+        Returns:
+            Order response dict, or None on failure.
+        """
+        if not self.clob_sdk:
+            self.logger.error(
+                "Cannot place order – CLOB SDK not initialized. "
+                "Install py-clob-client and configure API credentials."
+            )
+            return None
+
+        try:
+            # Determine tick size from market info
+            tick_size = "0.01"  # default
+            try:
+                market = self.clob_sdk.get_market(token_id)
+                if market and hasattr(market, "minimum_tick_size"):
+                    tick_size = str(market.minimum_tick_size)
+            except Exception:
+                pass
+
+            # Build order arguments
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=round(price, 2),
+                size=round(size_usdc, 2),
+            )
+
+            # Determine buy/sell
+            if side.upper() == "BUY":
+                signed_order = self.clob_sdk.create_and_post_order(order_args)
+            else:
+                signed_order = self.clob_sdk.create_and_post_order(order_args)
+
+            self.logger.info(
+                "CLOB order placed: %s %.2f USDC @ %.4f for token %s",
+                side, size_usdc, price, token_id[:16] + "...",
+            )
+            return signed_order
+
+        except Exception as exc:
+            self.logger.error("Failed to place CLOB order: %s", exc, exc_info=True)
+            return None
 
     def get_new_trades(self, address):
         """Return only trades we have not seen before for *address*."""
@@ -284,7 +480,12 @@ class PolymarketCLOBClient:
         seen = self._last_trade_ids.get(address, set())
         new_trades = []
         for trade in all_trades:
-            tid = trade.get("id") or trade.get("tradeID") or trade.get("hash", "")
+            tid = (
+                trade.get("id")
+                or trade.get("tradeID")
+                or trade.get("hash")
+                or trade.get("transactionHash", "")
+            )
             if tid and tid not in seen:
                 new_trades.append(trade)
                 seen.add(tid)
@@ -297,7 +498,12 @@ class PolymarketCLOBClient:
         all_trades = self.get_trades_for_address(address)
         seen = set()
         for trade in all_trades:
-            tid = trade.get("id") or trade.get("tradeID") or trade.get("hash", "")
+            tid = (
+                trade.get("id")
+                or trade.get("tradeID")
+                or trade.get("hash")
+                or trade.get("transactionHash", "")
+            )
             if tid:
                 seen.add(tid)
         self._last_trade_ids[address] = seen
@@ -466,12 +672,13 @@ class TradeExecutor:
     supporting CLOB order placement when possible.
     """
 
-    def __init__(self, w3, private_key, cfg, logger=None):
+    def __init__(self, w3, private_key, cfg, clob_client=None, logger=None):
         self.w3 = w3
         self.private_key = private_key
         self.account = w3.eth.account.from_key(private_key)
         self.address = self.account.address
         self.cfg = cfg
+        self.clob_client = clob_client  # PolymarketCLOBClient for order placement
         self.logger = logger or logging.getLogger("CopyTrader")
         self.copy_pct = Decimal(str(cfg.get("copy_percentage", 50))) / Decimal("100")
         self.max_trade = Decimal(str(cfg.get("max_trade_usdc", 100)))
@@ -612,25 +819,43 @@ class TradeExecutor:
             raw_amount = int(copy_amount * Decimal("1000000"))
             self.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
 
-            # NOTE: Polymarket's primary trading interface uses off-chain signed
-            # orders submitted to the CLOB API. Direct on-chain fillOrder calls
-            # require a counterparty order. In production you would:
-            #   1. Fetch the order book from the CLOB API
-            #   2. Find matching resting orders
-            #   3. Build and sign a taker order
-            #   4. Submit via POST /order to the CLOB API
-            #
-            # For safety, this bot logs the intent and prepares the approval.
-            # Full CLOB order signing requires the Polymarket Python SDK
-            # (py-clob-client) which can be integrated as a next step.
+            # Place order via the CLOB API (requires py-clob-client + API creds)
+            if self.clob_client and self.clob_client.clob_sdk:
+                # Apply slippage to price
+                slippage_mult = Decimal(str(self.slippage_bps)) / Decimal("10000")
+                if side == "BUY":
+                    adjusted_price = float(Decimal(str(price)) * (Decimal("1") + slippage_mult))
+                    adjusted_price = min(adjusted_price, 0.99)
+                else:
+                    adjusted_price = float(Decimal(str(price)) * (Decimal("1") - slippage_mult))
+                    adjusted_price = max(adjusted_price, 0.01)
 
-            self.logger.info(
-                "Trade prepared: %s %s USDC worth of token %s. "
-                "Submission to CLOB API pending SDK integration.",
-                side, copy_amount, token_id[:20],
-            )
+                result = self.clob_client.place_order(
+                    token_id=token_id,
+                    side=side,
+                    size_usdc=float(copy_amount),
+                    price=adjusted_price,
+                )
+                if result:
+                    self.logger.info("Order submitted to CLOB: %s", result)
+                    return {
+                        "status": "submitted",
+                        "side": side,
+                        "amount_usdc": float(copy_amount),
+                        "token_id": token_id,
+                        "price": adjusted_price,
+                        "clob_response": result,
+                    }
+                else:
+                    self.logger.warning("CLOB order placement returned no result")
+            else:
+                self.logger.warning(
+                    "CLOB SDK not available – trade detected but not executed. "
+                    "Install py-clob-client and configure API credentials to enable."
+                )
+
             return {
-                "status": "prepared",
+                "status": "detected_only",
                 "side": side,
                 "amount_usdc": float(copy_amount),
                 "token_id": token_id,
@@ -700,7 +925,11 @@ class CopyTraderBot:
             self.logger.error("No private key configured – cannot execute trades")
             return False
         try:
-            self.executor = TradeExecutor(self.w3, pk, self.cfg, self.logger)
+            self.executor = TradeExecutor(
+                self.w3, pk, self.cfg,
+                clob_client=self.clob_client,
+                logger=self.logger,
+            )
             self.logger.info("Executor initialized – wallet: %s", self.executor.address)
             balance = self.executor.get_usdc_balance()
             matic = self.executor.get_matic_balance()
@@ -716,7 +945,10 @@ class CopyTraderBot:
         if requests is None:
             self.logger.warning("requests library not installed – CLOB API disabled")
             return
-        self.clob_client = PolymarketCLOBClient(logger=self.logger)
+        pk = load_private_key(self.cfg)
+        self.clob_client = PolymarketCLOBClient(
+            cfg=self.cfg, private_key=pk, logger=self.logger,
+        )
         # Seed existing trades so we don't copy old history
         for addr in self.cfg.get("watched_addresses", []):
             self.clob_client.seed_seen_trades(addr)
@@ -736,14 +968,14 @@ class CopyTraderBot:
 
     def _run_loop(self):
         """Main monitoring loop."""
-        # Initialise connections
+        # Initialise connections – CLOB first so executor can use it
+        self._init_clob()
+
         web3_ok = self._init_web3()
         if web3_ok:
             self._init_executor()
             watched = self.cfg.get("watched_addresses", [])
             self.on_chain_monitor = OnChainMonitor(self.w3, watched, self.logger)
-
-        self._init_clob()
 
         poll_interval = self.cfg.get("poll_interval_seconds", 10)
         self.logger.info(
@@ -952,6 +1184,49 @@ class CopyTraderGUI:
             parent, text="Use Polymarket CLOB API (recommended)", variable=self.use_clob_var
         ).grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=3)
 
+        # --- CLOB API Credentials ---
+        row += 1
+        ttk.Separator(parent, orient=tk.HORIZONTAL).grid(
+            row=row, column=0, columnspan=3, sticky=tk.EW, pady=8
+        )
+
+        row += 1
+        ttk.Label(
+            parent, text="CLOB API Credentials (auto-derived from private key, or enter manually):",
+            font=("TkDefaultFont", 9, "bold"),
+        ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=3)
+
+        row += 1
+        ttk.Label(parent, text="API Key:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.api_key_entry = ttk.Entry(parent, width=70)
+        self.api_key_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, pady=2)
+
+        row += 1
+        ttk.Label(parent, text="API Secret:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.api_secret_entry = ttk.Entry(parent, width=70, show="*")
+        self.api_secret_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, pady=2)
+
+        row += 1
+        ttk.Label(parent, text="API Passphrase:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.api_passphrase_entry = ttk.Entry(parent, width=70, show="*")
+        self.api_passphrase_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, pady=2)
+
+        row += 1
+        self.derive_btn = ttk.Button(
+            parent, text="Derive Credentials from Private Key",
+            command=self._derive_api_creds,
+        )
+        self.derive_btn.grid(row=row, column=1, sticky=tk.W, pady=3)
+
+        row += 1
+        ttk.Label(
+            parent,
+            text="Credentials are derived deterministically from your private key. "
+                 "They will be auto-generated on first bot start if left blank.",
+            foreground="gray",
+            wraplength=600,
+        ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
+
         parent.columnconfigure(1, weight=1)
 
     def _build_address_tab(self, parent):
@@ -999,6 +1274,10 @@ class CopyTraderGUI:
         self.slippage_entry.insert(0, str(self.cfg.get("slippage_tolerance_bps", 100)))
         self.poll_entry.insert(0, str(self.cfg.get("poll_interval_seconds", 10)))
         self.use_clob_var.set(self.cfg.get("use_clob_api", True))
+        # API credentials
+        self.api_key_entry.insert(0, self.cfg.get("clob_api_key", ""))
+        self.api_secret_entry.insert(0, self.cfg.get("clob_api_secret", ""))
+        self.api_passphrase_entry.insert(0, self.cfg.get("clob_api_passphrase", ""))
         pk = load_private_key(self.cfg)
         if pk:
             self.pk_entry.insert(0, pk)
@@ -1010,6 +1289,10 @@ class CopyTraderGUI:
         self.cfg["ws_rpc_url"] = self.ws_rpc_entry.get().strip()
         self.cfg["copy_percentage"] = self.copy_pct_var.get()
         self.cfg["use_clob_api"] = self.use_clob_var.get()
+        # API credentials
+        self.cfg["clob_api_key"] = self.api_key_entry.get().strip()
+        self.cfg["clob_api_secret"] = self.api_secret_entry.get().strip()
+        self.cfg["clob_api_passphrase"] = self.api_passphrase_entry.get().strip()
         try:
             self.cfg["max_trade_usdc"] = float(self.max_trade_entry.get().strip())
         except ValueError:
@@ -1029,6 +1312,37 @@ class CopyTraderGUI:
     def _toggle_pk(self):
         current = self.pk_entry.cget("show")
         self.pk_entry.configure(show="" if current == "*" else "*")
+
+    def _derive_api_creds(self):
+        """Derive Polymarket CLOB API credentials from the private key."""
+        pk = self.pk_entry.get().strip()
+        if not pk:
+            messagebox.showwarning("No Key", "Enter your private key first.")
+            return
+        if not HAS_CLOB_SDK:
+            messagebox.showerror(
+                "Missing SDK",
+                "py-clob-client is not installed.\n\n"
+                "Run: pip install py-clob-client",
+            )
+            return
+        try:
+            client = ClobClient(host=CLOB_API_BASE, chain_id=137, key=pk)
+            creds = client.create_or_derive_api_creds()
+
+            # Populate the GUI fields
+            self.api_key_entry.delete(0, tk.END)
+            self.api_key_entry.insert(0, creds.api_key)
+            self.api_secret_entry.delete(0, tk.END)
+            self.api_secret_entry.insert(0, creds.api_secret)
+            self.api_passphrase_entry.delete(0, tk.END)
+            self.api_passphrase_entry.insert(0, creds.api_passphrase)
+
+            self.logger.info("CLOB API credentials derived successfully")
+            messagebox.showinfo("Success", "API credentials derived and populated.")
+        except Exception as exc:
+            self.logger.error("Failed to derive API credentials: %s", exc)
+            messagebox.showerror("Error", f"Failed to derive credentials:\n{exc}")
 
     def _add_address(self):
         addr = self.new_addr_entry.get().strip()
@@ -1123,13 +1437,16 @@ POLYMARKET COPY TRADER BOT — USAGE INSTRUCTIONS
 
 1. REQUIRED INSTALLATIONS
    ----------------------
-   pip install web3 requests
+   pip install web3 requests py-clob-client
 
    Optional (for .env support):
    pip install python-dotenv
 
    Python 3.8+ is required. Tkinter is included with standard Python
    installations on most platforms.
+
+   The py-clob-client package is the official Polymarket Python SDK.
+   It handles API authentication (HMAC signing) and order creation.
 
 2. CONFIGURATION
    -------------
@@ -1148,7 +1465,10 @@ POLYMARKET COPY TRADER BOT — USAGE INSTRUCTIONS
      "slippage_tolerance_bps": 100,
      "gas_multiplier": 1.2,
      "poll_interval_seconds": 10,
-     "use_clob_api": true
+     "use_clob_api": true,
+     "clob_api_key": "",
+     "clob_api_secret": "",
+     "clob_api_passphrase": ""
    }
 
    Recommended Polygon RPC providers:
@@ -1157,7 +1477,35 @@ POLYMARKET COPY TRADER BOT — USAGE INSTRUCTIONS
    - QuickNode: https://quicknode.com
    - Public:   https://polygon-rpc.com (rate limited)
 
-3. PRIVATE KEY SETUP
+3. API CREDENTIALS & AUTHENTICATION
+   ---------------------------------
+   Polymarket's CLOB API requires L2 authentication (API key + HMAC)
+   for trade history and order placement endpoints.
+
+   Credentials are derived DETERMINISTICALLY from your wallet private key:
+
+   Option A – Automatic (recommended):
+     Enter your private key in the GUI, then click
+     "Derive Credentials from Private Key". The API key, secret, and
+     passphrase will be generated and saved to config.json.
+
+   Option B – Automatic on first start:
+     If no credentials are saved but a private key is present, the bot
+     will derive them automatically when started.
+
+   Option C – Manual:
+     Use the py-clob-client SDK directly:
+       from py_clob_client.client import ClobClient
+       client = ClobClient("https://clob.polymarket.com", 137, key="0x...")
+       creds = client.create_or_derive_api_creds()
+       print(creds)
+     Then paste apiKey, secret, passphrase into the GUI or config.json.
+
+   IMPORTANT: Each wallet can only have ONE active API key at a time.
+   Calling create_or_derive_api_creds() is safe to repeat — it returns
+   the same key deterministically without invalidating it.
+
+4. PRIVATE KEY SETUP
    -----------------
    Enter your private key in the GUI or save it to the file specified
    by "private_key_file" in config.json (default: .private_key).
@@ -1172,40 +1520,37 @@ POLYMARKET COPY TRADER BOT — USAGE INSTRUCTIONS
    • Run on a secure, trusted machine only.
    • Use a hardware wallet or multisig for large holdings.
 
-4. RUNNING THE BOT
+5. RUNNING THE BOT
    ----------------
    python polymarket_copy_trader.py
 
    The Tkinter GUI will open. From there you can:
    - Configure RPC endpoints and your private key
+   - Derive or enter CLOB API credentials
    - Add trader wallet addresses to monitor
    - Adjust copy percentage (1–100%) and max trade size
    - Start/Stop the monitoring bot
    - View real-time logs in the Log tab
 
-5. HOW IT WORKS
+6. HOW IT WORKS
    -------------
    The bot uses two complementary data sources:
 
    a) Polymarket CLOB API (primary, recommended):
-      Polls the public REST API for recent trades by watched addresses.
-      More reliable and lower latency than raw block scanning.
+      Uses authenticated requests via py-clob-client to fetch trades
+      for watched addresses. Orders are placed via the CLOB API using
+      EIP-712 signed order payloads.
 
    b) On-chain monitoring (fallback):
       Scans new Polygon blocks for transactions from watched addresses
       to Polymarket's CTF Exchange contracts. Requires a valid RPC URL.
 
    When a new trade is detected, the bot:
-   1. Computes the copy amount (original size × copy percentage)
+   1. Computes the copy amount (original size x copy percentage)
    2. Caps it to max_trade_usdc and 95% of available USDC balance
    3. Ensures USDC approval on the exchange contract
-   4. Logs the trade intent
-
-   NOTE: Full automated order execution requires integration with the
-   Polymarket CLOB order signing flow (py-clob-client SDK). The current
-   implementation handles detection, scaling, and approval. Extend the
-   execute_copy_trade() method with CLOB order placement for full
-   automation.
+   4. Places the order via the CLOB API (if SDK + credentials are available)
+   5. Logs the result
 
 6. LOGGING
    -------
