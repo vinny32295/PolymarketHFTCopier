@@ -1736,58 +1736,124 @@ class TradeExecutor:
     def _search_factory_events(self, factory_addr, is_safe=False):
         """Search a factory contract's event logs for a proxy deployed by this EOA.
 
-        For the legacy proxy factory, looks for ``Deploy(deployer, proxy)`` events.
-        For the Safe factory, scans raw logs with the EOA as an indexed topic
-        (the ``ProxyCreation`` event encodes the proxy address in the data).
+        Uses specific event signatures for efficiency:
+        - Legacy factory: ``Deploy(address,address)`` — deployer indexed, proxy in data.
+        - Safe factory:   ``ProxyCreation(address,address)`` — proxy in data, singleton in data.
+          Also tries the 1-arg variant ``ProxyCreation(address)``.
+
+        Falls back to a broad topic-1 scan if signature-specific queries miss.
 
         Returns the proxy address as a checksummed string, or ``None``.
         """
         eoa_padded = "0x" + self.address[2:].lower().zfill(64)
-        start_block = 10_000_000
+
         chunk_size = 5_000_000
         label = "Safe" if is_safe else "legacy"
+        checksummed_factory = Web3.to_checksum_address(factory_addr)
+
+        # Build a list of event signatures to try (most-specific first)
+        if is_safe:
+            event_sigs = [
+                Web3.keccak(text="ProxyCreation(address,address)").hex(),
+                Web3.keccak(text="ProxyCreation(address)").hex(),
+            ]
+        else:
+            event_sigs = [
+                Web3.keccak(text="Deploy(address,address)").hex(),
+            ]
 
         try:
             latest_block = self.w3.eth.block_number
             self.logger.info(
-                "Searching %s factory (%s) event logs for EOA %s...",
+                "Searching %s factory (%s) event logs for EOA %s "
+                "(blocks %d–%d)...",
                 label, factory_addr[:12] + "...", self.address,
+                start_block, latest_block,
+            )
+
+            # --- Pass 1: signature-specific queries ---
+            for sig in event_sigs:
+                for from_blk in range(start_block, latest_block + 1, chunk_size):
+                    to_blk = min(from_blk + chunk_size - 1, latest_block)
+                    try:
+                        logs = self.w3.eth.get_logs({
+                            "address": checksummed_factory,
+                            "fromBlock": from_blk,
+                            "toBlock": to_blk,
+                            "topics": [sig, eoa_padded],
+                        })
+                        addr = self._extract_proxy_from_logs(logs, label)
+                        if addr:
+                            return addr
+                    except Exception as exc:
+                        self.logger.debug(
+                            "%s sig-scan chunk %d–%d failed: %s",
+                            label, from_blk, to_blk, exc,
+                        )
+
+            # --- Pass 2: broad scan (topic0=any, topic1=EOA) ---
+            self.logger.info(
+                "%s signature-specific search found nothing — "
+                "trying broad topic scan...", label,
             )
             for from_blk in range(start_block, latest_block + 1, chunk_size):
                 to_blk = min(from_blk + chunk_size - 1, latest_block)
                 try:
                     logs = self.w3.eth.get_logs({
-                        "address": Web3.to_checksum_address(factory_addr),
+                        "address": checksummed_factory,
                         "fromBlock": from_blk,
                         "toBlock": to_blk,
                         "topics": [None, eoa_padded],
                     })
-                    if logs:
-                        last_log = logs[-1]
-                        raw_data = last_log.get("data", b"")
-                        if isinstance(raw_data, bytes):
-                            raw_hex = raw_data.hex()
-                        else:
-                            raw_hex = raw_data.replace("0x", "")
-                        if len(raw_hex) >= 40:
-                            addr = Web3.to_checksum_address(
-                                "0x" + raw_hex[-40:]
-                            )
-                            self.logger.info(
-                                "Discovered %s proxy via event log: %s "
-                                "(block %d)",
-                                label, addr, last_log.get("blockNumber", 0),
-                            )
-                            return addr
-                except Exception as chunk_exc:
+                    addr = self._extract_proxy_from_logs(logs, label)
+                    if addr:
+                        return addr
+                except Exception as exc:
                     self.logger.debug(
-                        "%s event chunk %d-%d failed: %s",
-                        label, from_blk, to_blk, chunk_exc,
+                        "%s broad-scan chunk %d–%d failed: %s",
+                        label, from_blk, to_blk, exc,
                     )
+
         except Exception as exc:
             self.logger.info(
                 "%s factory event search failed: %s", label, exc,
             )
+        return None
+
+    @staticmethod
+    def _extract_proxy_from_logs(logs, label=""):
+        """Extract a proxy address from a list of event logs.
+
+        Checks both ``log['data']`` (non-indexed params) and
+        ``log['topics'][2]`` (third indexed topic) to handle different
+        factory event formats.
+
+        Returns the checksummed proxy address, or ``None``.
+        """
+        if not logs:
+            return None
+        last_log = logs[-1]
+
+        # Try topics[2] first (common: Deploy(indexed owner, indexed proxy))
+        topics = last_log.get("topics", [])
+        if len(topics) >= 3:
+            raw_topic = topics[2]
+            if isinstance(raw_topic, bytes):
+                raw_topic = raw_topic.hex()
+            else:
+                raw_topic = raw_topic.replace("0x", "")
+            if len(raw_topic) >= 40:
+                return Web3.to_checksum_address("0x" + raw_topic[-40:])
+
+        # Fall back to data field (non-indexed param)
+        raw_data = last_log.get("data", b"")
+        if isinstance(raw_data, bytes):
+            raw_hex = raw_data.hex()
+        else:
+            raw_hex = raw_data.replace("0x", "")
+        if len(raw_hex) >= 40:
+            return Web3.to_checksum_address("0x" + raw_hex[-40:])
+
         return None
 
     def discover_proxy_wallet(self):
