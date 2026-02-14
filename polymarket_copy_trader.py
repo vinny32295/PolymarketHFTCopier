@@ -164,6 +164,29 @@ CTF_EXCHANGE_ABI = json.loads("""[
     ],"name":"OrdersMatched","type":"event"}
 ]""")
 
+# Minimal Conditional Tokens (ERC1155) ABI – for checking balances &
+# redeeming resolved positions back to USDC.
+CONDITIONAL_TOKENS_ABI = json.loads("""[
+    {"constant":true,"inputs":[{"name":"owner","type":"address"},
+     {"name":"id","type":"uint256"}],
+     "name":"balanceOf","outputs":[{"name":"","type":"uint256"}],
+     "type":"function"},
+    {"constant":true,"inputs":[{"name":"conditionId","type":"bytes32"}],
+     "name":"payoutDenominator",
+     "outputs":[{"name":"","type":"uint256"}],
+     "type":"function"},
+    {"constant":false,"inputs":[
+        {"name":"collateralToken","type":"address"},
+        {"name":"parentCollectionId","type":"bytes32"},
+        {"name":"conditionId","type":"bytes32"},
+        {"name":"indexSets","type":"uint256[]"}],
+     "name":"redeemPositions","outputs":[],
+     "type":"function"}
+]""")
+
+# How often to check for redeemable (settled) positions (seconds)
+REDEEM_CHECK_INTERVAL_SECONDS = 300  # 5 minutes
+
 # Default config file path
 CONFIG_FILE = "config.json"
 LOG_FILE = "bot.log"
@@ -187,6 +210,7 @@ DEFAULT_CONFIG = {
     "fixed_trade_usdc": 0.0,
     "order_ttl_seconds": 30,
     "resume_threshold_usdc": 100.0,
+    "auto_redeem_settled": True,
 }
 
 
@@ -432,6 +456,19 @@ class PolymarketCLOBClient:
             if data and isinstance(data, list) and len(data) > 0:
                 return data[0]
             return data
+        return None
+
+    def get_market_by_token(self, token_id):
+        """Look up market info by CLOB token ID via the Gamma API.
+
+        Returns a market dict with fields like condition_id, closed,
+        active, question, etc.  Returns None on failure.
+        """
+        url = f"{self.gamma_url}/markets"
+        params = {"clob_token_ids": token_id}
+        data = self._get_public(url, params=params)
+        if data and isinstance(data, list) and len(data) > 0:
+            return data[0]
         return None
 
     def get_order_book(self, token_id):
@@ -829,6 +866,10 @@ class TradeExecutor:
             address=Web3.to_checksum_address(CTF_EXCHANGE_ADDRESS),
             abi=CTF_EXCHANGE_ABI,
         )
+        self.conditional_tokens = w3.eth.contract(
+            address=Web3.to_checksum_address(CONDITIONAL_TOKENS_ADDRESS),
+            abi=CONDITIONAL_TOKENS_ABI,
+        )
 
     def _get_nonce(self):
         with self._nonce_lock:
@@ -1103,6 +1144,156 @@ class TradeExecutor:
                     reason, token_id[:16] + "...",
                 )
 
+        return results
+
+    # ------------------------------------------------------------------
+    # Auto-redeem settled positions
+    # ------------------------------------------------------------------
+
+    def check_and_redeem_settled(self):
+        """Scan positions for resolved markets and redeem tokens back to USDC.
+
+        For each tracked position this method:
+        1. Queries the Gamma API to check if the market has resolved.
+        2. Verifies on-chain that the condition's payout denominator is
+           non-zero (meaning the oracle has reported the outcome).
+        3. Checks the wallet's ERC-1155 balance of the conditional token.
+        4. Calls ``redeemPositions`` on the Conditional Tokens contract
+           to convert winning tokens back to USDC.
+
+        Returns a list of result dicts (one per redeemed position).
+        """
+        if not self.clob_client:
+            return []
+        if not self._positions:
+            return []
+        if not self.cfg.get("auto_redeem_settled", True):
+            return []
+
+        results = []
+        for token_id, pos in list(self._positions.items()):
+            if pos["tokens"] <= 0:
+                continue
+
+            try:
+                # 1. Look up market via Gamma API
+                market = self.clob_client.get_market_by_token(token_id)
+                if not market:
+                    continue
+
+                # Only proceed if the market is flagged as closed / resolved
+                is_closed = (
+                    market.get("closed") is True
+                    or str(market.get("closed", "")).lower() == "true"
+                    or market.get("active") is False
+                    or str(market.get("active", "")).lower() == "false"
+                )
+                if not is_closed:
+                    continue
+
+                condition_id = market.get("condition_id")
+                if not condition_id:
+                    self.logger.debug(
+                        "Resolved market for token %s has no condition_id, skipping",
+                        token_id[:16] + "...",
+                    )
+                    continue
+
+                # 2. Verify on-chain that the oracle has finalised the result
+                cond_bytes = bytes.fromhex(condition_id.replace("0x", ""))
+                payout_denom = self.conditional_tokens.functions.payoutDenominator(
+                    cond_bytes
+                ).call()
+                if payout_denom == 0:
+                    self.logger.debug(
+                        "Condition %s not yet resolved on-chain, skipping",
+                        condition_id[:16] + "...",
+                    )
+                    continue
+
+                # 3. Check on-chain balance of the conditional token
+                ct_balance = self.conditional_tokens.functions.balanceOf(
+                    self.address, int(token_id)
+                ).call()
+                if ct_balance == 0:
+                    self.logger.info(
+                        "Market resolved but no on-chain tokens for %s — "
+                        "clearing stale position",
+                        token_id[:16] + "...",
+                    )
+                    del self._positions[token_id]
+                    continue
+
+                self.logger.info(
+                    "REDEEM: Market resolved for token %s (condition %s) — "
+                    "redeeming %d conditional tokens",
+                    token_id[:16] + "...",
+                    condition_id[:16] + "...",
+                    ct_balance,
+                )
+
+                # 4. Dry-run guard
+                if self.cfg.get("dry_run", False):
+                    self.logger.info(
+                        "[DRY RUN] Would redeem positions for condition %s",
+                        condition_id[:16] + "...",
+                    )
+                    results.append({
+                        "status": "dry_run",
+                        "condition_id": condition_id,
+                        "token_id": token_id,
+                        "balance": ct_balance,
+                    })
+                    continue
+
+                # 5. Build and send the redeemPositions transaction
+                #    indexSets [1, 2] covers both outcomes of a binary market.
+                tx = self.conditional_tokens.functions.redeemPositions(
+                    Web3.to_checksum_address(USDC_ADDRESS),
+                    b"\x00" * 32,       # parentCollectionId (root)
+                    cond_bytes,          # conditionId
+                    [1, 2],             # both binary outcomes
+                ).build_transaction(self._base_tx_params())
+
+                receipt = self._sign_and_send(tx)
+                if receipt and receipt.status == 1:
+                    self.logger.info(
+                        "Redemption confirmed: tx %s — USDC returned to wallet",
+                        receipt.transactionHash.hex(),
+                    )
+                    self.invalidate_balance_cache()
+                    del self._positions[token_id]
+                    results.append({
+                        "status": "redeemed",
+                        "condition_id": condition_id,
+                        "token_id": token_id,
+                        "balance": ct_balance,
+                        "tx_hash": receipt.transactionHash.hex(),
+                    })
+                else:
+                    self.logger.warning(
+                        "Redemption tx failed for condition %s",
+                        condition_id[:16] + "...",
+                    )
+                    results.append({
+                        "status": "failed",
+                        "condition_id": condition_id,
+                        "token_id": token_id,
+                    })
+
+            except Exception as exc:
+                self.logger.warning(
+                    "Error checking redemption for token %s: %s",
+                    token_id[:16] + "...",
+                    exc,
+                )
+
+        if results:
+            redeemed = sum(1 for r in results if r["status"] == "redeemed")
+            self.logger.info(
+                "Redemption check complete: %d redeemed out of %d candidates",
+                redeemed, len(results),
+            )
         return results
 
     def compute_copy_amount(self, original_usdc_amount):
@@ -1554,6 +1745,8 @@ class CopyTraderBot:
         resume_threshold = Decimal(
             str(self.cfg.get("resume_threshold_usdc", 100))
         )
+        _last_pause_log = 0  # timestamp of last "still paused" INFO log
+        _last_redeem_check = 0  # timestamp of last settled-position redemption scan
 
         while self.running:
             try:
@@ -1570,13 +1763,20 @@ class CopyTraderBot:
                                     balance, resume_threshold,
                                 )
                             else:
-                                self.logger.info(
-                                    "Paused (low balance $%.2f, need $%s to "
-                                    "resume) — waiting for trades to settle",
-                                    balance, resume_threshold,
-                                )
+                                # Log at INFO only every 5 minutes to
+                                # avoid flooding the logs while idle.
+                                now = time.time()
+                                if now - _last_pause_log >= 300:
+                                    self.logger.info(
+                                        "Paused (low balance $%.2f, need $%s "
+                                        "to resume) — waiting for trades to "
+                                        "settle",
+                                        balance, resume_threshold,
+                                    )
+                                    _last_pause_log = now
                         elif balance < LOW_BALANCE_PAUSE_THRESHOLD:
                             self._paused_low_balance = True
+                            _last_pause_log = time.time()
                             self.logger.warning(
                                 "Balance $%.2f below $%s — pausing new trades. "
                                 "Will resume when balance reaches $%s.",
@@ -1608,6 +1808,28 @@ class CopyTraderBot:
                     except Exception as exit_exc:
                         self.logger.debug(
                             "Exit condition check error: %s", exit_exc,
+                        )
+
+                # --- Auto-redeem settled positions back to USDC ---
+                # Runs every REDEEM_CHECK_INTERVAL_SECONDS (default 5 min)
+                # even while paused — recovering USDC helps resume trading.
+                now = time.time()
+                if (
+                    self.executor
+                    and self.cfg.get("auto_redeem_settled", True)
+                    and now - _last_redeem_check >= REDEEM_CHECK_INTERVAL_SECONDS
+                ):
+                    _last_redeem_check = now
+                    try:
+                        redeemed = self.executor.check_and_redeem_settled()
+                        if redeemed:
+                            self.logger.info(
+                                "Auto-redeem: %d position(s) processed",
+                                len(redeemed),
+                            )
+                    except Exception as redeem_exc:
+                        self.logger.debug(
+                            "Redemption check error: %s", redeem_exc,
                         )
 
                 # --- Skip trade detection & execution while paused ---
@@ -1832,6 +2054,15 @@ class CopyTraderGUI:
             variable=self.dry_run_var
         ).grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=3)
 
+        # Auto-redeem settled positions checkbox
+        row += 1
+        self.auto_redeem_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            parent,
+            text="Auto-redeem settled positions (convert winning tokens back to USDC)",
+            variable=self.auto_redeem_var,
+        ).grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=3)
+
         # --- CLOB API Credentials ---
         row += 1
         ttk.Separator(parent, orient=tk.HORIZONTAL).grid(
@@ -1924,6 +2155,7 @@ class CopyTraderGUI:
         self.poll_entry.insert(0, str(self.cfg.get("poll_interval_seconds", 15)))
         self.use_clob_var.set(self.cfg.get("use_clob_api", True))
         self.dry_run_var.set(self.cfg.get("dry_run", False))
+        self.auto_redeem_var.set(self.cfg.get("auto_redeem_settled", True))
         # API credentials
         self.api_key_entry.insert(0, self.cfg.get("clob_api_key", ""))
         self.api_secret_entry.insert(0, self.cfg.get("clob_api_secret", ""))
@@ -1940,6 +2172,7 @@ class CopyTraderGUI:
         self.cfg["copy_percentage"] = self.copy_pct_var.get()
         self.cfg["use_clob_api"] = self.use_clob_var.get()
         self.cfg["dry_run"] = self.dry_run_var.get()
+        self.cfg["auto_redeem_settled"] = self.auto_redeem_var.get()
         # API credentials
         self.cfg["clob_api_key"] = self.api_key_entry.get().strip()
         self.cfg["clob_api_secret"] = self.api_secret_entry.get().strip()
@@ -2144,6 +2377,8 @@ def run_headless():
         cfg["clob_api_secret"] = os.environ["CLOB_API_SECRET"]
     if os.environ.get("CLOB_API_PASSPHRASE"):
         cfg["clob_api_passphrase"] = os.environ["CLOB_API_PASSPHRASE"]
+    if os.environ.get("AUTO_REDEEM_SETTLED"):
+        cfg["auto_redeem_settled"] = os.environ["AUTO_REDEEM_SETTLED"].lower() in ("1", "true", "yes")
 
     if not cfg.get("watched_addresses"):
         logger.error("No watched addresses configured. Set WATCHED_ADDRESSES env var or edit config.json.")
@@ -2151,9 +2386,10 @@ def run_headless():
 
     logger.info("=== Polymarket Copy Trader — Headless Mode ===")
     logger.info("Watched addresses: %s", cfg["watched_addresses"])
-    logger.info("Copy %%: %s | Max trade: %s USDC | Resume threshold: $%s | Dry run: %s",
+    logger.info("Copy %%: %s | Max trade: %s USDC | Resume threshold: $%s | Dry run: %s | Auto-redeem: %s",
                 cfg.get("copy_percentage"), cfg.get("max_trade_usdc"),
-                cfg.get("resume_threshold_usdc", 100), cfg.get("dry_run", False))
+                cfg.get("resume_threshold_usdc", 100), cfg.get("dry_run", False),
+                cfg.get("auto_redeem_settled", True))
 
     bot = CopyTraderBot(cfg, logger)
 
