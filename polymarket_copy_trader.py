@@ -805,6 +805,11 @@ class TradeExecutor:
         self._open_orders = {}
         self._order_ttl = cfg.get("order_ttl_seconds", 300)
 
+        # Position tracker: token_id -> Decimal tokens owned.
+        # Prevents selling tokens we never bought and caps sells to what
+        # we actually hold.
+        self._positions = {}  # type: dict[str, Decimal]
+
         # Contract handles
         self.usdc = w3.eth.contract(
             address=Web3.to_checksum_address(USDC_ADDRESS), abi=ERC20_ABI
@@ -1120,6 +1125,25 @@ class TradeExecutor:
                     )
                     copy_amount = Decimal(str(round(min_viable_usdc, 6)))
 
+            # --- SELL guard: only sell tokens we actually hold ---
+            if side == "SELL":
+                held = self._positions.get(token_id, Decimal("0"))
+                if held <= 0:
+                    self.logger.info(
+                        "SELL skipped – no position in token %s",
+                        token_id[:16] + "...",
+                    )
+                    return None
+                # Cap sell to what we own (in USDC terms at current price)
+                if price_f > 0:
+                    held_usdc = held * Decimal(str(price_f))
+                    if copy_amount > held_usdc:
+                        self.logger.info(
+                            "SELL capped from $%.2f to $%.2f (held %.2f tokens)",
+                            copy_amount, held_usdc, held,
+                        )
+                        copy_amount = held_usdc
+
             self.logger.info(
                 "COPY TRADE: %s %.2f USDC of token %s (original: %.2f USDC, price: %s)",
                 side, copy_amount, token_id[:16] + "..." if len(token_id) > 16 else token_id,
@@ -1164,6 +1188,25 @@ class TradeExecutor:
                 if result:
                     self.logger.info("Order submitted to CLOB: %s", result)
                     self.invalidate_balance_cache()
+
+                    # Update position tracker
+                    tokens = (
+                        copy_amount / Decimal(str(adjusted_price))
+                        if adjusted_price > 0
+                        else Decimal("0")
+                    )
+                    if side == "BUY":
+                        self._positions[token_id] = (
+                            self._positions.get(token_id, Decimal("0")) + tokens
+                        )
+                    elif side == "SELL":
+                        held = self._positions.get(token_id, Decimal("0"))
+                        self._positions[token_id] = max(held - tokens, Decimal("0"))
+                    self.logger.info(
+                        "Position updated: token %s now %.2f tokens",
+                        token_id[:16] + "...",
+                        self._positions.get(token_id, Decimal("0")),
+                    )
 
                     # Track the order for fill monitoring
                     order_id = None

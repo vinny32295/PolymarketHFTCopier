@@ -396,6 +396,85 @@ class TestTradeExecutorDryRun(unittest.TestCase):
         executor.ensure_usdc_approval.assert_not_called()
 
 
+class TestPositionTracking(unittest.TestCase):
+    """Test that the bot tracks positions and caps sells to what it holds."""
+
+    def _make_executor(self):
+        w3 = MagicMock()
+        mock_account = MagicMock()
+        mock_account.address = "0x" + "1" * 40
+        w3.eth.account.from_key.return_value = mock_account
+        w3.eth.contract.return_value = MagicMock()
+
+        cfg = dict(bot.DEFAULT_CONFIG)
+        cfg["dry_run"] = True
+        cfg["copy_percentage"] = 100
+        cfg["max_trade_usdc"] = 1000
+
+        executor = bot.TradeExecutor(
+            w3=w3,
+            private_key="0x" + "a" * 64,
+            cfg=cfg,
+            logger=logging.getLogger("test"),
+        )
+        executor.get_usdc_balance = MagicMock(return_value=Decimal("1000"))
+        executor.ensure_usdc_approval = MagicMock()
+        return executor
+
+    def test_sell_skipped_when_no_position(self):
+        """SELL should be skipped if we never bought the token."""
+        executor = self._make_executor()
+        result = executor.execute_copy_trade({
+            "side": "SELL",
+            "size": "10.0",
+            "asset_id": "token_abc",
+            "price": 0.50,
+        })
+        self.assertIsNone(result)
+
+    def test_sell_allowed_after_buy(self):
+        """After a BUY, a subsequent SELL on the same token should proceed."""
+        executor = self._make_executor()
+        # Simulate a buy that records a position
+        executor._positions["token_abc"] = Decimal("20")
+        result = executor.execute_copy_trade({
+            "side": "SELL",
+            "size": "5.0",
+            "asset_id": "token_abc",
+            "price": 0.50,
+        })
+        self.assertIsNotNone(result)
+        self.assertEqual(result["side"], "SELL")
+
+    def test_sell_capped_to_position(self):
+        """SELL amount is capped to the tokens we actually hold."""
+        executor = self._make_executor()
+        # We hold 10 tokens at price 0.50 = $5 worth
+        executor._positions["token_abc"] = Decimal("10")
+        result = executor.execute_copy_trade({
+            "side": "SELL",
+            "size": "100.0",  # Try to sell $100 worth
+            "asset_id": "token_abc",
+            "price": 0.50,
+        })
+        self.assertIsNotNone(result)
+        # Capped to held_usdc = 10 * 0.50 = $5.00
+        self.assertAlmostEqual(result["amount_usdc"], 5.0, places=1)
+
+    def test_buy_does_not_get_capped(self):
+        """BUY trades should not be affected by position tracking."""
+        executor = self._make_executor()
+        result = executor.execute_copy_trade({
+            "side": "BUY",
+            "size": "10.0",
+            "asset_id": "token_abc",
+            "price": 0.50,
+        })
+        self.assertIsNotNone(result)
+        self.assertEqual(result["side"], "BUY")
+        self.assertAlmostEqual(result["amount_usdc"], 10.0, places=1)
+
+
 class TestOnChainMonitor(unittest.TestCase):
     """Test on-chain monitor address filtering."""
 
