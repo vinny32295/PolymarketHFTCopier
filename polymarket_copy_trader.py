@@ -776,14 +776,22 @@ class TradeExecutor:
 
         If fixed_trade_usdc > 0, use that flat amount for every trade.
         Otherwise scale the original by copy_percentage, capped to max_trade.
-        Always capped to 95% of available balance.
+        When the balance is available, also capped to 95% of it.
         """
         if self.fixed_trade > 0:
             base = self.fixed_trade
         else:
             base = Decimal(str(original_usdc_amount)) * self.copy_pct
-        balance = self.get_usdc_balance()
-        amount = min(base, self.max_trade, balance * Decimal("0.95"))
+        amount = min(base, self.max_trade)
+        try:
+            balance = self.get_usdc_balance()
+            amount = min(amount, balance * Decimal("0.95"))
+        except Exception as exc:
+            self.logger.warning(
+                "Could not fetch USDC balance for cap check (%s); "
+                "proceeding with max_trade cap only",
+                exc,
+            )
         return max(amount, Decimal("0"))
 
     def ensure_usdc_approval(self, spender, amount_raw):

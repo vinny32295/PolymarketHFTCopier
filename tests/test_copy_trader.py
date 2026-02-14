@@ -206,6 +206,14 @@ class TestTradeExecutorCopyAmount(unittest.TestCase):
         amount = executor.compute_copy_amount(Decimal("5"))
         self.assertEqual(amount, Decimal("0.5"))
 
+    def test_balance_fetch_failure_uses_max_trade_cap(self):
+        executor = self._make_executor(copy_pct=100, max_trade=50, usdc_balance=1000)
+        # Make balance fetch fail
+        executor.get_usdc_balance = MagicMock(side_effect=Exception("RPC down"))
+        # 100% of 200 = 200, capped by max_trade=50 (balance cap skipped)
+        amount = executor.compute_copy_amount(Decimal("200"))
+        self.assertEqual(amount, Decimal("50"))
+
 
 class TestTradeExecutorDryRun(unittest.TestCase):
     """Test that dry-run mode prevents execution."""
