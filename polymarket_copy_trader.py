@@ -793,16 +793,18 @@ class TradeExecutor:
         """
         try:
             side = str(trade_info.get("side", "BUY")).upper()
-            original_size = Decimal(str(
-                trade_info.get("size")
-                or trade_info.get("amount")
-                or trade_info.get("makerAmountFilled", "0")
-            ))
-            if original_size <= 0:
+            # CLOB API returns size/amount in USDC; on-chain returns raw units (6 decimals)
+            clob_size = trade_info.get("size") or trade_info.get("amount")
+            if clob_size:
+                original_usdc = Decimal(str(clob_size))
+            else:
+                raw = Decimal(str(trade_info.get("makerAmountFilled", "0")))
+                original_usdc = raw / Decimal("1000000")
+            if original_usdc <= 0:
                 self.logger.warning("Skipping trade with zero/negative size")
                 return None
 
-            copy_amount = self.compute_copy_amount(original_size / Decimal("1000000"))
+            copy_amount = self.compute_copy_amount(original_usdc)
             if copy_amount <= Decimal("0.01"):
                 self.logger.info("Computed copy amount too small (%.4f USDC), skipping", copy_amount)
                 return None
@@ -817,7 +819,7 @@ class TradeExecutor:
             self.logger.info(
                 "COPY TRADE: %s %.2f USDC of token %s (original: %.2f USDC, price: %s)",
                 side, copy_amount, token_id[:16] + "..." if len(token_id) > 16 else token_id,
-                original_size / Decimal("1000000"), price,
+                original_usdc, price,
             )
 
             # --- DRY RUN: log but do not execute ---
