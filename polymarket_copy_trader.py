@@ -826,11 +826,12 @@ class TradeExecutor:
         with self._nonce_lock:
             self._nonce = None
 
-    def get_usdc_balance(self, max_age_seconds=300):
+    def get_usdc_balance(self, max_age_seconds=15):
         """Return USDC balance as a Decimal (6 decimals).
 
-        Results are cached for *max_age_seconds* (default 5 min) to reduce
-        RPC load.  Pass ``max_age_seconds=0`` to force a fresh fetch.
+        Results are cached for *max_age_seconds* (default 15 s — aligned
+        with the poll interval) to avoid stale reads after deposits.
+        Pass ``max_age_seconds=0`` to force a fresh fetch.
 
         If the RPC call fails and a (possibly stale) cached value exists it
         is returned with a warning.  When no cached value is available the
