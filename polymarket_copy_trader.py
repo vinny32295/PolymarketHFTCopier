@@ -151,6 +151,7 @@ DEFAULT_CONFIG = {
     "clob_api_secret": "",
     "clob_api_passphrase": "",
     "dry_run": False,
+    "fixed_trade_usdc": 0.0,
 }
 
 
@@ -687,6 +688,7 @@ class TradeExecutor:
         self.logger = logger or logging.getLogger("CopyTrader")
         self.copy_pct = Decimal(str(cfg.get("copy_percentage", 50))) / Decimal("100")
         self.max_trade = Decimal(str(cfg.get("max_trade_usdc", 100)))
+        self.fixed_trade = Decimal(str(cfg.get("fixed_trade_usdc", 0)))
         self.gas_multiplier = cfg.get("gas_multiplier", 1.2)
         self.slippage_bps = cfg.get("slippage_tolerance_bps", 100)
         self._nonce_lock = threading.Lock()
@@ -724,10 +726,18 @@ class TradeExecutor:
         return Decimal(raw) / Decimal("1000000000000000000")
 
     def compute_copy_amount(self, original_usdc_amount):
-        """Scale the original trade amount by the copy percentage, capped."""
-        scaled = Decimal(str(original_usdc_amount)) * self.copy_pct
+        """Return the copy amount in USDC.
+
+        If fixed_trade_usdc > 0, use that flat amount for every trade.
+        Otherwise scale the original by copy_percentage, capped to max_trade.
+        Always capped to 95% of available balance.
+        """
+        if self.fixed_trade > 0:
+            base = self.fixed_trade
+        else:
+            base = Decimal(str(original_usdc_amount)) * self.copy_pct
         balance = self.get_usdc_balance()
-        amount = min(scaled, self.max_trade, balance * Decimal("0.95"))
+        amount = min(base, self.max_trade, balance * Decimal("0.95"))
         return max(amount, Decimal("0"))
 
     def ensure_usdc_approval(self, spender, amount_raw):
@@ -1190,6 +1200,15 @@ class CopyTraderGUI:
         self.max_trade_entry = ttk.Entry(parent, width=20)
         self.max_trade_entry.grid(row=row, column=1, sticky=tk.W, pady=3)
 
+        # Fixed trade size
+        row += 1
+        ttk.Label(parent, text="Fixed Trade (USDC):").grid(row=row, column=0, sticky=tk.W, pady=3)
+        fixed_frame = ttk.Frame(parent)
+        fixed_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
+        self.fixed_trade_entry = ttk.Entry(fixed_frame, width=10)
+        self.fixed_trade_entry.pack(side=tk.LEFT)
+        ttk.Label(fixed_frame, text="(0 = use % scaling)").pack(side=tk.LEFT, padx=5)
+
         # Slippage
         row += 1
         ttk.Label(parent, text="Slippage Tolerance (bps):").grid(row=row, column=0, sticky=tk.W, pady=3)
@@ -1304,6 +1323,7 @@ class CopyTraderGUI:
         self.ws_rpc_entry.insert(0, self.cfg.get("ws_rpc_url", ""))
         self.copy_pct_var.set(self.cfg.get("copy_percentage", 50))
         self.max_trade_entry.insert(0, str(self.cfg.get("max_trade_usdc", 100)))
+        self.fixed_trade_entry.insert(0, str(self.cfg.get("fixed_trade_usdc", 0)))
         self.slippage_entry.insert(0, str(self.cfg.get("slippage_tolerance_bps", 100)))
         self.poll_entry.insert(0, str(self.cfg.get("poll_interval_seconds", 10)))
         self.use_clob_var.set(self.cfg.get("use_clob_api", True))
@@ -1330,6 +1350,10 @@ class CopyTraderGUI:
         self.cfg["clob_api_passphrase"] = self.api_passphrase_entry.get().strip()
         try:
             self.cfg["max_trade_usdc"] = float(self.max_trade_entry.get().strip())
+        except ValueError:
+            pass
+        try:
+            self.cfg["fixed_trade_usdc"] = float(self.fixed_trade_entry.get().strip())
         except ValueError:
             pass
         try:
