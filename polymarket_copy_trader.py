@@ -56,10 +56,11 @@ except ImportError:
 # Polymarket official Python CLOB client (for authenticated API access)
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+    from py_clob_client.clob_types import ApiCreds, OpenOrderParams, OrderArgs, OrderType
     HAS_CLOB_SDK = True
 except ImportError:
     ClobClient = None
+    OpenOrderParams = None
     HAS_CLOB_SDK = False
 
 # ---------------------------------------------------------------------------
@@ -171,6 +172,7 @@ DEFAULT_CONFIG = {
     "clob_api_passphrase": "",
     "dry_run": False,
     "fixed_trade_usdc": 0.0,
+    "order_ttl_seconds": 300,
 }
 
 
@@ -514,6 +516,71 @@ class PolymarketCLOBClient:
             self.logger.error("Failed to place CLOB order: %s", exc, exc_info=True)
             return None
 
+    # ------------------------------------------------------------------
+    # Order monitoring helpers
+    # ------------------------------------------------------------------
+
+    def get_open_orders(self):
+        """Fetch all open orders for the authenticated user.
+
+        Returns a list of order dicts, or an empty list on failure.
+        """
+        if not self.clob_sdk:
+            return []
+        try:
+            orders = self.clob_sdk.get_orders()
+            if isinstance(orders, list):
+                return orders
+            if hasattr(orders, "__iter__"):
+                return list(orders)
+            return []
+        except Exception as exc:
+            self.logger.warning("Failed to fetch open orders: %s", exc)
+            return []
+
+    def get_order(self, order_id):
+        """Fetch a single order by its ID.
+
+        Returns the order dict, or None on failure.
+        """
+        if not self.clob_sdk:
+            return None
+        try:
+            return self.clob_sdk.get_order(order_id)
+        except Exception as exc:
+            self.logger.warning("Failed to fetch order %s: %s", order_id, exc)
+            return None
+
+    def cancel_order(self, order_id):
+        """Cancel a single open order.
+
+        Returns the API response, or None on failure.
+        """
+        if not self.clob_sdk:
+            return None
+        try:
+            resp = self.clob_sdk.cancel(order_id)
+            self.logger.info("Cancelled order %s: %s", order_id, resp)
+            return resp
+        except Exception as exc:
+            self.logger.warning("Failed to cancel order %s: %s", order_id, exc)
+            return None
+
+    def cancel_all_orders(self):
+        """Cancel all open orders.
+
+        Returns the API response, or None on failure.
+        """
+        if not self.clob_sdk:
+            return None
+        try:
+            resp = self.clob_sdk.cancel_all()
+            self.logger.info("Cancelled all orders: %s", resp)
+            return resp
+        except Exception as exc:
+            self.logger.warning("Failed to cancel all orders: %s", exc)
+            return None
+
     def get_new_trades(self, address):
         """Return only trades we have not seen before for *address*."""
         address = address.lower()
@@ -733,6 +800,10 @@ class TradeExecutor:
         self._cached_balance = None
         self._balance_timestamp = 0
 
+        # Open order tracking: order_id -> {placed_at, side, token_id, price, usdc}
+        self._open_orders = {}
+        self._order_ttl = cfg.get("order_ttl_seconds", 300)
+
         # Contract handles
         self.usdc = w3.eth.contract(
             address=Web3.to_checksum_address(USDC_ADDRESS), abi=ERC20_ABI
@@ -795,6 +866,109 @@ class TradeExecutor:
         """Return native MATIC/POL balance in ether."""
         raw = self.w3.eth.get_balance(self.address)
         return Decimal(raw) / Decimal("1000000000000000000")
+
+    # ------------------------------------------------------------------
+    # Open order monitoring
+    # ------------------------------------------------------------------
+
+    def track_order(self, order_id, side, token_id, price, usdc_amount):
+        """Record an order so we can monitor its fill status later."""
+        self._open_orders[order_id] = {
+            "placed_at": time.time(),
+            "side": side,
+            "token_id": token_id,
+            "price": price,
+            "usdc": usdc_amount,
+        }
+
+    def monitor_open_orders(self):
+        """Check tracked orders, log fills, and cancel stale ones.
+
+        Called once per poll cycle from the main bot loop.  Returns a
+        summary dict with counts: filled, cancelled, still_open.
+        """
+        if not self.clob_client or not self.clob_client.clob_sdk:
+            return None
+        if not self._open_orders:
+            return None
+
+        now = time.time()
+        filled = 0
+        cancelled = 0
+        still_open = 0
+        to_remove = []
+
+        for order_id, info in list(self._open_orders.items()):
+            order = self.clob_client.get_order(order_id)
+            if order is None:
+                # API error — skip, try again next cycle
+                still_open += 1
+                continue
+
+            status = (order.get("status") or "").upper()
+
+            if status in ("MATCHED", "FILLED"):
+                self.logger.info(
+                    "Order %s FILLED: %s $%.2f @ %.4f (token %s)",
+                    order_id[:12] + "...",
+                    info["side"],
+                    info["usdc"],
+                    info["price"],
+                    info["token_id"][:16] + "...",
+                )
+                self.invalidate_balance_cache()
+                filled += 1
+                to_remove.append(order_id)
+
+            elif status in ("CANCELLED", "EXPIRED"):
+                self.logger.info(
+                    "Order %s %s (was %s $%.2f @ %.4f)",
+                    order_id[:12] + "...",
+                    status,
+                    info["side"],
+                    info["usdc"],
+                    info["price"],
+                )
+                to_remove.append(order_id)
+
+            elif now - info["placed_at"] > self._order_ttl:
+                # Stale order — cancel it
+                self.logger.warning(
+                    "Order %s stale (%.0fs old, TTL=%ds) — cancelling: "
+                    "%s $%.2f @ %.4f",
+                    order_id[:12] + "...",
+                    now - info["placed_at"],
+                    self._order_ttl,
+                    info["side"],
+                    info["usdc"],
+                    info["price"],
+                )
+                self.clob_client.cancel_order(order_id)
+                self.invalidate_balance_cache()
+                cancelled += 1
+                to_remove.append(order_id)
+            else:
+                age = int(now - info["placed_at"])
+                self.logger.debug(
+                    "Order %s still LIVE (%ds old): %s $%.2f @ %.4f",
+                    order_id[:12] + "...",
+                    age,
+                    info["side"],
+                    info["usdc"],
+                    info["price"],
+                )
+                still_open += 1
+
+        for oid in to_remove:
+            self._open_orders.pop(oid, None)
+
+        if filled or cancelled:
+            self.logger.info(
+                "Order monitor: %d filled, %d cancelled, %d still open",
+                filled, cancelled, still_open,
+            )
+
+        return {"filled": filled, "cancelled": cancelled, "still_open": still_open}
 
     def compute_copy_amount(self, original_usdc_amount):
         """Return the copy amount in USDC.
@@ -988,6 +1162,21 @@ class TradeExecutor:
                 if result:
                     self.logger.info("Order submitted to CLOB: %s", result)
                     self.invalidate_balance_cache()
+
+                    # Track the order for fill monitoring
+                    order_id = None
+                    if isinstance(result, dict):
+                        order_id = (
+                            result.get("orderID")
+                            or result.get("id")
+                            or result.get("order_id")
+                        )
+                    if order_id:
+                        self.track_order(
+                            order_id, side, token_id,
+                            adjusted_price, float(copy_amount),
+                        )
+
                     return {
                         "status": "submitted",
                         "side": side,
@@ -1182,6 +1371,15 @@ class CopyTraderBot:
                         self.logger.warning(
                             "Trade detected but executor not ready: %s",
                             json.dumps(trade, default=str)[:200],
+                        )
+
+                # --- Monitor open orders (fill status / stale cancellation) ---
+                if self.executor:
+                    try:
+                        self.executor.monitor_open_orders()
+                    except Exception as mon_exc:
+                        self.logger.debug(
+                            "Order monitor error: %s", mon_exc,
                         )
 
             except Exception as exc:

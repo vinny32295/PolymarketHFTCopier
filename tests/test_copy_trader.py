@@ -599,5 +599,152 @@ class TestConstants(unittest.TestCase):
         self.assertIn("OrdersMatched", event_names)
 
 
+class TestOrderMonitoring(unittest.TestCase):
+    """Test open order tracking, fill detection, and stale cancellation."""
+
+    def _make_executor(self, order_ttl=300):
+        """Create a TradeExecutor with mocked Web3 and CLOB client."""
+        w3 = MagicMock()
+        mock_account = MagicMock()
+        mock_account.address = "0x" + "1" * 40
+        w3.eth.account.from_key.return_value = mock_account
+        w3.eth.contract.return_value = MagicMock()
+
+        cfg = dict(bot.DEFAULT_CONFIG)
+        cfg["order_ttl_seconds"] = order_ttl
+
+        executor = bot.TradeExecutor(
+            w3=w3,
+            private_key="0x" + "a" * 64,
+            cfg=cfg,
+            logger=logging.getLogger("test"),
+        )
+        executor.get_usdc_balance = MagicMock(return_value=Decimal("1000"))
+
+        # Mock a CLOB client
+        executor.clob_client = MagicMock()
+        executor.clob_client.clob_sdk = MagicMock()
+        return executor
+
+    def test_track_order_stores_info(self):
+        executor = self._make_executor()
+        executor.track_order("order1", "BUY", "token1", 0.50, 5.0)
+        self.assertIn("order1", executor._open_orders)
+        self.assertEqual(executor._open_orders["order1"]["side"], "BUY")
+        self.assertEqual(executor._open_orders["order1"]["usdc"], 5.0)
+
+    def test_monitor_detects_filled_order(self):
+        executor = self._make_executor()
+        executor.track_order("order1", "BUY", "token1", 0.50, 5.0)
+        # Simulate the API returning MATCHED status
+        executor.clob_client.get_order.return_value = {"status": "MATCHED"}
+        result = executor.monitor_open_orders()
+        self.assertEqual(result["filled"], 1)
+        self.assertEqual(result["cancelled"], 0)
+        self.assertNotIn("order1", executor._open_orders)
+
+    def test_monitor_detects_cancelled_order(self):
+        executor = self._make_executor()
+        executor.track_order("order1", "BUY", "token1", 0.50, 5.0)
+        executor.clob_client.get_order.return_value = {"status": "CANCELLED"}
+        result = executor.monitor_open_orders()
+        self.assertEqual(result["filled"], 0)
+        self.assertNotIn("order1", executor._open_orders)
+
+    def test_monitor_cancels_stale_order(self):
+        executor = self._make_executor(order_ttl=60)
+        executor.track_order("order1", "BUY", "token1", 0.50, 5.0)
+        # Backdate the placement time so it's stale
+        executor._open_orders["order1"]["placed_at"] -= 120
+        executor.clob_client.get_order.return_value = {"status": "LIVE"}
+        result = executor.monitor_open_orders()
+        self.assertEqual(result["cancelled"], 1)
+        executor.clob_client.cancel_order.assert_called_once_with("order1")
+        self.assertNotIn("order1", executor._open_orders)
+
+    def test_monitor_keeps_fresh_live_order(self):
+        executor = self._make_executor(order_ttl=300)
+        executor.track_order("order1", "BUY", "token1", 0.50, 5.0)
+        executor.clob_client.get_order.return_value = {"status": "LIVE"}
+        result = executor.monitor_open_orders()
+        self.assertEqual(result["still_open"], 1)
+        self.assertEqual(result["filled"], 0)
+        self.assertEqual(result["cancelled"], 0)
+        self.assertIn("order1", executor._open_orders)
+
+    def test_monitor_noop_when_no_tracked_orders(self):
+        executor = self._make_executor()
+        result = executor.monitor_open_orders()
+        self.assertIsNone(result)
+
+    def test_monitor_handles_api_failure_gracefully(self):
+        executor = self._make_executor()
+        executor.track_order("order1", "BUY", "token1", 0.50, 5.0)
+        # Simulate API failure
+        executor.clob_client.get_order.return_value = None
+        result = executor.monitor_open_orders()
+        self.assertEqual(result["still_open"], 1)
+        # Order should still be tracked
+        self.assertIn("order1", executor._open_orders)
+
+
+class TestCLOBClientOrderMethods(unittest.TestCase):
+    """Test PolymarketCLOBClient order management methods."""
+
+    def _make_client(self):
+        cfg = dict(bot.DEFAULT_CONFIG)
+        logger = logging.getLogger("test")
+        logger.handlers = [logging.NullHandler()]
+        client = bot.PolymarketCLOBClient.__new__(bot.PolymarketCLOBClient)
+        client.cfg = cfg
+        client.base_url = bot.CLOB_API_BASE
+        client.gamma_url = bot.GAMMA_API_BASE
+        client.data_url = bot.DATA_API_BASE
+        client.session = MagicMock()
+        client.logger = logger
+        client._last_trade_ids = {}
+        client.clob_sdk = MagicMock()
+        return client
+
+    def test_get_open_orders_returns_list(self):
+        client = self._make_client()
+        client.clob_sdk.get_orders.return_value = [
+            {"id": "order1", "status": "LIVE"},
+            {"id": "order2", "status": "LIVE"},
+        ]
+        orders = client.get_open_orders()
+        self.assertEqual(len(orders), 2)
+
+    def test_get_open_orders_no_sdk(self):
+        client = self._make_client()
+        client.clob_sdk = None
+        self.assertEqual(client.get_open_orders(), [])
+
+    def test_get_order_returns_dict(self):
+        client = self._make_client()
+        client.clob_sdk.get_order.return_value = {"id": "order1", "status": "MATCHED"}
+        order = client.get_order("order1")
+        self.assertEqual(order["status"], "MATCHED")
+
+    def test_cancel_order_calls_sdk(self):
+        client = self._make_client()
+        client.clob_sdk.cancel.return_value = {"cancelled": True}
+        resp = client.cancel_order("order1")
+        client.clob_sdk.cancel.assert_called_once_with("order1")
+        self.assertIsNotNone(resp)
+
+    def test_cancel_all_orders_calls_sdk(self):
+        client = self._make_client()
+        client.clob_sdk.cancel_all.return_value = {"cancelled": 3}
+        resp = client.cancel_all_orders()
+        client.clob_sdk.cancel_all.assert_called_once()
+        self.assertIsNotNone(resp)
+
+    def test_cancel_order_no_sdk(self):
+        client = self._make_client()
+        client.clob_sdk = None
+        self.assertIsNone(client.cancel_order("order1"))
+
+
 if __name__ == "__main__":
     unittest.main()
