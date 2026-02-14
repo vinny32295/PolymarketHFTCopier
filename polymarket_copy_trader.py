@@ -56,10 +56,13 @@ except ImportError:
 # Polymarket official Python CLOB client (for authenticated API access)
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import ApiCreds, OpenOrderParams, OrderArgs, OrderType
+    from py_clob_client.clob_types import (
+        ApiCreds, MarketOrderArgs, OpenOrderParams, OrderArgs, OrderType,
+    )
     HAS_CLOB_SDK = True
 except ImportError:
     ClobClient = None
+    MarketOrderArgs = None
     OpenOrderParams = None
     HAS_CLOB_SDK = False
 
@@ -85,7 +88,7 @@ CONDITIONAL_TOKENS_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 
 # Polymarket minimum order constraints
 MIN_ORDER_SIZE_TOKENS = 5    # minimum outcome tokens per order
-MIN_ORDER_NOTIONAL_USDC = 1.0  # minimum USDC notional for marketable orders
+MIN_ORDER_NOTIONAL_USDC = 1.05  # slightly above $1 to stay above min after fees
 
 # Polymarket CLOB API base URL
 CLOB_API_BASE = "https://clob.polymarket.com"
@@ -172,7 +175,7 @@ DEFAULT_CONFIG = {
     "clob_api_passphrase": "",
     "dry_run": False,
     "fixed_trade_usdc": 0.0,
-    "order_ttl_seconds": 300,
+    "order_ttl_seconds": 30,
 }
 
 
@@ -442,14 +445,17 @@ class PolymarketCLOBClient:
         return None
 
     def place_order(self, token_id, side, size_usdc, price, neg_risk=False):
-        """Place an order on the Polymarket CLOB.
+        """Place a Fill-or-Kill (FOK) market order on the Polymarket CLOB.
+
+        FOK orders either fill immediately at the given price or are
+        cancelled — no funds are left locked in open limit orders.
 
         Requires the py-clob-client SDK with valid API credentials.
 
         Args:
             token_id: The conditional token ID to trade.
             side: 'BUY' or 'SELL'.
-            size_usdc: Trade size in USDC (will be converted to raw units).
+            size_usdc: Trade size in USDC.
             price: Price per share (0.0–1.0 range).
             neg_risk: Whether the market uses the neg-risk framework.
 
@@ -464,17 +470,6 @@ class PolymarketCLOBClient:
             return None
 
         try:
-            # Determine tick size from market info
-            tick_size = "0.01"  # default
-            try:
-                market = self.clob_sdk.get_market(token_id)
-                if market and hasattr(market, "minimum_tick_size"):
-                    tick_size = str(market.minimum_tick_size)
-            except Exception:
-                pass
-
-            # Build order arguments — size is in shares, not USDC
-            # shares = usdc_amount / price_per_share
             if price <= 0:
                 self.logger.error("Invalid price %s – cannot place order", price)
                 return None
@@ -484,9 +479,9 @@ class PolymarketCLOBClient:
             min_usdc_for_tokens = MIN_ORDER_SIZE_TOKENS * price
             effective_usdc = max(size_usdc, min_usdc_for_tokens,
                                 MIN_ORDER_NOTIONAL_USDC)
-            size_shares = round(effective_usdc / price, 2)
 
             if effective_usdc > size_usdc:
+                size_shares = round(effective_usdc / price, 2)
                 self.logger.warning(
                     "Order size %.2f USDC (%.2f tokens) below minimums; "
                     "bumped to %.2f USDC (%.2f tokens) "
@@ -497,20 +492,26 @@ class PolymarketCLOBClient:
                 )
             actual_usdc = effective_usdc
 
-            order_args = OrderArgs(
+            # Use FOK (Fill-or-Kill) market order — fills instantly or
+            # gets cancelled, so no balance is locked in open orders.
+            order_args = MarketOrderArgs(
                 token_id=token_id,
                 price=round(price, 2),
-                size=size_shares,
+                amount=round(actual_usdc, 6),
                 side=side.upper(),
+                order_type=OrderType.FOK,
             )
 
-            signed_order = self.clob_sdk.create_and_post_order(order_args)
+            signed_order = self.clob_sdk.create_market_order(order_args)
+            resp = self.clob_sdk.post_order(
+                signed_order, orderType=OrderType.FOK,
+            )
 
             self.logger.info(
-                "CLOB order placed: %s %.2f USDC (%.2f tokens) @ %.4f for token %s",
-                side, actual_usdc, size_shares, price, token_id[:16] + "...",
+                "FOK order placed: %s $%.2f @ %.4f for token %s — %s",
+                side, actual_usdc, price, token_id[:16] + "...", resp,
             )
-            return signed_order
+            return resp
 
         except Exception as exc:
             self.logger.error("Failed to place CLOB order: %s", exc, exc_info=True)
@@ -825,11 +826,12 @@ class TradeExecutor:
         with self._nonce_lock:
             self._nonce = None
 
-    def get_usdc_balance(self, max_age_seconds=300):
+    def get_usdc_balance(self, max_age_seconds=15):
         """Return USDC balance as a Decimal (6 decimals).
 
-        Results are cached for *max_age_seconds* (default 5 min) to reduce
-        RPC load.  Pass ``max_age_seconds=0`` to force a fresh fetch.
+        Results are cached for *max_age_seconds* (default 15 s — aligned
+        with the poll interval) to avoid stale reads after deposits.
+        Pass ``max_age_seconds=0`` to force a fresh fetch.
 
         If the RPC call fails and a (possibly stale) cached value exists it
         is returned with a warning.  When no cached value is available the
@@ -1298,6 +1300,16 @@ class CopyTraderBot:
         self.clob_client = PolymarketCLOBClient(
             cfg=self.cfg, private_key=pk, logger=self.logger,
         )
+        # Cancel any stale open orders from a previous session so balance
+        # isn't locked up.  With FOK orders this shouldn't happen going
+        # forward, but cleans up legacy GTC orders.
+        try:
+            resp = self.clob_client.cancel_all_orders()
+            if resp:
+                self.logger.info("Startup: cancelled all open orders: %s", resp)
+        except Exception as exc:
+            self.logger.warning("Startup: cancel-all failed (non-fatal): %s", exc)
+
         # Seed existing trades so we don't copy old history
         watched = self.cfg.get("watched_addresses", [])
         for i, addr in enumerate(watched):
