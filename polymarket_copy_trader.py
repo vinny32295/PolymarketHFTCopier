@@ -1476,12 +1476,124 @@ class CopyTraderGUI:
 
 
 # ---------------------------------------------------------------------------
+# Headless health-check server (for cloud PaaS deployments)
+# ---------------------------------------------------------------------------
+
+class HealthCheckServer:
+    """Minimal HTTP server on $PORT (default 8080) that responds 200 OK.
+
+    DigitalOcean App Platform (and similar PaaS) send periodic health
+    checks. Without a listening port, the deployment is marked unhealthy.
+    """
+
+    def __init__(self, bot, logger, port=None):
+        self.bot = bot
+        self.logger = logger
+        self.port = int(port or os.environ.get("PORT", 8080))
+        self._thread = None
+
+    def start(self):
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+
+        bot_ref = self.bot
+        logger_ref = self.logger
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                status = "running" if bot_ref and bot_ref.running else "stopped"
+                body = json.dumps({"status": status}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, fmt, *args):
+                pass  # suppress default access logs
+
+        server = HTTPServer(("0.0.0.0", self.port), Handler)
+        self._thread = threading.Thread(target=server.serve_forever, daemon=True)
+        self._thread.start()
+        self.logger.info("Health-check server listening on port %d", self.port)
+
+
+# ---------------------------------------------------------------------------
+# Headless (CLI) runner — no Tkinter, for server deployments
+# ---------------------------------------------------------------------------
+
+def run_headless():
+    """Run the bot in headless mode using config.json + env vars."""
+    logger = setup_logging()
+    cfg = load_config()
+
+    # Allow env-var overrides so secrets stay out of config.json on the server
+    if os.environ.get("RPC_URL"):
+        cfg["rpc_url"] = os.environ["RPC_URL"]
+    if os.environ.get("WS_RPC_URL"):
+        cfg["ws_rpc_url"] = os.environ["WS_RPC_URL"]
+    if os.environ.get("PRIVATE_KEY"):
+        save_private_key(os.environ["PRIVATE_KEY"], cfg)
+    if os.environ.get("WATCHED_ADDRESSES"):
+        cfg["watched_addresses"] = [
+            a.strip() for a in os.environ["WATCHED_ADDRESSES"].split(",") if a.strip()
+        ]
+    if os.environ.get("COPY_PERCENTAGE"):
+        cfg["copy_percentage"] = int(os.environ["COPY_PERCENTAGE"])
+    if os.environ.get("MAX_TRADE_USDC"):
+        cfg["max_trade_usdc"] = float(os.environ["MAX_TRADE_USDC"])
+    if os.environ.get("DRY_RUN"):
+        cfg["dry_run"] = os.environ["DRY_RUN"].lower() in ("1", "true", "yes")
+    if os.environ.get("CLOB_API_KEY"):
+        cfg["clob_api_key"] = os.environ["CLOB_API_KEY"]
+    if os.environ.get("CLOB_API_SECRET"):
+        cfg["clob_api_secret"] = os.environ["CLOB_API_SECRET"]
+    if os.environ.get("CLOB_API_PASSPHRASE"):
+        cfg["clob_api_passphrase"] = os.environ["CLOB_API_PASSPHRASE"]
+
+    if not cfg.get("watched_addresses"):
+        logger.error("No watched addresses configured. Set WATCHED_ADDRESSES env var or edit config.json.")
+        sys.exit(1)
+
+    logger.info("=== Polymarket Copy Trader — Headless Mode ===")
+    logger.info("Watched addresses: %s", cfg["watched_addresses"])
+    logger.info("Copy %%: %s | Max trade: %s USDC | Dry run: %s",
+                cfg.get("copy_percentage"), cfg.get("max_trade_usdc"), cfg.get("dry_run", False))
+
+    bot = CopyTraderBot(cfg, logger)
+
+    # Start health-check HTTP server for App Platform
+    health = HealthCheckServer(bot, logger)
+    health.start()
+
+    # Start the bot (runs in a background thread)
+    bot.start()
+
+    # Keep the main thread alive
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+        bot.stop()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def main():
-    app = CopyTraderGUI()
-    app.run()
+    headless = "--headless" in sys.argv
+
+    # Auto-detect: if no DISPLAY / no Tkinter, fall back to headless
+    if not headless:
+        display = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+        if not display and sys.platform != "win32" and sys.platform != "darwin":
+            headless = True
+
+    if headless:
+        run_headless()
+    else:
+        app = CopyTraderGUI()
+        app.run()
 
 
 if __name__ == "__main__":
