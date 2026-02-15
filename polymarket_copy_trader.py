@@ -102,8 +102,8 @@ MIN_ORDER_NOTIONAL_USDC = 1.05  # slightly above $1 to stay above min after fees
 LOW_BALANCE_PAUSE_THRESHOLD = Decimal("1.05")   # can't even fill the smallest order
 
 # Auto-exit thresholds for open positions
-TAKE_PROFIT_PRICE = Decimal("1.00")   # hold to full redemption ($1.00) by default
-STOP_LOSS_PCT = Decimal("0")          # disabled by default — whale doesn't use stop-loss
+TAKE_PROFIT_PRICE = Decimal("0.99")   # sell near top instead of waiting for resolution
+STOP_LOSS_PCT = Decimal("0.50")       # exit if price drops to 50% of entry (e.g. 0.80 → 0.40)
 
 # Polymarket CLOB API base URL
 CLOB_API_BASE = "https://clob.polymarket.com"
@@ -374,8 +374,8 @@ DEFAULT_CONFIG = {
     "dry_run": False,
     "order_ttl_seconds": 60,
     "resume_threshold_usdc": 5.0,
-    "take_profit_price": 1.00,
-    "stop_loss_pct": 0,
+    "take_profit_price": 0.99,
+    "stop_loss_pct": 50,
     "exit_check_seconds": 5,
     "auto_redeem_settled": True,
     "proxy_redeem": True,
@@ -3905,15 +3905,21 @@ class TradeExecutor:
                 # the time we execute — using it (+ adverse slippage) guaranteed
                 # we'd pay MORE on buys and receive LESS on sells.
                 #
-                # New approach: use the whale's price directly as our limit.
-                # For BUYs this means we won't pay more than the whale did.
-                # For SELLs we won't sell for less than the whale did.
+                # Use whale's price + slippage tolerance as our limit.
+                # For BUYs we accept paying up to slippage_bps above whale.
+                # For SELLs we accept receiving slippage_bps below whale.
                 # The FOK order type ensures instant fill or no fill — no
                 # stale GTC orders sitting on the book.
-                adjusted_price = float(Decimal(str(price)))
+                slippage_mult = Decimal(str(self.slippage_bps)) / Decimal("10000")
                 if side == "BUY":
+                    adjusted_price = float(
+                        Decimal(str(price)) * (Decimal("1") + slippage_mult)
+                    )
                     adjusted_price = min(adjusted_price, 0.99)
                 else:
+                    adjusted_price = float(
+                        Decimal(str(price)) * (Decimal("1") - slippage_mult)
+                    )
                     adjusted_price = max(adjusted_price, 0.01)
 
                 # --- Stale price protection ---
