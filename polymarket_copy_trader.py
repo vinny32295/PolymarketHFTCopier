@@ -833,6 +833,14 @@ class PolymarketCLOBClient:
             return resp
 
         except Exception as exc:
+            exc_msg = str(exc).lower()
+            if "does not exist" in exc_msg:
+                self.logger.warning(
+                    "Orderbook does not exist for token %s — market likely "
+                    "resolved. Needs on-chain redemption, not CLOB sale.",
+                    token_id[:16] + "...",
+                )
+                return {"error": "orderbook_dead"}
             self.logger.error("Failed to place CLOB order: %s", exc, exc_info=True)
             return None
 
@@ -1448,6 +1456,14 @@ class TradeExecutor:
                 size_usdc=sell_usdc,
                 price=adjusted_price,
             )
+
+            # --- Dead orderbook → try on-chain redemption instead ---
+            if isinstance(result, dict) and result.get("error") == "orderbook_dead":
+                redeemed = self._try_onchain_redeem(token_id, pos, reason)
+                if redeemed:
+                    results.append(redeemed)
+                continue
+
             if result:
                 self.logger.info(
                     "Auto-exit %s order submitted: %s", reason, result,
@@ -1503,6 +1519,111 @@ class TradeExecutor:
 
         return results
 
+    def _try_onchain_redeem(self, token_id, pos, reason):
+        """Attempt on-chain redemption for a position whose orderbook is dead.
+
+        When the CLOB returns "orderbook does not exist", the market has
+        resolved and the tokens can only be redeemed on-chain — not sold.
+
+        Returns a result dict on success, or None.
+        """
+        condition_id = pos.get("condition_id")
+        neg_risk = pos.get("neg_risk", False)
+
+        if not condition_id:
+            # Try the Gamma API as a last resort
+            try:
+                market = self.clob_client.get_market_by_token(token_id)
+                if market:
+                    condition_id = market.get("condition_id")
+                    neg_risk = self._is_neg_risk_market(market)
+            except Exception:
+                pass
+
+        if not condition_id:
+            self.logger.warning(
+                "Cannot redeem token %s — no condition_id available. "
+                "Removing stale position from tracking.",
+                token_id[:16] + "...",
+            )
+            self._positions.pop(token_id, None)
+            self._save_positions()
+            return None
+
+        # Check if actually resolved on-chain
+        try:
+            resolved_cid, payout_denom = self._resolve_condition_id(
+                condition_id, neg_risk=neg_risk,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "On-chain resolution check failed for token %s: %s",
+                token_id[:16] + "...", exc,
+            )
+            # Remove from tracking to stop retry spam
+            self._positions.pop(token_id, None)
+            self._save_positions()
+            return None
+
+        if payout_denom == 0:
+            self.logger.info(
+                "Market not resolved on-chain for token %s — "
+                "orderbook dead but not settled yet. Removing from tracking.",
+                token_id[:16] + "...",
+            )
+            self._positions.pop(token_id, None)
+            self._save_positions()
+            return None
+
+        # Market IS resolved — redeem on-chain!
+        self.logger.info(
+            "REDEEM (auto-exit %s): orderbook dead, redeeming on-chain — "
+            "token %s, conditionId=%s, neg_risk=%s",
+            reason, token_id[:16] + "...",
+            resolved_cid[:16] + "...", neg_risk,
+        )
+
+        if self.cfg.get("dry_run", False):
+            self.logger.info(
+                "[DRY RUN] Would redeem token %s on-chain", token_id[:16] + "...",
+            )
+            return {"status": "dry_run", "reason": reason, "token_id": token_id}
+
+        try:
+            tx = self._build_redeem_tx(resolved_cid, neg_risk=neg_risk)
+            receipt = self._sign_and_send(tx)
+            if receipt and receipt.status == 1:
+                self.logger.info(
+                    "Redemption OK (auto-exit %s): tx %s — USDC returned",
+                    reason, receipt.transactionHash.hex(),
+                )
+                self.invalidate_balance_cache()
+                self._positions.pop(token_id, None)
+                self._save_positions()
+                return {
+                    "status": "redeemed",
+                    "reason": reason,
+                    "token_id": token_id,
+                    "tx_hash": receipt.transactionHash.hex(),
+                }
+            else:
+                self.logger.warning(
+                    "Redemption tx failed for token %s — removing from tracking",
+                    token_id[:16] + "...",
+                )
+                self._positions.pop(token_id, None)
+                self._save_positions()
+        except Exception as exc:
+            self.logger.warning(
+                "On-chain redeem failed for token %s: %s — "
+                "removing from tracking",
+                token_id[:16] + "...", exc,
+            )
+            self._positions.pop(token_id, None)
+            self._save_positions()
+
+        return None
+
     # ------------------------------------------------------------------
     # Portfolio scan & auto-redeem settled positions
     # ------------------------------------------------------------------
@@ -1546,6 +1667,18 @@ class TradeExecutor:
             proxy_tokens = self.clob_client.get_wallet_token_ids(proxy_addr)
             if proxy_tokens:
                 token_ids = token_ids | proxy_tokens
+
+        # Also include any token IDs from _positions that may not appear
+        # in the API trade history (e.g. markets removed from the API).
+        if self._positions:
+            pos_tokens = set(self._positions.keys())
+            added = pos_tokens - token_ids
+            if added:
+                self.logger.info(
+                    "Adding %d token(s) from positions.json not in trade history",
+                    len(added),
+                )
+            token_ids = token_ids | pos_tokens
 
         if not token_ids:
             self.logger.info("No trade history found for wallet — portfolio scan done")
