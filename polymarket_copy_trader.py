@@ -381,6 +381,7 @@ DEFAULT_CONFIG = {
     "proxy_address": "",
     "webhook_url": "",
     "max_price_deviation_pct": 5,
+    "max_loss_usdc": 0,
 }
 
 
@@ -1331,6 +1332,9 @@ class TradeExecutor:
         # Optional webhook callback (set by CopyTraderBot after init)
         self.notify_callback = None
 
+        # Kill switch: stop the bot when cumulative losses exceed threshold
+        self.kill_switch_triggered = False
+
         # Cached proxy wallet address (discovered once, reused)
         self._proxy_address = None
         self._proxy_discovery_done = False
@@ -1544,6 +1548,21 @@ class TradeExecutor:
             outcome.upper(), record["market"], num_shares, entry_p, exit_p,
             pnl, total_pnl, total_cost, total_proceeds,
         )
+
+        # Kill switch: stop the bot if cumulative losses exceed threshold
+        max_loss = float(self.cfg.get("max_loss_usdc", 0))
+        if max_loss > 0 and total_pnl <= -max_loss:
+            self.kill_switch_triggered = True
+            self.logger.critical(
+                "KILL SWITCH: lifetime P&L $%+.2f hit max loss limit "
+                "of -$%.2f — stopping bot",
+                total_pnl, max_loss,
+            )
+            if self.notify_callback:
+                self.notify_callback(
+                    "KILL SWITCH: P&L $%+.2f hit -$%.2f limit — bot stopped"
+                    % (total_pnl, max_loss)
+                )
 
         return record
 
@@ -4589,6 +4608,12 @@ class CopyTraderBot:
                 self.logger.error("Error in monitoring loop: %s", exc, exc_info=True)
                 self._notify("ERROR in monitoring loop: %s" % exc)
 
+            # Kill switch: stop if cumulative losses exceeded threshold
+            if self.executor and self.executor.kill_switch_triggered:
+                self.logger.critical("Kill switch activated — stopping bot")
+                self.running = False
+                break
+
             # Sleep with early-exit check (supports sub-second poll intervals)
             sleep_remaining = float(poll_interval)
             sleep_step = min(0.5, sleep_remaining)
@@ -4897,6 +4922,15 @@ class CopyTraderGUI:
         self.stop_loss_entry.pack(side=tk.LEFT)
         ttk.Label(sl_frame, text="(sell when price drops to this % of entry)").pack(side=tk.LEFT, padx=5)
 
+        # Kill switch — max loss
+        row += 1
+        ttk.Label(parent, text="Max Loss Kill Switch (USDC):").grid(row=row, column=0, sticky=tk.W, pady=3)
+        kill_frame = ttk.Frame(parent)
+        kill_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
+        self.max_loss_entry = ttk.Entry(kill_frame, width=10)
+        self.max_loss_entry.pack(side=tk.LEFT)
+        ttk.Label(kill_frame, text="(stop bot after losing this much, 0=off)").pack(side=tk.LEFT, padx=5)
+
         # Poll interval
         row += 1
         ttk.Label(parent, text="Poll Interval (seconds):").grid(row=row, column=0, sticky=tk.W, pady=3)
@@ -5158,6 +5192,7 @@ class CopyTraderGUI:
         self.resume_threshold_entry.insert(0, str(self.cfg.get("resume_threshold_usdc", 5)))
         self.take_profit_entry.insert(0, str(self.cfg.get("take_profit_price", 0.99)))
         self.stop_loss_entry.insert(0, str(self.cfg.get("stop_loss_pct", 50)))
+        self.max_loss_entry.insert(0, str(self.cfg.get("max_loss_usdc", 0)))
         self.poll_entry.insert(0, str(self.cfg.get("poll_interval_seconds", 15)))
         self.exit_check_entry.insert(0, str(self.cfg.get("exit_check_seconds", 5)))
         self.use_clob_var.set(self.cfg.get("use_clob_api", True))
@@ -5206,6 +5241,12 @@ class CopyTraderGUI:
             val = float(self.stop_loss_entry.get().strip())
             if 0 < val <= 100:
                 self.cfg["stop_loss_pct"] = val
+        except ValueError:
+            pass
+        try:
+            val = float(self.max_loss_entry.get().strip())
+            if val >= 0:
+                self.cfg["max_loss_usdc"] = val
         except ValueError:
             pass
         try:
@@ -5412,6 +5453,8 @@ def run_headless():
         cfg["take_profit_price"] = float(os.environ["TAKE_PROFIT_PRICE"])
     if os.environ.get("STOP_LOSS_PCT"):
         cfg["stop_loss_pct"] = float(os.environ["STOP_LOSS_PCT"])
+    if os.environ.get("MAX_LOSS_USDC"):
+        cfg["max_loss_usdc"] = float(os.environ["MAX_LOSS_USDC"])
     if os.environ.get("EXIT_CHECK_SECONDS"):
         cfg["exit_check_seconds"] = int(os.environ["EXIT_CHECK_SECONDS"])
     if os.environ.get("AUTO_REDEEM_SETTLED"):
