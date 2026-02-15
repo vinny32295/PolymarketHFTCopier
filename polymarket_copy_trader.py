@@ -117,6 +117,7 @@ DATA_API_BASE = "https://data-api.polymarket.com"
 # Positions persistence file — stores redemption params so they
 # survive restarts and don't depend on the Gamma API at redeem time.
 POSITIONS_FILE = "positions.json"
+TRADE_HISTORY_FILE = "trade_history.json"
 
 # Polymarket Proxy Wallet Factory on Polygon
 # Deploys lightweight proxy wallets for Polymarket users; each EOA has
@@ -369,6 +370,7 @@ DEFAULT_CONFIG = {
     "resume_threshold_usdc": 5.0,
     "take_profit_price": 0.99,
     "stop_loss_pct": 50,
+    "exit_check_seconds": 5,
     "auto_redeem_settled": True,
     "proxy_redeem": True,
     "proxy_withdraw": True,
@@ -1267,6 +1269,65 @@ class TradeExecutor:
         except Exception as exc:
             self.logger.warning("Could not save positions: %s", exc)
 
+    # ------------------------------------------------------------------
+    # Closed-trade history (persistent across sessions)
+    # ------------------------------------------------------------------
+
+    @property
+    def _trade_history_file(self):
+        return self.cfg.get("trade_history_file", TRADE_HISTORY_FILE)
+
+    def _load_trade_history(self):
+        """Load the persistent trade history from disk."""
+        try:
+            with open(self._trade_history_file, "r") as fh:
+                return json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+
+    def _log_closed_trade(self, token_id, entry_price, exit_price,
+                          shares, reason, market=None):
+        """Append a closed trade record to the persistent history file."""
+        entry_p = float(entry_price) if entry_price else 0.0
+        exit_p = float(exit_price) if exit_price else 0.0
+        num_shares = float(shares) if shares else 0.0
+
+        cost_basis = entry_p * num_shares
+        proceeds = exit_p * num_shares
+        pnl = round(proceeds - cost_basis, 6)
+
+        record = {
+            "closed_at": datetime.now().isoformat(),
+            "token_id": token_id,
+            "market": market or token_id[:16] + "...",
+            "shares": num_shares,
+            "entry_price": entry_p,
+            "exit_price": exit_p,
+            "cost_basis_usdc": round(cost_basis, 6),
+            "proceeds_usdc": round(proceeds, 6),
+            "pnl_usdc": pnl,
+            "reason": reason,
+        }
+
+        history = self._load_trade_history()
+        history.append(record)
+
+        try:
+            tmp = self._trade_history_file + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(history, fh, indent=2)
+            os.replace(tmp, self._trade_history_file)
+        except Exception as exc:
+            self.logger.warning("Could not save trade history: %s", exc)
+
+        self.logger.info(
+            "CLOSED TRADE: %s | %.4f shares @ entry %.4f -> exit %.4f | "
+            "P&L $%.4f | reason=%s",
+            record["market"], num_shares, entry_p, exit_p, pnl, reason,
+        )
+
+        return record
+
     def get_usdc_balance(self, max_age_seconds=15):
         """Return USDC balance as a Decimal (6 decimals).
 
@@ -1513,6 +1574,11 @@ class TradeExecutor:
                     "Auto-exit %s order submitted: %s", reason, result,
                 )
                 self.invalidate_balance_cache()
+                # Log the closed trade before removing
+                self._log_closed_trade(
+                    token_id, entry_price, current_price_d,
+                    tokens, reason,
+                )
                 # Clear the position
                 del self._positions[token_id]
                 self._save_positions()
@@ -1553,6 +1619,10 @@ class TradeExecutor:
                         "removing from tracking",
                         token_id[:16] + "...", sell_usdc, min_sell_usdc,
                     )
+                    self._log_closed_trade(
+                        token_id, entry_price, current_price_d,
+                        tokens, "dust",
+                    )
                     del self._positions[token_id]
                     self._save_positions()
                 else:
@@ -1563,14 +1633,24 @@ class TradeExecutor:
 
         return results
 
+    # Maximum number of failed redemption/resolution attempts before we
+    # give up on a position and remove it from tracking.
+    MAX_REDEEM_RETRIES = 5
+
     def _try_onchain_redeem(self, token_id, pos, reason):
         """Attempt on-chain redemption for a position whose orderbook is dead.
 
         When the CLOB returns "orderbook does not exist", the market has
         resolved and the tokens can only be redeemed on-chain — not sold.
 
+        Transient failures (no condition_id, RPC errors, failed txs) are
+        retried up to MAX_REDEEM_RETRIES times before the position is
+        removed.  This prevents a single hiccup from logging a false
+        100% loss.
+
         Returns a result dict on success, or None.
         """
+        retries = pos.get("_redeem_retries", 0)
         condition_id = pos.get("condition_id")
         neg_risk = pos.get("neg_risk", False)
 
@@ -1589,13 +1669,28 @@ class TradeExecutor:
             condition_id = self.clob_client._token_to_condition.get(token_id)
 
         if not condition_id:
-            self.logger.warning(
-                "Cannot redeem token %s — no condition_id available. "
-                "Removing stale position from tracking.",
-                token_id[:16] + "...",
-            )
-            self._positions.pop(token_id, None)
-            self._save_positions()
+            retries += 1
+            pos["_redeem_retries"] = retries
+            if retries >= self.MAX_REDEEM_RETRIES:
+                self.logger.warning(
+                    "Cannot redeem token %s — no condition_id after %d "
+                    "attempts. Removing stale position from tracking.",
+                    token_id[:16] + "...", retries,
+                )
+                self._log_closed_trade(
+                    token_id, pos.get("entry_price", 0), 0,
+                    pos.get("tokens", 0), "stale",
+                )
+                self._positions.pop(token_id, None)
+                self._save_positions()
+            else:
+                self.logger.info(
+                    "Cannot redeem token %s — no condition_id (attempt "
+                    "%d/%d). Will retry next cycle.",
+                    token_id[:16] + "...", retries,
+                    self.MAX_REDEEM_RETRIES,
+                )
+                self._save_positions()
             return None
 
         # Check if actually resolved on-chain
@@ -1604,23 +1699,40 @@ class TradeExecutor:
                 condition_id, neg_risk=neg_risk,
             )
         except Exception as exc:
-            self.logger.warning(
-                "On-chain resolution check failed for token %s: %s",
-                token_id[:16] + "...", exc,
-            )
-            # Remove from tracking to stop retry spam
-            self._positions.pop(token_id, None)
-            self._save_positions()
+            retries += 1
+            pos["_redeem_retries"] = retries
+            if retries >= self.MAX_REDEEM_RETRIES:
+                self.logger.warning(
+                    "On-chain resolution check failed for token %s "
+                    "after %d attempts: %s — removing from tracking",
+                    token_id[:16] + "...", retries, exc,
+                )
+                self._log_closed_trade(
+                    token_id, pos.get("entry_price", 0), 0,
+                    pos.get("tokens", 0), "resolution_error",
+                )
+                self._positions.pop(token_id, None)
+                self._save_positions()
+            else:
+                self.logger.info(
+                    "On-chain resolution check failed for token %s: "
+                    "%s (attempt %d/%d). Will retry.",
+                    token_id[:16] + "...", exc, retries,
+                    self.MAX_REDEEM_RETRIES,
+                )
+                self._save_positions()
             return None
 
         if payout_denom == 0:
+            # Market not resolved yet — keep the position so the
+            # stop-loss can still fire once the orderbook comes back,
+            # or we can redeem when it does resolve.
             self.logger.info(
                 "Market not resolved on-chain for token %s — "
-                "orderbook dead but not settled yet. Removing from tracking.",
+                "orderbook dead but not settled yet. Keeping position "
+                "for retry.",
                 token_id[:16] + "...",
             )
-            self._positions.pop(token_id, None)
-            self._save_positions()
             return None
 
         # Market IS resolved — redeem on-chain!
@@ -1646,6 +1758,11 @@ class TradeExecutor:
                     reason, receipt.transactionHash.hex(),
                 )
                 self.invalidate_balance_cache()
+                # Redeemed at $1.00 per share (market resolved in our favor)
+                self._log_closed_trade(
+                    token_id, pos.get("entry_price", 0), 1.0,
+                    pos.get("tokens", 0), "redeemed",
+                )
                 self._positions.pop(token_id, None)
                 self._save_positions()
                 return {
@@ -1655,19 +1772,48 @@ class TradeExecutor:
                     "tx_hash": receipt.transactionHash.hex(),
                 }
             else:
-                self.logger.warning(
-                    "Redemption tx failed for token %s — removing from tracking",
-                    token_id[:16] + "...",
-                )
-                self._positions.pop(token_id, None)
+                retries += 1
+                pos["_redeem_retries"] = retries
+                if retries >= self.MAX_REDEEM_RETRIES:
+                    self.logger.warning(
+                        "Redemption tx failed for token %s after %d "
+                        "attempts — removing from tracking",
+                        token_id[:16] + "...", retries,
+                    )
+                    self._log_closed_trade(
+                        token_id, pos.get("entry_price", 0), 0,
+                        pos.get("tokens", 0), "failed_redeem",
+                    )
+                    self._positions.pop(token_id, None)
+                else:
+                    self.logger.info(
+                        "Redemption tx failed for token %s (attempt "
+                        "%d/%d). Will retry.",
+                        token_id[:16] + "...", retries,
+                        self.MAX_REDEEM_RETRIES,
+                    )
                 self._save_positions()
         except Exception as exc:
-            self.logger.warning(
-                "On-chain redeem failed for token %s: %s — "
-                "removing from tracking",
-                token_id[:16] + "...", exc,
-            )
-            self._positions.pop(token_id, None)
+            retries += 1
+            pos["_redeem_retries"] = retries
+            if retries >= self.MAX_REDEEM_RETRIES:
+                self.logger.warning(
+                    "On-chain redeem failed for token %s after %d "
+                    "attempts: %s — removing from tracking",
+                    token_id[:16] + "...", retries, exc,
+                )
+                self._log_closed_trade(
+                    token_id, pos.get("entry_price", 0), 0,
+                    pos.get("tokens", 0), "failed_redeem",
+                )
+                self._positions.pop(token_id, None)
+            else:
+                self.logger.info(
+                    "On-chain redeem failed for token %s: %s "
+                    "(attempt %d/%d). Will retry.",
+                    token_id[:16] + "...", exc, retries,
+                    self.MAX_REDEEM_RETRIES,
+                )
             self._save_positions()
 
         return None
@@ -1859,6 +2005,12 @@ class TradeExecutor:
                     )
                     self.invalidate_balance_cache()
                     # Remove from position tracker if it was there
+                    pos = self._positions.get(token_id)
+                    if pos:
+                        self._log_closed_trade(
+                            token_id, pos.get("entry_price", 0), 1.0,
+                            pos.get("tokens", 0), "redeemed",
+                        )
                     self._positions.pop(token_id, None)
                     self._save_positions()
                     results.append({
@@ -2104,8 +2256,15 @@ class TradeExecutor:
                 if ct_balance == 0:
                     self.logger.info(
                         "Market resolved but no on-chain tokens for %s — "
-                        "clearing stale position",
+                        "clearing stale position (likely redeemed externally)",
                         token_id[:16] + "...",
+                    )
+                    # Tokens already gone — likely redeemed via Polymarket
+                    # UI.  Log at entry_price (unknown actual exit).
+                    self._log_closed_trade(
+                        token_id, pos.get("entry_price", 0),
+                        pos.get("entry_price", 0),
+                        pos.get("tokens", 0), "redeemed_external",
                     )
                     del self._positions[token_id]
                     self._save_positions()
@@ -2144,6 +2303,10 @@ class TradeExecutor:
                         receipt.transactionHash.hex(),
                     )
                     self.invalidate_balance_cache()
+                    self._log_closed_trade(
+                        token_id, pos.get("entry_price", 0), 1.0,
+                        pos.get("tokens", 0), "redeemed",
+                    )
                     del self._positions[token_id]
                     self._save_positions()
                     results.append({
@@ -3306,9 +3469,15 @@ class TradeExecutor:
                     elif side == "SELL":
                         pos = self._positions.get(token_id)
                         if pos:
+                            sold_tokens = min(tokens, pos["tokens"])
                             pos["tokens"] = max(pos["tokens"] - tokens, Decimal("0"))
                             # Remove position entirely if fully closed
                             if pos["tokens"] <= 0:
+                                self._log_closed_trade(
+                                    token_id, pos.get("entry_price", 0),
+                                    adjusted_price, sold_tokens,
+                                    "copied_sell",
+                                )
                                 del self._positions[token_id]
 
                     # Log redemption parameters for every trade
@@ -3572,6 +3741,8 @@ class CopyTraderBot:
         _last_redeem_check = 0  # timestamp of last settled-position redemption scan
         _last_proxy_check = 0   # timestamp of last proxy wallet redemption scan
         _last_portfolio_scan = 0  # timestamp of last full portfolio scan
+        _last_exit_check = 0  # timestamp of last exit-condition check
+        exit_check_interval = self.cfg.get("exit_check_seconds", 5)
 
         while self.running:
             try:
@@ -3628,7 +3799,14 @@ class CopyTraderBot:
 
                 # --- Auto-exit positions at take-profit / stop-loss ---
                 # Runs even while paused so we protect existing positions.
-                if self.executor:
+                # Uses its own faster timer (default 5s) independent of
+                # the poll interval to catch price moves quickly.
+                now_exit = time.time()
+                if (
+                    self.executor
+                    and now_exit - _last_exit_check >= exit_check_interval
+                ):
+                    _last_exit_check = now_exit
                     try:
                         self.executor.check_exit_conditions()
                     except Exception as exit_exc:
@@ -3959,7 +4137,12 @@ class CopyTraderGUI:
         notebook.add(addr_frame, text="Watched Addresses")
         self._build_address_tab(addr_frame)
 
-        # Tab 3: Log / Status
+        # Tab 3: Trade History
+        history_frame = ttk.Frame(notebook, padding=10)
+        notebook.add(history_frame, text="Trade History")
+        self._build_history_tab(history_frame)
+
+        # Tab 4: Log / Status
         log_frame = ttk.Frame(notebook, padding=10)
         notebook.add(log_frame, text="Log")
         self._build_log_tab(log_frame)
@@ -4069,6 +4252,15 @@ class CopyTraderGUI:
         self.poll_entry = ttk.Entry(parent, width=20)
         self.poll_entry.grid(row=row, column=1, sticky=tk.W, pady=3)
 
+        # Exit check interval
+        row += 1
+        ttk.Label(parent, text="Exit Check Interval (seconds):").grid(row=row, column=0, sticky=tk.W, pady=3)
+        exit_frame = ttk.Frame(parent)
+        exit_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
+        self.exit_check_entry = ttk.Entry(exit_frame, width=10)
+        self.exit_check_entry.pack(side=tk.LEFT)
+        ttk.Label(exit_frame, text="(how often TP/SL prices are checked)").pack(side=tk.LEFT, padx=5)
+
         # Use CLOB API checkbox
         row += 1
         self.use_clob_var = tk.BooleanVar(value=True)
@@ -4173,6 +4365,119 @@ class CopyTraderGUI:
         self.log_area.pack(fill=tk.BOTH, expand=True)
         ttk.Button(parent, text="Clear Log", command=self._clear_log).pack(anchor=tk.E, pady=3)
 
+    def _build_history_tab(self, parent):
+        columns = (
+            "closed_at", "market", "shares", "entry_price",
+            "exit_price", "pnl_usdc", "reason",
+        )
+        col_headings = {
+            "closed_at": "Closed At",
+            "market": "Market / Token",
+            "shares": "Shares",
+            "entry_price": "Entry",
+            "exit_price": "Exit",
+            "pnl_usdc": "P&L ($)",
+            "reason": "Reason",
+        }
+        col_widths = {
+            "closed_at": 150, "market": 160, "shares": 80,
+            "entry_price": 80, "exit_price": 80, "pnl_usdc": 90,
+            "reason": 100,
+        }
+
+        tree_frame = ttk.Frame(parent)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
+        self.history_tree = ttk.Treeview(
+            tree_frame, columns=columns, show="headings",
+            yscrollcommand=scrollbar.set, height=20,
+        )
+        scrollbar.config(command=self.history_tree.yview)
+
+        for col in columns:
+            self.history_tree.heading(col, text=col_headings[col])
+            anchor = tk.E if col in ("shares", "entry_price", "exit_price", "pnl_usdc") else tk.W
+            self.history_tree.column(col, width=col_widths[col], anchor=anchor)
+
+        self.history_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Summary label
+        self.history_summary_var = tk.StringVar(value="")
+        ttk.Label(parent, textvariable=self.history_summary_var, font=("Courier", 10)).pack(
+            anchor=tk.W, pady=(5, 0),
+        )
+
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(fill=tk.X, pady=3)
+        ttk.Button(btn_frame, text="Refresh", command=self._refresh_history).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="Export CSV", command=self._export_history_csv).pack(side=tk.LEFT, padx=5)
+
+        # Load existing history on startup
+        self._refresh_history()
+
+    def _refresh_history(self):
+        """Reload trade_history.json into the treeview."""
+        for row in self.history_tree.get_children():
+            self.history_tree.delete(row)
+
+        try:
+            with open(TRADE_HISTORY_FILE, "r") as fh:
+                history = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            history = []
+
+        total_pnl = 0.0
+        for rec in reversed(history):  # newest first
+            pnl = rec.get("pnl_usdc", 0)
+            total_pnl += pnl
+            closed_at = rec.get("closed_at", "")
+            # Shorten the ISO timestamp for display
+            if "T" in closed_at:
+                closed_at = closed_at.replace("T", " ")[:19]
+            self.history_tree.insert("", tk.END, values=(
+                closed_at,
+                rec.get("market", ""),
+                f"{rec.get('shares', 0):.4f}",
+                f"{rec.get('entry_price', 0):.4f}",
+                f"{rec.get('exit_price', 0):.4f}",
+                f"{pnl:+.4f}",
+                rec.get("reason", ""),
+            ))
+
+        n = len(history)
+        self.history_summary_var.set(
+            f"Total trades: {n}  |  Cumulative P&L: ${total_pnl:+.4f}"
+        )
+
+    def _export_history_csv(self):
+        """Export trade history to a CSV file."""
+        try:
+            with open(TRADE_HISTORY_FILE, "r") as fh:
+                history = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            history = []
+
+        if not history:
+            return
+
+        import csv
+        csv_path = "trade_history.csv"
+        fieldnames = [
+            "closed_at", "token_id", "market", "shares",
+            "entry_price", "exit_price", "cost_basis_usdc",
+            "proceeds_usdc", "pnl_usdc", "reason",
+        ]
+        with open(csv_path, "w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(history)
+
+        self.history_summary_var.set(
+            self.history_summary_var.get() + f"  |  Exported to {csv_path}"
+        )
+
     # ---- Field load/save ----
 
     def _load_fields_from_config(self):
@@ -4185,6 +4490,7 @@ class CopyTraderGUI:
         self.take_profit_entry.insert(0, str(self.cfg.get("take_profit_price", 0.99)))
         self.stop_loss_entry.insert(0, str(self.cfg.get("stop_loss_pct", 50)))
         self.poll_entry.insert(0, str(self.cfg.get("poll_interval_seconds", 15)))
+        self.exit_check_entry.insert(0, str(self.cfg.get("exit_check_seconds", 5)))
         self.use_clob_var.set(self.cfg.get("use_clob_api", True))
         self.dry_run_var.set(self.cfg.get("dry_run", False))
         self.auto_redeem_var.set(self.cfg.get("auto_redeem_settled", True))
@@ -4235,6 +4541,12 @@ class CopyTraderGUI:
             pass
         try:
             self.cfg["poll_interval_seconds"] = int(self.poll_entry.get().strip())
+        except ValueError:
+            pass
+        try:
+            val = int(self.exit_check_entry.get().strip())
+            if val >= 1:
+                self.cfg["exit_check_seconds"] = val
         except ValueError:
             pass
         self.cfg["watched_addresses"] = list(self.addr_listbox.get(0, tk.END))
@@ -4425,6 +4737,8 @@ def run_headless():
         cfg["take_profit_price"] = float(os.environ["TAKE_PROFIT_PRICE"])
     if os.environ.get("STOP_LOSS_PCT"):
         cfg["stop_loss_pct"] = float(os.environ["STOP_LOSS_PCT"])
+    if os.environ.get("EXIT_CHECK_SECONDS"):
+        cfg["exit_check_seconds"] = int(os.environ["EXIT_CHECK_SECONDS"])
     if os.environ.get("AUTO_REDEEM_SETTLED"):
         cfg["auto_redeem_settled"] = os.environ["AUTO_REDEEM_SETTLED"].lower() in ("1", "true", "yes")
     if os.environ.get("PROXY_REDEEM"):

@@ -24,6 +24,11 @@ bot.log
 *.log
 session_*_report.json
 
+# Runtime data files
+trade_history.json
+trade_history.csv
+positions.json
+
 # IDE
 .vscode/
 .idea/
