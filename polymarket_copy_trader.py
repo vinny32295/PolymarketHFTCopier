@@ -1053,11 +1053,30 @@ class OnChainMonitor:
     def update_watched(self, addresses):
         self.watched = {a.lower() for a in addresses}
 
+    def _rpc_with_retry(self, fn, description="RPC call", retries=3):
+        """Execute *fn()* with exponential-backoff retries on connection errors."""
+        for attempt in range(retries + 1):
+            try:
+                return fn()
+            except (ConnectionError, OSError) as exc:
+                if attempt < retries:
+                    delay = 2 ** attempt
+                    self.logger.warning(
+                        "%s failed (attempt %d/%d): %s — retrying in %ds",
+                        description, attempt + 1, retries + 1, exc, delay,
+                    )
+                    time.sleep(delay)
+                else:
+                    raise
+
     def _scan_block(self, block_number):
         """Scan a single block for relevant Polymarket trades."""
         trades = []
         try:
-            block = self.w3.eth.get_block(block_number, full_transactions=True)
+            block = self._rpc_with_retry(
+                lambda: self.w3.eth.get_block(block_number, full_transactions=True),
+                description="get_block(%d)" % block_number,
+            )
         except Exception as exc:
             self.logger.error("Failed to fetch block %d: %s", block_number, exc)
             return trades
@@ -1120,7 +1139,10 @@ class OnChainMonitor:
     def poll_new_blocks(self):
         """Check for new blocks since last poll and scan them."""
         try:
-            current = self.w3.eth.block_number
+            current = self._rpc_with_retry(
+                lambda: self.w3.eth.block_number,
+                description="get_block_number",
+            )
         except Exception as exc:
             self.logger.error("Failed to get block number: %s", exc)
             return []
@@ -1271,6 +1293,7 @@ class TradeExecutor:
                         "parent_collection_id", "0x" + "00" * 32,
                     ),
                     "index_sets": entry.get("index_sets", [1, 2]),
+                    "market_name": entry.get("market_name"),
                 }
             self.logger.info(
                 "Loaded %d position(s) from %s", len(positions), self._positions_file,
@@ -1297,6 +1320,7 @@ class TradeExecutor:
                         "parent_collection_id", "0x" + "00" * 32,
                     ),
                     "index_sets": pos.get("index_sets", [1, 2]),
+                    "market_name": pos.get("market_name"),
                 }
             pf = self._positions_file
             tmp = pf + ".tmp"
@@ -1305,6 +1329,34 @@ class TradeExecutor:
             os.replace(tmp, pf)
         except Exception as exc:
             self.logger.warning("Could not save positions: %s", exc)
+
+    def backfill_market_names(self):
+        """Enrich existing positions that lack a market_name.
+
+        Called once at startup after the CLOB client is available.
+        Looks up the market question via the API for any position where
+        market_name is missing and persists the result.
+        """
+        if not self.clob_client:
+            return
+        updated = 0
+        for tid, pos in self._positions.items():
+            if pos.get("market_name"):
+                continue
+            try:
+                market = self.clob_client.get_market_by_token(tid)
+                if market:
+                    name = market.get("question") or market.get("slug")
+                    if name:
+                        pos["market_name"] = name
+                        updated += 1
+            except Exception:
+                pass  # non-critical; will retry next restart
+        if updated:
+            self._save_positions()
+            self.logger.info(
+                "Backfilled market_name for %d position(s)", updated,
+            )
 
     # ------------------------------------------------------------------
     # Closed-trade history (persistent across sessions)
@@ -1386,7 +1438,15 @@ class TradeExecutor:
             return self._cached_balance
 
         try:
-            raw = self.usdc.functions.balanceOf(self.address).call()
+            for _attempt in range(4):
+                try:
+                    raw = self.usdc.functions.balanceOf(self.address).call()
+                    break
+                except (ConnectionError, OSError):
+                    if _attempt < 3:
+                        time.sleep(2 ** _attempt)
+                    else:
+                        raise
             self._cached_balance = Decimal(raw) / Decimal("1000000")
             self._balance_timestamp = now
         except Exception as exc:
@@ -3880,6 +3940,13 @@ class CopyTraderBot:
             self._init_executor()
             watched = self.cfg.get("watched_addresses", [])
             self.on_chain_monitor = OnChainMonitor(self.w3, watched, self.logger)
+
+            # ---- Backfill market names for legacy positions ----
+            if self.executor:
+                try:
+                    self.executor.backfill_market_names()
+                except Exception as bf_exc:
+                    self.logger.debug("Market name backfill failed (non-fatal): %s", bf_exc)
 
             # ---- Startup redemption (runs BEFORE copy-trading begins) ----
             self.logger.info("Startup: redeeming settled positions before monitoring...")
