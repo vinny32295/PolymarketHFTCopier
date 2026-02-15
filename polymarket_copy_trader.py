@@ -808,9 +808,18 @@ class PolymarketCLOBClient:
                 self.logger.error("Invalid price %s – cannot place order", price)
                 return None
 
+            # Round price to 2 decimals first — the CLOB API uses this
+            # rounded value, so all minimum calculations must be based on it
+            # to avoid rounding mismatches (e.g. computing 5.00 tokens with
+            # the raw price but the API seeing 4.96 after rounding).
+            rounded_price = round(price, 2)
+            if rounded_price <= 0:
+                self.logger.error("Price rounds to zero – cannot place order")
+                return None
+
             # Compute the minimum USDC needed to satisfy both Polymarket
             # constraints: ≥5 outcome tokens AND ≥$1 USDC notional.
-            min_usdc_for_tokens = MIN_ORDER_SIZE_TOKENS * price
+            min_usdc_for_tokens = MIN_ORDER_SIZE_TOKENS * rounded_price
             effective_usdc = max(size_usdc, min_usdc_for_tokens,
                                 MIN_ORDER_NOTIONAL_USDC)
 
@@ -823,22 +832,23 @@ class PolymarketCLOBClient:
                         size_usdc, effective_usdc,
                     )
                     return None
-                size_shares = round(effective_usdc / price, 2)
+                size_shares = round(effective_usdc / rounded_price, 2)
                 self.logger.warning(
                     "Order size %.2f USDC (%.2f tokens) below minimums; "
                     "bumped to %.2f USDC (%.2f tokens) "
                     "(min tokens=%d, min notional=$%.0f)",
-                    size_usdc, round(size_usdc / price, 2),
+                    size_usdc, round(size_usdc / rounded_price, 2),
                     effective_usdc, size_shares,
                     MIN_ORDER_SIZE_TOKENS, MIN_ORDER_NOTIONAL_USDC,
                 )
             actual_usdc = effective_usdc
 
-            rounded_price = round(price, 2)
-            if rounded_price <= 0:
-                self.logger.error("Price rounds to zero – cannot place order")
-                return None
             size_tokens = round(actual_usdc / rounded_price, 2)
+
+            # Safety net: if rounding still drops below the minimum token
+            # count, ceil up to exactly MIN_ORDER_SIZE_TOKENS.
+            if side.upper() == "BUY" and size_tokens < MIN_ORDER_SIZE_TOKENS:
+                size_tokens = float(MIN_ORDER_SIZE_TOKENS)
 
             limit_args = OrderArgs(
                 price=rounded_price,
@@ -3112,21 +3122,50 @@ class TradeExecutor:
                     if market:
                         neg_risk = self._is_neg_risk_market(market)
                         condition_id = market.get("condition_id")
-                except Exception:
-                    pass
-                # Fallback: use cached condition_id from activity data
+                except Exception as exc:
+                    self.logger.debug(
+                        "Market lookup failed for token %s: %s",
+                        token_id[:16] + "...", exc,
+                    )
+                # Fallback 1: use cached condition_id from activity data
                 if not condition_id:
                     condition_id = self.clob_client._token_to_condition.get(token_id)
+                # Fallback 2: extract condition_id from the trade_info itself
+                if not condition_id:
+                    condition_id = (
+                        trade_info.get("conditionId")
+                        or trade_info.get("condition_id")
+                    )
+                    if condition_id:
+                        # Cache it for future trades on the same token
+                        self.clob_client._token_to_condition[token_id] = str(condition_id)
+            if not condition_id:
+                self.logger.warning(
+                    "No condition_id found for token %s — positions will "
+                    "lack redemption params until resolved",
+                    token_id[:16] + "...",
+                )
 
             # --- Enforce Polymarket order minimums early ---
             # The CLOB API requires both ≥5 tokens AND ≥$1 USDC notional.
             # Compute the minimum viable USDC now so the balance cap and
             # allowance approval use the real order size (not the pre-bump
             # amount that place_order would silently inflate).
+            #
+            # Use the slippage-adjusted, rounded price so the minimum here
+            # matches what place_order() will actually submit.  Previously
+            # this used the raw market price, which was too low once
+            # slippage bumped the effective price up.
             price_f = float(price) if not isinstance(price, float) else price
             if price_f > 0:
+                slippage_mult_f = float(self.slippage_bps) / 10000.0
+                if side == "BUY":
+                    effective_price = min(price_f * (1 + slippage_mult_f), 0.99)
+                else:
+                    effective_price = max(price_f * (1 - slippage_mult_f), 0.01)
+                effective_price = round(effective_price, 2)
                 min_viable_usdc = max(
-                    MIN_ORDER_SIZE_TOKENS * price_f,
+                    MIN_ORDER_SIZE_TOKENS * effective_price,
                     MIN_ORDER_NOTIONAL_USDC,
                 )
                 if float(copy_amount) < min_viable_usdc:
