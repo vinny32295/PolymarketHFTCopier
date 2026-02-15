@@ -367,6 +367,8 @@ DEFAULT_CONFIG = {
     "dry_run": False,
     "order_ttl_seconds": 30,
     "resume_threshold_usdc": 5.0,
+    "take_profit_price": 0.99,
+    "stop_loss_pct": 50,
     "auto_redeem_settled": True,
     "proxy_redeem": True,
     "proxy_withdraw": True,
@@ -1430,6 +1432,10 @@ class TradeExecutor:
         if not self._positions:
             return []
 
+        # Read thresholds from config (fall back to module-level defaults)
+        tp_price = Decimal(str(self.cfg.get("take_profit_price", TAKE_PROFIT_PRICE)))
+        sl_pct = Decimal(str(self.cfg.get("stop_loss_pct", STOP_LOSS_PCT * 100))) / Decimal("100")
+
         results = []
         # Iterate over a snapshot so we can mutate _positions safely
         for token_id, pos in list(self._positions.items()):
@@ -1444,9 +1450,9 @@ class TradeExecutor:
             current_price_d = Decimal(str(current_price))
 
             reason = None
-            if current_price_d >= TAKE_PROFIT_PRICE:
+            if current_price_d >= tp_price:
                 reason = "take-profit"
-            elif entry_price > 0 and current_price_d <= entry_price * STOP_LOSS_PCT:
+            elif entry_price > 0 and current_price_d <= entry_price * sl_pct:
                 reason = "stop-loss"
 
             if reason is None:
@@ -4039,6 +4045,24 @@ class CopyTraderGUI:
         self.resume_threshold_entry.pack(side=tk.LEFT)
         ttk.Label(resume_frame, text="(min balance to resume after pause)").pack(side=tk.LEFT, padx=5)
 
+        # Take-profit price
+        row += 1
+        ttk.Label(parent, text="Take-Profit Price:").grid(row=row, column=0, sticky=tk.W, pady=3)
+        tp_frame = ttk.Frame(parent)
+        tp_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
+        self.take_profit_entry = ttk.Entry(tp_frame, width=10)
+        self.take_profit_entry.pack(side=tk.LEFT)
+        ttk.Label(tp_frame, text="(sell when price >= this, e.g. 0.90)").pack(side=tk.LEFT, padx=5)
+
+        # Stop-loss percentage
+        row += 1
+        ttk.Label(parent, text="Stop-Loss (%):").grid(row=row, column=0, sticky=tk.W, pady=3)
+        sl_frame = ttk.Frame(parent)
+        sl_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
+        self.stop_loss_entry = ttk.Entry(sl_frame, width=10)
+        self.stop_loss_entry.pack(side=tk.LEFT)
+        ttk.Label(sl_frame, text="(sell when price drops to this % of entry)").pack(side=tk.LEFT, padx=5)
+
         # Poll interval
         row += 1
         ttk.Label(parent, text="Poll Interval (seconds):").grid(row=row, column=0, sticky=tk.W, pady=3)
@@ -4158,6 +4182,8 @@ class CopyTraderGUI:
         self.max_trade_entry.insert(0, str(self.cfg.get("max_trade_usdc", 100)))
         self.slippage_entry.insert(0, str(self.cfg.get("slippage_tolerance_bps", 100)))
         self.resume_threshold_entry.insert(0, str(self.cfg.get("resume_threshold_usdc", 5)))
+        self.take_profit_entry.insert(0, str(self.cfg.get("take_profit_price", 0.99)))
+        self.stop_loss_entry.insert(0, str(self.cfg.get("stop_loss_pct", 50)))
         self.poll_entry.insert(0, str(self.cfg.get("poll_interval_seconds", 15)))
         self.use_clob_var.set(self.cfg.get("use_clob_api", True))
         self.dry_run_var.set(self.cfg.get("dry_run", False))
@@ -4193,6 +4219,18 @@ class CopyTraderGUI:
             pass
         try:
             self.cfg["resume_threshold_usdc"] = float(self.resume_threshold_entry.get().strip())
+        except ValueError:
+            pass
+        try:
+            val = float(self.take_profit_entry.get().strip())
+            if 0 < val <= 1:
+                self.cfg["take_profit_price"] = val
+        except ValueError:
+            pass
+        try:
+            val = float(self.stop_loss_entry.get().strip())
+            if 0 < val <= 100:
+                self.cfg["stop_loss_pct"] = val
         except ValueError:
             pass
         try:
@@ -4383,6 +4421,10 @@ def run_headless():
         cfg["clob_api_secret"] = os.environ["CLOB_API_SECRET"]
     if os.environ.get("CLOB_API_PASSPHRASE"):
         cfg["clob_api_passphrase"] = os.environ["CLOB_API_PASSPHRASE"]
+    if os.environ.get("TAKE_PROFIT_PRICE"):
+        cfg["take_profit_price"] = float(os.environ["TAKE_PROFIT_PRICE"])
+    if os.environ.get("STOP_LOSS_PCT"):
+        cfg["stop_loss_pct"] = float(os.environ["STOP_LOSS_PCT"])
     if os.environ.get("AUTO_REDEEM_SETTLED"):
         cfg["auto_redeem_settled"] = os.environ["AUTO_REDEEM_SETTLED"].lower() in ("1", "true", "yes")
     if os.environ.get("PROXY_REDEEM"):
@@ -4402,6 +4444,8 @@ def run_headless():
                 cfg.get("copy_percentage"), cfg.get("max_trade_usdc"),
                 cfg.get("resume_threshold_usdc", 5), cfg.get("dry_run", False),
                 cfg.get("auto_redeem_settled", True))
+    logger.info("Take-profit: %s | Stop-loss: %s%%",
+                cfg.get("take_profit_price", 0.99), cfg.get("stop_loss_pct", 50))
     logger.info("Proxy redeem: %s | Proxy withdraw: %s",
                 cfg.get("proxy_redeem", True), cfg.get("proxy_withdraw", True))
 
