@@ -108,6 +108,7 @@ class TestCLOBClient(unittest.TestCase):
         client.logger = logger
         client._last_trade_ids = {}
         client._token_to_condition = {}
+        client._token_to_slug = {}
         client.clob_sdk = None
         return client
 
@@ -168,6 +169,7 @@ class TestPlaceOrderMinSize(unittest.TestCase):
         client.logger = logger
         client._last_trade_ids = {}
         client._token_to_condition = {}
+        client._token_to_slug = {}
         client.clob_sdk = MagicMock()
         client.clob_sdk.create_market_order.return_value = {"signed": True}
         client.clob_sdk.post_order.return_value = {"orderID": "test123"}
@@ -791,6 +793,7 @@ class TestCLOBClientOrderMethods(unittest.TestCase):
         client.logger = logger
         client._last_trade_ids = {}
         client._token_to_condition = {}
+        client._token_to_slug = {}
         client.clob_sdk = MagicMock()
         return client
 
@@ -1607,6 +1610,7 @@ class TestGetMarketByToken(unittest.TestCase):
         client.logger = logger
         client._last_trade_ids = {}
         client._token_to_condition = {}
+        client._token_to_slug = {}
         client.clob_sdk = None
         return client
 
@@ -1651,6 +1655,7 @@ class TestGetWalletTokenIds(unittest.TestCase):
         client.logger = logger
         client._last_trade_ids = {}
         client._token_to_condition = {}
+        client._token_to_slug = {}
         client.clob_sdk = None
         return client
 
@@ -2108,7 +2113,7 @@ class TestProxyRedemptionAndWithdrawal(unittest.TestCase):
         """Test redeem_via_proxy encodes and sends correctly."""
         executor = self._make_executor()
         cond_id = "0x" + "a" * 64
-        executor.conditional_tokens.encodeABI = MagicMock(return_value=b"\x01\x02")
+        executor.conditional_tokens.encode_abi = MagicMock(return_value=b"\x01\x02")
 
         mock_proxy_contract = MagicMock()
         mock_proxy_contract.functions.execute.return_value.build_transaction.return_value = {}
@@ -2121,14 +2126,14 @@ class TestProxyRedemptionAndWithdrawal(unittest.TestCase):
 
         result = executor.redeem_via_proxy(self.PROXY_ADDR, cond_id)
         self.assertEqual(result.status, 1)
-        executor.conditional_tokens.encodeABI.assert_called_once()
+        executor.conditional_tokens.encode_abi.assert_called_once()
         executor._sign_and_send.assert_called_once()
 
     def test_withdraw_usdc_from_proxy(self):
         """Test USDC withdrawal from proxy to EOA."""
         executor = self._make_executor()
         executor.usdc.functions.balanceOf.return_value.call.return_value = 200_000000
-        executor.usdc.encodeABI = MagicMock(return_value=b"\x03\x04")
+        executor.usdc.encode_abi = MagicMock(return_value=b"\x03\x04")
 
         mock_proxy_contract = MagicMock()
         mock_proxy_contract.functions.execute.return_value.build_transaction.return_value = {}
@@ -2142,7 +2147,7 @@ class TestProxyRedemptionAndWithdrawal(unittest.TestCase):
 
         result = executor.withdraw_usdc_from_proxy(self.PROXY_ADDR)
         self.assertEqual(result.status, 1)
-        executor.usdc.encodeABI.assert_called_once()
+        executor.usdc.encode_abi.assert_called_once()
 
     def test_withdraw_zero_balance_returns_none(self):
         """No withdrawal when proxy USDC balance is 0."""
@@ -2156,7 +2161,7 @@ class TestProxyRedemptionAndWithdrawal(unittest.TestCase):
     def test_withdraw_specific_amount(self):
         """Withdraw a specific amount rather than full balance."""
         executor = self._make_executor()
-        executor.usdc.encodeABI = MagicMock(return_value=b"\x05\x06")
+        executor.usdc.encode_abi = MagicMock(return_value=b"\x05\x06")
 
         mock_proxy_contract = MagicMock()
         mock_proxy_contract.functions.execute.return_value.build_transaction.return_value = {}
@@ -2170,7 +2175,7 @@ class TestProxyRedemptionAndWithdrawal(unittest.TestCase):
         result = executor.withdraw_usdc_from_proxy(self.PROXY_ADDR, amount=Decimal("50"))
         self.assertEqual(result.status, 1)
         # Verify transfer args: amount should be 50 * 1000000
-        call_args = executor.usdc.encodeABI.call_args
+        call_args = executor.usdc.encode_abi.call_args
         self.assertEqual(call_args[1]["args"][1], 50_000000)
 
 
