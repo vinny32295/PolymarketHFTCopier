@@ -1439,9 +1439,10 @@ class TradeExecutor:
         pnl = round(proceeds - cost_basis, 6)
 
         # Classify the outcome for reporting
-        if reason in ("redeemed", "redeemed_external"):
+        if reason == "redeemed":
             outcome = "won" if exit_p >= 0.5 else "lost"
-        elif reason in ("dust", "stale", "failed_redeem", "resolution_error"):
+        elif reason in ("dust", "stale", "failed_redeem", "resolution_error",
+                         "redeemed_external"):
             outcome = "lost"
         else:
             outcome = "sold"
@@ -2591,18 +2592,16 @@ class TradeExecutor:
                 if ct_balance == 0:
                     self.logger.info(
                         "Market resolved but no on-chain tokens for %s — "
-                        "clearing phantom position (order likely never filled)",
+                        "already redeemed or order never filled. "
+                        "Removing from tracking (no P/L entry).",
                         token_id[:16] + "...",
                     )
-                    # No on-chain tokens.  Most likely the original buy
-                    # order was never filled (phantom position).  Log at
-                    # entry_price so P&L = $0 (no actual loss beyond gas).
-                    self._log_closed_trade(
-                        token_id, pos.get("entry_price", 0),
-                        pos.get("entry_price", 0),
-                        pos.get("tokens", 0), "redeemed_external",
-                        market=pos.get("market_name"),
-                    )
+                    # No on-chain tokens.  Either:
+                    # 1. Already redeemed in a prior cycle (P/L already logged)
+                    # 2. The buy order was never filled (phantom position)
+                    # In both cases, do NOT log a closed trade — it would
+                    # either double-count the redemption or create a fake
+                    # P/L=$0 entry that inflates trade counts.
                     del self._positions[token_id]
                     self._save_positions()
                     continue
