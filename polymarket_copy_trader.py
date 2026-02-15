@@ -4229,11 +4229,41 @@ class CopyTraderBot:
         self.running = True
         self._session_start = datetime.now()
         self._trade_history = []
+
+        # --- Display active configuration at startup ---
+        watched = self.cfg.get("watched_addresses", [])
+        self.logger.info("=" * 60)
+        self.logger.info("COPY TRADER CONFIGURATION")
+        self.logger.info("=" * 60)
+        self.logger.info("  Watched addresses:      %d", len(watched))
+        for i, addr in enumerate(watched):
+            self.logger.info("    [%d] %s", i + 1, addr)
+        self.logger.info("  Copy percentage:        %s%%",
+                         self.cfg.get("copy_percentage", 50))
+        self.logger.info("  Max trade size:         $%s",
+                         self.cfg.get("max_trade_usdc", 100))
+        self.logger.info("  Slippage tolerance:     %s bps",
+                         self.cfg.get("slippage_tolerance_bps", 0))
+        self.logger.info("  Poll interval:          %ss",
+                         self.cfg.get("poll_interval_seconds", 2))
+        self.logger.info("  Order TTL:              %ss",
+                         self.cfg.get("order_ttl_seconds", 10))
+        self.logger.info("  Max price deviation:    %s%%",
+                         self.cfg.get("max_price_deviation_pct", 2))
+        self.logger.info("  Trade max age:          %ss",
+                         self.cfg.get("trade_max_age_seconds", 30))
+        self.logger.info("  Resume threshold:       $%s",
+                         self.cfg.get("resume_threshold_usdc", 5))
+        self.logger.info("  Dry run:                %s",
+                         self.cfg.get("dry_run", False))
+        self.logger.info("  Auto redeem settled:    %s",
+                         self.cfg.get("auto_redeem_settled", True))
+        self.logger.info("=" * 60)
+
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         self.logger.info("Bot started")
-        self._notify("Bot started — monitoring %d address(es)" % len(
-            self.cfg.get("watched_addresses", [])))
+        self._notify("Bot started — monitoring %d address(es)" % len(watched))
 
     def stop(self):
         self.running = False
