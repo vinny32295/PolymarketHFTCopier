@@ -1067,13 +1067,13 @@ class TestLowBalancePauseResume(unittest.TestCase):
         self.assertTrue(b._paused_low_balance)
 
     def test_stays_paused_below_resume_threshold(self):
-        """Bot should remain paused if balance < configured threshold."""
+        """Bot should remain paused if balance < configured threshold ($5)."""
         b = self._make_bot()
         b._paused_low_balance = True
         b.executor = MagicMock()
-        b.executor.get_usdc_balance.return_value = Decimal("50.00")
+        b.executor.get_usdc_balance.return_value = Decimal("3.00")
 
-        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 100)))
+        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 5)))
         balance = b.executor.get_usdc_balance(max_age_seconds=0)
         if b._paused_low_balance and balance >= resume_threshold:
             b._paused_low_balance = False
@@ -1081,13 +1081,13 @@ class TestLowBalancePauseResume(unittest.TestCase):
         self.assertTrue(b._paused_low_balance)
 
     def test_resumes_at_resume_threshold(self):
-        """Bot should resume trading when balance >= configured threshold ($150 default)."""
+        """Bot should resume trading when balance >= configured threshold ($5 default)."""
         b = self._make_bot()
         b._paused_low_balance = True
         b.executor = MagicMock()
-        b.executor.get_usdc_balance.return_value = Decimal("150.00")
+        b.executor.get_usdc_balance.return_value = Decimal("5.00")
 
-        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 150)))
+        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 5)))
         balance = b.executor.get_usdc_balance(max_age_seconds=0)
         if b._paused_low_balance and balance >= resume_threshold:
             b._paused_low_balance = False
@@ -1099,9 +1099,9 @@ class TestLowBalancePauseResume(unittest.TestCase):
         b = self._make_bot()
         b._paused_low_balance = True
         b.executor = MagicMock()
-        b.executor.get_usdc_balance.return_value = Decimal("250.00")
+        b.executor.get_usdc_balance.return_value = Decimal("10.00")
 
-        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 100)))
+        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 5)))
         balance = b.executor.get_usdc_balance(max_age_seconds=0)
         if b._paused_low_balance and balance >= resume_threshold:
             b._paused_low_balance = False
@@ -1164,7 +1164,7 @@ class TestLowBalancePauseResume(unittest.TestCase):
         b = self._make_bot()
         b.executor = MagicMock()
         b.clob_client = MagicMock()
-        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 100)))
+        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 5)))
 
         # Phase 1: Normal trading (balance is healthy)
         b.executor.get_usdc_balance.return_value = Decimal("500.00")
@@ -1177,23 +1177,23 @@ class TestLowBalancePauseResume(unittest.TestCase):
             b._paused_low_balance = True
         self.assertTrue(b._paused_low_balance)
 
-        # Phase 3: Partial recovery ($50) - not enough to resume
-        b.executor.get_usdc_balance.return_value = Decimal("50.00")
+        # Phase 3: Partial recovery ($3) - not enough to resume (need $5)
+        b.executor.get_usdc_balance.return_value = Decimal("3.00")
         balance = b.executor.get_usdc_balance(max_age_seconds=0)
         if b._paused_low_balance and balance >= resume_threshold:
             b._paused_low_balance = False
         self.assertTrue(b._paused_low_balance)
 
-        # Phase 4: Full recovery ($150+) - resumes
-        b.executor.get_usdc_balance.return_value = Decimal("160.00")
+        # Phase 4: Full recovery ($5+) - resumes
+        b.executor.get_usdc_balance.return_value = Decimal("6.00")
         balance = b.executor.get_usdc_balance(max_age_seconds=0)
         if b._paused_low_balance and balance >= resume_threshold:
             b._paused_low_balance = False
         self.assertFalse(b._paused_low_balance)
 
     def test_default_resume_threshold_in_config(self):
-        """Verify the default resume_threshold_usdc is 150 in DEFAULT_CONFIG."""
-        self.assertEqual(bot.DEFAULT_CONFIG["resume_threshold_usdc"], 150.0)
+        """Verify the default resume_threshold_usdc is 5 in DEFAULT_CONFIG."""
+        self.assertEqual(bot.DEFAULT_CONFIG["resume_threshold_usdc"], 5.0)
         self.assertEqual(bot.LOW_BALANCE_PAUSE_THRESHOLD, Decimal("1.05"))
 
     def test_env_var_override(self):

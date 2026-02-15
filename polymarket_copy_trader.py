@@ -312,6 +312,10 @@ NEG_RISK_ADAPTER_ABI = json.loads("""[
 # How often to check for redeemable (settled) positions (seconds)
 REDEEM_CHECK_INTERVAL_SECONDS = 300  # 5 minutes
 
+# When paused for low balance, check for settlements much more
+# aggressively so we can redeem USDC and resume trading quickly.
+PAUSED_REDEEM_INTERVAL_SECONDS = 30  # every 30 s while paused
+
 # How often to run the full portfolio scan (more expensive than the
 # periodic check_and_redeem_settled because it queries the Data API
 # for the wallet's complete trade history).
@@ -339,7 +343,7 @@ DEFAULT_CONFIG = {
     "dry_run": False,
     "fixed_trade_usdc": 0.0,
     "order_ttl_seconds": 30,
-    "resume_threshold_usdc": 150.0,
+    "resume_threshold_usdc": 5.0,
     "auto_redeem_settled": True,
     "proxy_redeem": True,
     "proxy_withdraw": True,
@@ -3159,7 +3163,7 @@ class CopyTraderBot:
         # Low-balance pause state.  When the USDC balance is too low to
         # place any order the bot stops copying new trades and waits for
         # open positions to settle.  Trading resumes once the balance
-        # reaches resume_threshold_usdc (default $100, configurable).
+        # reaches resume_threshold_usdc (default $5, configurable).
         self._paused_low_balance = False
 
         # Web3 connection (lazy init)
@@ -3313,7 +3317,7 @@ class CopyTraderBot:
         )
 
         resume_threshold = Decimal(
-            str(self.cfg.get("resume_threshold_usdc", 100))
+            str(self.cfg.get("resume_threshold_usdc", 5))
         )
         _last_pause_log = 0  # timestamp of last "still paused" INFO log
         _last_redeem_check = 0  # timestamp of last settled-position redemption scan
@@ -3341,8 +3345,7 @@ class CopyTraderBot:
                                 if now - _last_pause_log >= 300:
                                     self.logger.info(
                                         "Paused (low balance $%.2f, need $%s "
-                                        "to resume) — waiting for trades to "
-                                        "settle",
+                                        "to resume) — waiting for settlements",
                                         balance, resume_threshold,
                                     )
                                     _last_pause_log = now
@@ -3351,9 +3354,11 @@ class CopyTraderBot:
                             _last_pause_log = time.time()
                             self.logger.warning(
                                 "Balance $%.2f below $%s — pausing new trades. "
-                                "Will resume when balance reaches $%s.",
+                                "Will check for settlements every %ds and "
+                                "resume when balance reaches $%s.",
                                 balance,
                                 LOW_BALANCE_PAUSE_THRESHOLD,
+                                PAUSED_REDEEM_INTERVAL_SECONDS,
                                 resume_threshold,
                             )
                     except Exception as bal_exc:
@@ -3383,20 +3388,28 @@ class CopyTraderBot:
                         )
 
                 # --- Auto-redeem settled positions back to USDC ---
-                # Runs every REDEEM_CHECK_INTERVAL_SECONDS (default 5 min)
-                # even while paused — recovering USDC helps resume trading.
+                # When paused (low balance) we check every 30 s so we
+                # can redeem as trades resolve and resume quickly.
+                # Otherwise checks every 5 min.
                 now = time.time()
+                redeem_interval = (
+                    PAUSED_REDEEM_INTERVAL_SECONDS
+                    if self._paused_low_balance
+                    else REDEEM_CHECK_INTERVAL_SECONDS
+                )
+                _did_redeem = False
                 if (
                     self.executor
                     and self.cfg.get("auto_redeem_settled", True)
-                    and now - _last_redeem_check >= REDEEM_CHECK_INTERVAL_SECONDS
+                    and now - _last_redeem_check >= redeem_interval
                 ):
                     _last_redeem_check = now
                     try:
                         redeemed = self.executor.check_and_redeem_settled()
                         if redeemed:
+                            _did_redeem = True
                             self.logger.info(
-                                "Auto-redeem: %d position(s) processed",
+                                "Auto-redeem: %d position(s) redeemed",
                                 len(redeemed),
                             )
                     except Exception as redeem_exc:
@@ -3410,6 +3423,8 @@ class CopyTraderBot:
                 # expensive than check_and_redeem_settled (which only
                 # checks _positions dict) but catches positions that
                 # were missed or not tracked.
+                # When paused, runs every 15 min to sweep for anything
+                # the lightweight check missed.
                 if (
                     self.executor
                     and self.cfg.get("auto_redeem_settled", True)
@@ -3419,6 +3434,7 @@ class CopyTraderBot:
                     try:
                         scan_results = self.executor.scan_and_redeem_portfolio()
                         if scan_results:
+                            _did_redeem = True
                             self.logger.info(
                                 "Portfolio scan: %d position(s) processed",
                                 len(scan_results),
@@ -3429,17 +3445,22 @@ class CopyTraderBot:
                         )
 
                 # --- Proxy wallet redemption & withdrawal ---
-                # Runs on the same cadence as auto-redeem.  Recovering
-                # USDC from the proxy helps the bot resume trading.
+                # Uses the same accelerated cadence while paused.
+                proxy_interval = (
+                    PAUSED_REDEEM_INTERVAL_SECONDS
+                    if self._paused_low_balance
+                    else REDEEM_CHECK_INTERVAL_SECONDS
+                )
                 if (
                     self.executor
                     and self.cfg.get("proxy_redeem", True)
-                    and now - _last_proxy_check >= REDEEM_CHECK_INTERVAL_SECONDS
+                    and now - _last_proxy_check >= proxy_interval
                 ):
                     _last_proxy_check = now
                     try:
                         proxy_results = self.executor.scan_and_redeem_proxy_portfolio()
                         if proxy_results:
+                            _did_redeem = True
                             self.logger.info(
                                 "Proxy check: %d result(s) processed",
                                 len(proxy_results),
@@ -3448,6 +3469,22 @@ class CopyTraderBot:
                         self.logger.debug(
                             "Proxy redemption check error: %s", proxy_exc,
                         )
+
+                # If we just redeemed while paused, immediately re-check
+                # balance so we can resume without waiting another cycle.
+                if _did_redeem and self._paused_low_balance and self.executor:
+                    try:
+                        self.executor.invalidate_balance_cache()
+                        balance = self.executor.get_usdc_balance(max_age_seconds=0)
+                        if balance >= resume_threshold:
+                            self._paused_low_balance = False
+                            self.logger.info(
+                                "Redemption recovered funds — balance $%.2f "
+                                "(>= $%s), resuming trading",
+                                balance, resume_threshold,
+                            )
+                    except Exception:
+                        pass  # will be rechecked next cycle
 
                 # --- Skip trade detection & execution while paused ---
                 if self._paused_low_balance:
@@ -4011,7 +4048,7 @@ def run_headless():
     logger.info("Watched addresses: %s", cfg["watched_addresses"])
     logger.info("Copy %%: %s | Max trade: %s USDC | Resume threshold: $%s | Dry run: %s | Auto-redeem: %s",
                 cfg.get("copy_percentage"), cfg.get("max_trade_usdc"),
-                cfg.get("resume_threshold_usdc", 100), cfg.get("dry_run", False),
+                cfg.get("resume_threshold_usdc", 5), cfg.get("dry_run", False),
                 cfg.get("auto_redeem_settled", True))
     logger.info("Proxy redeem: %s | Proxy withdraw: %s",
                 cfg.get("proxy_redeem", True), cfg.get("proxy_withdraw", True))
