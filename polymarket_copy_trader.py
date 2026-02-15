@@ -539,6 +539,7 @@ class PolymarketCLOBClient:
         self._token_to_condition = {}  # token_id -> condition_id from activity
         self._token_to_neg_risk = {}  # token_id -> neg_risk flag from activity/API
         self._token_to_slug = {}  # token_id -> market slug from activity
+        self._token_to_avg_entry = {}  # token_id -> VWAP entry price from activity
 
         # Authenticated CLOB client (py-clob-client SDK)
         self.clob_sdk = None
@@ -758,6 +759,11 @@ class PolymarketCLOBClient:
 
         Queries the Data API activity feed and extracts token IDs from
         each trade record.  Returns a set of token-ID strings.
+
+        Also computes the volume-weighted average BUY price for each
+        token and caches it in ``_token_to_avg_entry`` so that
+        discovered positions can use the user's actual cost basis
+        instead of the market's last trade price.
         """
         url = f"{self.data_url}/activity"
         params = {"user": address.lower(), "limit": limit}
@@ -769,6 +775,8 @@ class PolymarketCLOBClient:
             "data", data.get("history", [])
         )
         token_ids = set()
+        # Accumulators for VWAP: token_id -> [total_cost, total_shares]
+        buy_accum = {}
         logged_sample = False
         for trade in trades:
             # Log the first trade record's keys for diagnostics
@@ -796,6 +804,36 @@ class PolymarketCLOBClient:
                 if slug and tid not in self._token_to_slug:
                     self._token_to_slug[tid] = str(slug)
 
+                # Accumulate buy-side cost basis for VWAP entry price
+                side = str(
+                    trade.get("side") or trade.get("type") or ""
+                ).upper()
+                if side == "BUY":
+                    try:
+                        price = float(trade.get("price", 0))
+                        shares = float(
+                            trade.get("size")
+                            or trade.get("amount")
+                            or trade.get("usdcSize")
+                            or 0
+                        )
+                        if price > 0 and shares > 0:
+                            acc = buy_accum.setdefault(tid, [0.0, 0.0])
+                            acc[0] += price * shares  # total cost
+                            acc[1] += shares           # total shares
+                    except (ValueError, TypeError):
+                        pass
+
+        # Compute VWAP entry prices from accumulated buy trades
+        for tid, (total_cost, total_shares) in buy_accum.items():
+            if total_shares > 0:
+                self._token_to_avg_entry[tid] = total_cost / total_shares
+
+        if self._token_to_avg_entry:
+            self.logger.info(
+                "Cached %d avg entry price(s) from activity data",
+                len(self._token_to_avg_entry),
+            )
         if self._token_to_condition:
             self.logger.info(
                 "Cached %d condition_id(s) from activity data",
@@ -2192,8 +2230,18 @@ class TradeExecutor:
                     # Not resolved on-chain — seed as active position
                     if token_id not in self._positions:
                         tokens = Decimal(ct_balance) / Decimal("1000000")
-                        price = self.clob_client.get_last_trade_price(token_id)
-                        entry_price = Decimal(str(price)) if price and price > 0 else Decimal("0")
+                        # Use the user's actual VWAP buy price from
+                        # activity history (cached during token discovery).
+                        # Falls back to market last-trade-price only when
+                        # the activity feed didn't contain buy records.
+                        cached_entry = self.clob_client._token_to_avg_entry.get(token_id)
+                        if cached_entry and cached_entry > 0:
+                            entry_price = Decimal(str(round(cached_entry, 6)))
+                            price_source = "activity VWAP"
+                        else:
+                            price = self.clob_client.get_last_trade_price(token_id)
+                            entry_price = Decimal(str(price)) if price and price > 0 else Decimal("0")
+                            price_source = "last trade"
                         seed_market_name = (
                             market.get("question") or market.get("slug")
                             if market else None
@@ -2212,8 +2260,9 @@ class TradeExecutor:
                         active_seeded += 1
                         if entry_price > 0:
                             self.logger.info(
-                                "Discovered active position: %s (%.2f tokens @ $%.4f, neg_risk=%s)",
-                                token_id[:16] + "...", tokens, price, neg_risk,
+                                "Discovered active position: %s (%.2f tokens @ $%.4f [%s], neg_risk=%s)",
+                                token_id[:16] + "...", tokens, entry_price,
+                                price_source, neg_risk,
                             )
                         else:
                             unresolved_no_price += 1
@@ -2277,6 +2326,23 @@ class TradeExecutor:
                             token_id, pos.get("entry_price", 0), exit_price,
                             pos.get("tokens", 0), "redeemed",
                             market=pos.get("market_name"),
+                        )
+                    else:
+                        # Position wasn't tracked yet (discovered already
+                        # resolved).  Use VWAP entry from activity history
+                        # so P/L is still recorded accurately.
+                        disc_tokens = Decimal(ct_balance) / Decimal("1000000")
+                        cached_entry = self.clob_client._token_to_avg_entry.get(
+                            token_id, 0
+                        )
+                        disc_market = (
+                            market.get("question") or market.get("slug")
+                            if market else None
+                        )
+                        self._log_closed_trade(
+                            token_id, cached_entry, exit_price,
+                            disc_tokens, "redeemed",
+                            market=disc_market,
                         )
                     self._positions.pop(token_id, None)
                     self._save_positions()
