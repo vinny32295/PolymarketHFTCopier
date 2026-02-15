@@ -4737,7 +4737,10 @@ class CopyTraderGUI:
             return
 
         import csv
-        csv_path = "trade_history.csv"
+        csv_path = os.path.join(
+            os.path.dirname(os.path.abspath(TRADE_HISTORY_FILE)),
+            "trade_history.csv",
+        )
         fieldnames = [
             "closed_at", "token_id", "market", "shares",
             "entry_price", "exit_price", "cost_basis_usdc",
