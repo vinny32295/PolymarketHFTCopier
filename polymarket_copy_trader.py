@@ -2157,8 +2157,9 @@ class TradeExecutor:
                             )
                         else:
                             no_market_count += 1
-                            self.logger.debug(
-                                "No market info or cached condition_id for token %s",
+                            self.logger.info(
+                                "No market info or cached condition_id for token %s "
+                                "— cannot check resolution",
                                 token_id[:16] + "...",
                             )
                             continue
@@ -2562,12 +2563,20 @@ class TradeExecutor:
                 if not condition_id:
                     market = self.clob_client.get_market_by_token(token_id)
                     if not market:
+                        self.logger.warning(
+                            "REDEEM BLOCKED: no market info for token %s "
+                            "(%s) — cannot determine condition_id",
+                            token_id[:16] + "...",
+                            pos.get("market_name", "unknown"),
+                        )
                         continue
                     condition_id = market.get("condition_id")
                     if not condition_id:
-                        self.logger.debug(
-                            "Market for token %s has no condition_id, skipping",
+                        self.logger.warning(
+                            "REDEEM BLOCKED: market for token %s has no "
+                            "condition_id — %s",
                             token_id[:16] + "...",
+                            pos.get("market_name", "unknown"),
                         )
                         continue
                     neg_risk = self._is_neg_risk_market(market)
@@ -2676,9 +2685,11 @@ class TradeExecutor:
 
             except Exception as exc:
                 self.logger.warning(
-                    "Error checking redemption for token %s: %s",
+                    "Error checking redemption for token %s (%s): %s",
                     token_id[:16] + "...",
+                    pos.get("market_name", "unknown"),
                     exc,
+                    exc_info=True,
                 )
 
         if results:
@@ -4275,8 +4286,9 @@ class CopyTraderBot:
                                 len(redeemed),
                             )
                     except Exception as redeem_exc:
-                        self.logger.debug(
+                        self.logger.warning(
                             "Redemption check error: %s", redeem_exc,
+                            exc_info=True,
                         )
 
                 # --- Full portfolio scan (periodic) ---
