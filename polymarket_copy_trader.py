@@ -1385,6 +1385,55 @@ class TradeExecutor:
             "usdc": usdc_amount,
         }
 
+    def _rollback_position(self, order_id, info, reason):
+        """Reverse the optimistic position update for an unfilled order.
+
+        When an order is submitted, the bot immediately updates _positions
+        with the expected tokens.  If the order is later cancelled, expired,
+        or stale-cancelled, we must undo that to avoid phantom positions
+        that have no on-chain backing.
+        """
+        token_id = info["token_id"]
+        price = info["price"]
+        side = info["side"]
+
+        if not price or price <= 0:
+            return
+
+        tokens = Decimal(str(info["usdc"])) / Decimal(str(price))
+        pos = self._positions.get(token_id)
+        if pos is None:
+            return
+
+        if side == "BUY":
+            old_tokens = pos["tokens"]
+            pos["tokens"] = max(pos["tokens"] - tokens, Decimal("0"))
+            if pos["tokens"] <= 0:
+                self.logger.info(
+                    "Rolled back phantom position %s (unfilled BUY %s, "
+                    "%.2f tokens removed entirely)",
+                    token_id[:16] + "...", reason, old_tokens,
+                )
+                del self._positions[token_id]
+            else:
+                self.logger.info(
+                    "Rolled back %.2f tokens from %s (unfilled BUY %s, "
+                    "%.2f tokens remain)",
+                    tokens, token_id[:16] + "...", reason,
+                    pos["tokens"],
+                )
+        elif side == "SELL":
+            # Sell was cancelled — restore the tokens we pre-subtracted
+            pos["tokens"] += tokens
+            self.logger.info(
+                "Restored %.2f tokens to %s (unfilled SELL %s, "
+                "%.2f tokens now)",
+                tokens, token_id[:16] + "...", reason,
+                pos["tokens"],
+            )
+
+        self._save_positions()
+
     def monitor_open_orders(self):
         """Check tracked orders, log fills, and cancel stale ones.
 
@@ -1433,6 +1482,7 @@ class TradeExecutor:
                     info["usdc"],
                     info["price"],
                 )
+                self._rollback_position(order_id, info, status.lower())
                 to_remove.append(order_id)
 
             elif now - info["placed_at"] > self._order_ttl:
@@ -1448,6 +1498,7 @@ class TradeExecutor:
                     info["price"],
                 )
                 self.clob_client.cancel_order(order_id)
+                self._rollback_position(order_id, info, "stale-cancelled")
                 self.invalidate_balance_cache()
                 cancelled += 1
                 to_remove.append(order_id)
@@ -2256,11 +2307,12 @@ class TradeExecutor:
                 if ct_balance == 0:
                     self.logger.info(
                         "Market resolved but no on-chain tokens for %s — "
-                        "clearing stale position (likely redeemed externally)",
+                        "clearing phantom position (order likely never filled)",
                         token_id[:16] + "...",
                     )
-                    # Tokens already gone — likely redeemed via Polymarket
-                    # UI.  Log at entry_price (unknown actual exit).
+                    # No on-chain tokens.  Most likely the original buy
+                    # order was never filled (phantom position).  Log at
+                    # entry_price so P&L = $0 (no actual loss beyond gas).
                     self._log_closed_trade(
                         token_id, pos.get("entry_price", 0),
                         pos.get("entry_price", 0),
