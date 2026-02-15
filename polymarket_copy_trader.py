@@ -70,6 +70,8 @@ except ImportError:
 # Constants – Polymarket / Polygon addresses and ABIs
 # ---------------------------------------------------------------------------
 
+VERSION = "1.1.0"
+
 # Polymarket CTF Exchange (Conditional Token Framework) on Polygon
 # Reference: https://docs.polymarket.com/
 CTF_EXCHANGE_ADDRESS = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
@@ -3790,7 +3792,7 @@ class CopyTraderGUI:
         self.logger = None
 
         self.root = tk.Tk()
-        self.root.title("Polymarket Copy Trader Bot")
+        self.root.title(f"Polymarket Copy Trader Bot  v{VERSION}")
         self.root.geometry("900x720")
         self.root.minsize(700, 550)
 
@@ -3799,7 +3801,7 @@ class CopyTraderGUI:
         # Set up logging with GUI handler
         gui_handler = TextHandler(self.log_area)
         self.logger = setup_logging(gui_handler)
-        self.logger.info("Application started")
+        self.logger.info("Polymarket Copy Trader v%s started", VERSION)
         self._load_fields_from_config()
 
     # ---- UI construction ----
