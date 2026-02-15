@@ -940,12 +940,13 @@ class PolymarketCLOBClient:
             # --- FOK (Fill-or-Kill) attempt for instant fills ---
             if use_fok and MarketOrderArgs is not None:
                 try:
-                    fok_args = MarketOrderArgs(
-                        token_id=token_id,
-                        amount=round(actual_usdc, 2),
-                        price=rounded_price,
-                    )
                     if side.upper() == "BUY":
+                        fok_args = MarketOrderArgs(
+                            token_id=token_id,
+                            amount=round(actual_usdc, 2),
+                            price=rounded_price,
+                            side=side.upper(),
+                        )
                         signed_fok = self.clob_sdk.create_market_order(fok_args)
                     else:
                         # SELL FOK: amount is in shares, not USDC
@@ -953,6 +954,7 @@ class PolymarketCLOBClient:
                             token_id=token_id,
                             amount=round(size_tokens, 2),
                             price=rounded_price,
+                            side=side.upper(),
                         )
                         signed_fok = self.clob_sdk.create_market_order(fok_args)
                     resp = self.clob_sdk.post_order(
