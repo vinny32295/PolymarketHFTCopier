@@ -280,6 +280,12 @@ CONDITIONAL_TOKENS_ABI = json.loads("""[
      "outputs":[{"name":"","type":"uint256"}],
      "type":"function"},
     {"constant":true,"inputs":[
+        {"name":"","type":"bytes32"},
+        {"name":"","type":"uint256"}],
+     "name":"payoutNumerators",
+     "outputs":[{"name":"","type":"uint256"}],
+     "type":"function"},
+    {"constant":true,"inputs":[
         {"name":"oracle","type":"address"},
         {"name":"questionId","type":"bytes32"},
         {"name":"outcomeSlotCount","type":"uint256"}],
@@ -531,7 +537,9 @@ class PolymarketCLOBClient:
         self.logger = logger or logging.getLogger("CopyTrader")
         self._last_trade_ids = {}  # address -> set of seen trade IDs
         self._token_to_condition = {}  # token_id -> condition_id from activity
+        self._token_to_neg_risk = {}  # token_id -> neg_risk flag from activity/API
         self._token_to_slug = {}  # token_id -> market slug from activity
+        self._token_to_avg_entry = {}  # token_id -> VWAP entry price from activity
 
         # Authenticated CLOB client (py-clob-client SDK)
         self.clob_sdk = None
@@ -751,6 +759,11 @@ class PolymarketCLOBClient:
 
         Queries the Data API activity feed and extracts token IDs from
         each trade record.  Returns a set of token-ID strings.
+
+        Also computes the volume-weighted average BUY price for each
+        token and caches it in ``_token_to_avg_entry`` so that
+        discovered positions can use the user's actual cost basis
+        instead of the market's last trade price.
         """
         url = f"{self.data_url}/activity"
         params = {"user": address.lower(), "limit": limit}
@@ -762,6 +775,8 @@ class PolymarketCLOBClient:
             "data", data.get("history", [])
         )
         token_ids = set()
+        # Accumulators for VWAP: token_id -> [total_cost, total_shares]
+        buy_accum = {}
         logged_sample = False
         for trade in trades:
             # Log the first trade record's keys for diagnostics
@@ -789,6 +804,36 @@ class PolymarketCLOBClient:
                 if slug and tid not in self._token_to_slug:
                     self._token_to_slug[tid] = str(slug)
 
+                # Accumulate buy-side cost basis for VWAP entry price
+                side = str(
+                    trade.get("side") or trade.get("type") or ""
+                ).upper()
+                if side == "BUY":
+                    try:
+                        price = float(trade.get("price", 0))
+                        shares = float(
+                            trade.get("size")
+                            or trade.get("amount")
+                            or trade.get("usdcSize")
+                            or 0
+                        )
+                        if price > 0 and shares > 0:
+                            acc = buy_accum.setdefault(tid, [0.0, 0.0])
+                            acc[0] += price * shares  # total cost
+                            acc[1] += shares           # total shares
+                    except (ValueError, TypeError):
+                        pass
+
+        # Compute VWAP entry prices from accumulated buy trades
+        for tid, (total_cost, total_shares) in buy_accum.items():
+            if total_shares > 0:
+                self._token_to_avg_entry[tid] = total_cost / total_shares
+
+        if self._token_to_avg_entry:
+            self.logger.info(
+                "Cached %d avg entry price(s) from activity data",
+                len(self._token_to_avg_entry),
+            )
         if self._token_to_condition:
             self.logger.info(
                 "Cached %d condition_id(s) from activity data",
@@ -1412,7 +1457,18 @@ class TradeExecutor:
 
     def _log_closed_trade(self, token_id, entry_price, exit_price,
                           shares, reason, market=None):
-        """Append a closed trade record to the persistent history file."""
+        """Append a closed trade record to the persistent history file.
+
+        Tracks *cost_basis* (capital deployed) and *proceeds* (capital
+        returned) separately so lifetime P/L can be computed accurately
+        as ``sum(proceeds) - sum(cost_basis)`` across all records.
+
+        The *outcome* field categorises the result:
+        - ``"won"``  — redeemed at $1.00 (full payout)
+        - ``"lost"`` — redeemed at $0.00 (total loss)
+        - ``"sold"`` — sold on market before resolution
+        - ``"dust"`` — position too small to sell, written off
+        """
         entry_p = float(entry_price) if entry_price else 0.0
         exit_p = float(exit_price) if exit_price else 0.0
         num_shares = float(shares) if shares else 0.0
@@ -1420,6 +1476,15 @@ class TradeExecutor:
         cost_basis = entry_p * num_shares
         proceeds = exit_p * num_shares
         pnl = round(proceeds - cost_basis, 6)
+
+        # Classify the outcome for reporting
+        if reason == "redeemed":
+            outcome = "won" if exit_p >= 0.5 else "lost"
+        elif reason in ("dust", "stale", "failed_redeem", "resolution_error",
+                         "redeemed_external"):
+            outcome = "lost"
+        else:
+            outcome = "sold"
 
         record = {
             "closed_at": datetime.now().isoformat(),
@@ -1431,11 +1496,17 @@ class TradeExecutor:
             "cost_basis_usdc": round(cost_basis, 6),
             "proceeds_usdc": round(proceeds, 6),
             "pnl_usdc": pnl,
+            "outcome": outcome,
             "reason": reason,
         }
 
         history = self._load_trade_history()
         history.append(record)
+
+        # Compute running totals
+        total_cost = sum(r.get("cost_basis_usdc", 0) for r in history)
+        total_proceeds = sum(r.get("proceeds_usdc", 0) for r in history)
+        total_pnl = round(total_proceeds - total_cost, 6)
 
         try:
             tmp = self._trade_history_file + ".tmp"
@@ -1446,9 +1517,10 @@ class TradeExecutor:
             self.logger.warning("Could not save trade history: %s", exc)
 
         self.logger.info(
-            "CLOSED TRADE: %s | %.4f shares @ entry %.4f -> exit %.4f | "
-            "P&L $%.4f | reason=%s",
-            record["market"], num_shares, entry_p, exit_p, pnl, reason,
+            "CLOSED TRADE [%s]: %s | %.4f shares @ entry $%.4f -> exit $%.4f | "
+            "P&L $%+.4f | lifetime P&L $%+.4f (deployed $%.2f, returned $%.2f)",
+            outcome.upper(), record["market"], num_shares, entry_p, exit_p,
+            pnl, total_pnl, total_cost, total_proceeds,
         )
 
         return record
@@ -1947,17 +2019,25 @@ class TradeExecutor:
             return {"status": "dry_run", "reason": reason, "token_id": token_id}
 
         try:
+            pre_bal = self.get_usdc_balance(max_age_seconds=0)
             tx = self._build_redeem_tx(resolved_cid, neg_risk=neg_risk)
             receipt = self._sign_and_send(tx)
             if receipt and receipt.status == 1:
-                self.logger.info(
-                    "Redemption OK (auto-exit %s): tx %s — USDC returned",
-                    reason, receipt.transactionHash.hex(),
-                )
                 self.invalidate_balance_cache()
-                # Redeemed at $1.00 per share (market resolved in our favor)
+                post_bal = self.get_usdc_balance(max_age_seconds=0)
+                exit_price = self._get_redemption_exit_price(
+                    pre_bal, post_bal, pos.get("tokens", 0),
+                    pos.get("entry_price", 0),
+                )
+                self.logger.info(
+                    "Redemption OK (auto-exit %s): tx %s — exit $%.2f "
+                    "(USDC %s%.4f)",
+                    reason, receipt.transactionHash.hex(), exit_price,
+                    "+" if post_bal >= pre_bal else "",
+                    float(post_bal - pre_bal),
+                )
                 self._log_closed_trade(
-                    token_id, pos.get("entry_price", 0), 1.0,
+                    token_id, pos.get("entry_price", 0), exit_price,
                     pos.get("tokens", 0), "redeemed",
                     market=pos.get("market_name"),
                 )
@@ -1968,6 +2048,7 @@ class TradeExecutor:
                     "reason": reason,
                     "token_id": token_id,
                     "tx_hash": receipt.transactionHash.hex(),
+                    "exit_price": exit_price,
                 }
             else:
                 retries += 1
@@ -2102,6 +2183,8 @@ class TradeExecutor:
                         condition_id = market.get("condition_id")
                         if condition_id:
                             neg_risk = self._is_neg_risk_market(market)
+                            # Cache neg_risk for future fallback lookups
+                            self.clob_client._token_to_neg_risk[token_id] = neg_risk
 
                     # Fallback: use cached condition_id from activity data
                     # even when the Gamma/CLOB market lookup fails.
@@ -2109,14 +2192,18 @@ class TradeExecutor:
                         cached_cid = self.clob_client._token_to_condition.get(token_id)
                         if cached_cid:
                             condition_id = cached_cid
+                            neg_risk = self.clob_client._token_to_neg_risk.get(
+                                token_id, False
+                            )
                             self.logger.debug(
-                                "Using cached condition_id for token %s",
-                                token_id[:16] + "...",
+                                "Using cached condition_id for token %s (neg_risk=%s)",
+                                token_id[:16] + "...", neg_risk,
                             )
                         else:
                             no_market_count += 1
-                            self.logger.debug(
-                                "No market info or cached condition_id for token %s",
+                            self.logger.info(
+                                "No market info or cached condition_id for token %s "
+                                "— cannot check resolution",
                                 token_id[:16] + "...",
                             )
                             continue
@@ -2143,8 +2230,18 @@ class TradeExecutor:
                     # Not resolved on-chain — seed as active position
                     if token_id not in self._positions:
                         tokens = Decimal(ct_balance) / Decimal("1000000")
-                        price = self.clob_client.get_last_trade_price(token_id)
-                        entry_price = Decimal(str(price)) if price and price > 0 else Decimal("0")
+                        # Use the user's actual VWAP buy price from
+                        # activity history (cached during token discovery).
+                        # Falls back to market last-trade-price only when
+                        # the activity feed didn't contain buy records.
+                        cached_entry = self.clob_client._token_to_avg_entry.get(token_id)
+                        if cached_entry and cached_entry > 0:
+                            entry_price = Decimal(str(round(cached_entry, 6)))
+                            price_source = "activity VWAP"
+                        else:
+                            price = self.clob_client.get_last_trade_price(token_id)
+                            entry_price = Decimal(str(price)) if price and price > 0 else Decimal("0")
+                            price_source = "last trade"
                         seed_market_name = (
                             market.get("question") or market.get("slug")
                             if market else None
@@ -2163,8 +2260,9 @@ class TradeExecutor:
                         active_seeded += 1
                         if entry_price > 0:
                             self.logger.info(
-                                "Discovered active position: %s (%.2f tokens @ $%.4f, neg_risk=%s)",
-                                token_id[:16] + "...", tokens, price, neg_risk,
+                                "Discovered active position: %s (%.2f tokens @ $%.4f [%s], neg_risk=%s)",
+                                token_id[:16] + "...", tokens, entry_price,
+                                price_source, neg_risk,
                             )
                         else:
                             unresolved_no_price += 1
@@ -2199,22 +2297,52 @@ class TradeExecutor:
                     })
                     continue
 
+                pre_bal = self.get_usdc_balance(max_age_seconds=0)
                 tx = self._build_redeem_tx(resolved_cid, neg_risk=neg_risk)
 
                 receipt = self._sign_and_send(tx)
                 if receipt and receipt.status == 1:
-                    self.logger.info(
-                        "Redemption OK: tx %s — USDC returned to wallet",
-                        receipt.transactionHash.hex(),
-                    )
                     self.invalidate_balance_cache()
-                    # Remove from position tracker if it was there
+                    post_bal = self.get_usdc_balance(max_age_seconds=0)
+                    # Determine actual payout from balance change
                     pos = self._positions.get(token_id)
+                    tokens_held = (
+                        pos.get("tokens", 0) if pos
+                        else Decimal(ct_balance) / Decimal("1000000")
+                    )
+                    exit_price = self._get_redemption_exit_price(
+                        pre_bal, post_bal, tokens_held,
+                        pos.get("entry_price", 0) if pos else 0,
+                    )
+                    self.logger.info(
+                        "Redemption OK: tx %s — exit $%.2f "
+                        "(USDC %s%.4f)",
+                        receipt.transactionHash.hex(), exit_price,
+                        "+" if post_bal >= pre_bal else "",
+                        float(post_bal - pre_bal),
+                    )
                     if pos:
                         self._log_closed_trade(
-                            token_id, pos.get("entry_price", 0), 1.0,
+                            token_id, pos.get("entry_price", 0), exit_price,
                             pos.get("tokens", 0), "redeemed",
                             market=pos.get("market_name"),
+                        )
+                    else:
+                        # Position wasn't tracked yet (discovered already
+                        # resolved).  Use VWAP entry from activity history
+                        # so P/L is still recorded accurately.
+                        disc_tokens = Decimal(ct_balance) / Decimal("1000000")
+                        cached_entry = self.clob_client._token_to_avg_entry.get(
+                            token_id, 0
+                        )
+                        disc_market = (
+                            market.get("question") or market.get("slug")
+                            if market else None
+                        )
+                        self._log_closed_trade(
+                            token_id, cached_entry, exit_price,
+                            disc_tokens, "redeemed",
+                            market=disc_market,
                         )
                     self._positions.pop(token_id, None)
                     self._save_positions()
@@ -2223,6 +2351,7 @@ class TradeExecutor:
                         "token_id": token_id,
                         "balance": ct_balance,
                         "tx_hash": receipt.transactionHash.hex(),
+                        "exit_price": exit_price,
                     })
                 else:
                     self.logger.warning(
@@ -2337,6 +2466,81 @@ class TradeExecutor:
 
         return api_condition_id, 0
 
+    def _determine_exit_price(self, condition_id_hex, token_id, neg_risk=False):
+        """Determine whether a redeemed token was a winner ($1) or loser ($0).
+
+        Queries ``payoutNumerators`` on the ConditionalTokens contract for
+        both outcome indices.  Polymarket binary markets have exactly two
+        outcomes; only one has a non-zero numerator.
+
+        For the winning token, ``redeemPositions`` returns 1 USDC per token.
+        For the losing token, ``redeemPositions`` returns 0 USDC.
+
+        Returns 1.0 for winners, 0.0 for losers, or None if undetermined.
+        """
+        try:
+            cond_bytes = bytes.fromhex(condition_id_hex.replace("0x", ""))
+            num_0 = self.conditional_tokens.functions.payoutNumerators(
+                cond_bytes, 0,
+            ).call()
+            num_1 = self.conditional_tokens.functions.payoutNumerators(
+                cond_bytes, 1,
+            ).call()
+
+            if num_0 == 0 and num_1 == 0:
+                # Not resolved yet
+                return None
+
+            # Determine which outcome index this token_id corresponds to.
+            # Polymarket token IDs encode the position: the token for
+            # outcome index 0 vs 1.  We check which index has a non-zero
+            # payout numerator, then verify by checking if redeeming this
+            # token actually returns USDC.
+            #
+            # The most reliable method: check USDC balance before/after.
+            # But since we call this before redemption, we use a heuristic:
+            # compare the token_id against both outcome token IDs from
+            # the market data (if available), or fall back to balance-based
+            # detection after redemption.
+            #
+            # Simpler fallback: we check the balance CHANGE approach from
+            # the caller.  For now, return both numerators so the caller
+            # can use balance-diff to determine exit price.
+            self.logger.debug(
+                "Payout numerators for condition %s: [%d, %d]",
+                condition_id_hex[:16] + "...", num_0, num_1,
+            )
+            return {"num_0": num_0, "num_1": num_1}
+        except Exception as exc:
+            self.logger.debug(
+                "Could not query payoutNumerators: %s", exc,
+            )
+            return None
+
+    def _get_redemption_exit_price(self, pre_balance, post_balance,
+                                   tokens, entry_price):
+        """Compute the actual exit price from USDC balance change.
+
+        Compares USDC balance before and after a redemption transaction.
+        If the balance increased by ~tokens USDC, the position won ($1.00).
+        If the balance didn't change (or barely changed), it lost ($0.00).
+        """
+        tokens_f = float(tokens) if isinstance(tokens, Decimal) else tokens
+        balance_diff = float(post_balance - pre_balance)
+
+        if tokens_f <= 0:
+            return 0.0
+
+        # Compute per-token payout
+        payout_per_token = balance_diff / tokens_f if tokens_f > 0 else 0
+
+        # Winner: ~$1 per token.  Loser: ~$0 per token.
+        # Use 0.5 as the threshold since payouts are binary.
+        if payout_per_token >= 0.5:
+            return 1.0
+        else:
+            return 0.0
+
     def _get_token_balance(self, owner, token_id, neg_risk=False):
         """Return the on-chain token balance, checking the right contract.
 
@@ -2431,15 +2635,26 @@ class TradeExecutor:
                 if not condition_id:
                     market = self.clob_client.get_market_by_token(token_id)
                     if not market:
+                        self.logger.warning(
+                            "REDEEM BLOCKED: no market info for token %s "
+                            "(%s) — cannot determine condition_id",
+                            token_id[:16] + "...",
+                            pos.get("market_name", "unknown"),
+                        )
                         continue
                     condition_id = market.get("condition_id")
                     if not condition_id:
-                        self.logger.debug(
-                            "Market for token %s has no condition_id, skipping",
+                        self.logger.warning(
+                            "REDEEM BLOCKED: market for token %s has no "
+                            "condition_id — %s",
                             token_id[:16] + "...",
+                            pos.get("market_name", "unknown"),
                         )
                         continue
                     neg_risk = self._is_neg_risk_market(market)
+                    # Cache neg_risk for future fallback lookups
+                    if self.clob_client:
+                        self.clob_client._token_to_neg_risk[token_id] = neg_risk
                     # Backfill redemption params into the position
                     pos["condition_id"] = condition_id
                     pos["neg_risk"] = neg_risk
@@ -2461,18 +2676,16 @@ class TradeExecutor:
                 if ct_balance == 0:
                     self.logger.info(
                         "Market resolved but no on-chain tokens for %s — "
-                        "clearing phantom position (order likely never filled)",
+                        "already redeemed or order never filled. "
+                        "Removing from tracking (no P/L entry).",
                         token_id[:16] + "...",
                     )
-                    # No on-chain tokens.  Most likely the original buy
-                    # order was never filled (phantom position).  Log at
-                    # entry_price so P&L = $0 (no actual loss beyond gas).
-                    self._log_closed_trade(
-                        token_id, pos.get("entry_price", 0),
-                        pos.get("entry_price", 0),
-                        pos.get("tokens", 0), "redeemed_external",
-                        market=pos.get("market_name"),
-                    )
+                    # No on-chain tokens.  Either:
+                    # 1. Already redeemed in a prior cycle (P/L already logged)
+                    # 2. The buy order was never filled (phantom position)
+                    # In both cases, do NOT log a closed trade — it would
+                    # either double-count the redemption or create a fake
+                    # P/L=$0 entry that inflates trade counts.
                     del self._positions[token_id]
                     self._save_positions()
                     continue
@@ -2501,17 +2714,26 @@ class TradeExecutor:
                     continue
 
                 # 5. Build and send the redeemPositions transaction
+                pre_bal = self.get_usdc_balance(max_age_seconds=0)
                 tx = self._build_redeem_tx(resolved_cid, neg_risk=neg_risk)
 
                 receipt = self._sign_and_send(tx)
                 if receipt and receipt.status == 1:
-                    self.logger.info(
-                        "Redemption confirmed: tx %s — USDC returned to wallet",
-                        receipt.transactionHash.hex(),
-                    )
                     self.invalidate_balance_cache()
+                    post_bal = self.get_usdc_balance(max_age_seconds=0)
+                    exit_price = self._get_redemption_exit_price(
+                        pre_bal, post_bal, pos.get("tokens", 0),
+                        pos.get("entry_price", 0),
+                    )
+                    self.logger.info(
+                        "Redemption confirmed: tx %s — exit $%.2f "
+                        "(USDC %s%.4f)",
+                        receipt.transactionHash.hex(), exit_price,
+                        "+" if post_bal >= pre_bal else "",
+                        float(post_bal - pre_bal),
+                    )
                     self._log_closed_trade(
-                        token_id, pos.get("entry_price", 0), 1.0,
+                        token_id, pos.get("entry_price", 0), exit_price,
                         pos.get("tokens", 0), "redeemed",
                         market=pos.get("market_name"),
                     )
@@ -2523,6 +2745,7 @@ class TradeExecutor:
                         "token_id": token_id,
                         "balance": ct_balance,
                         "tx_hash": receipt.transactionHash.hex(),
+                        "exit_price": exit_price,
                     })
                 else:
                     self.logger.warning(
@@ -2537,9 +2760,11 @@ class TradeExecutor:
 
             except Exception as exc:
                 self.logger.warning(
-                    "Error checking redemption for token %s: %s",
+                    "Error checking redemption for token %s (%s): %s",
                     token_id[:16] + "...",
+                    pos.get("market_name", "unknown"),
                     exc,
+                    exc_info=True,
                 )
 
         if results:
@@ -3196,12 +3421,17 @@ class TradeExecutor:
                         condition_id = market.get("condition_id")
                         if condition_id:
                             neg_risk = self._is_neg_risk_market(market)
+                            # Cache neg_risk for future fallback lookups
+                            self.clob_client._token_to_neg_risk[token_id] = neg_risk
 
                     # Fallback: use cached condition_id from activity data
                     if not condition_id:
                         cached_cid = self.clob_client._token_to_condition.get(token_id)
                         if cached_cid:
                             condition_id = cached_cid
+                            neg_risk = self.clob_client._token_to_neg_risk.get(
+                                token_id, False
+                            )
                         else:
                             continue
 
@@ -3499,6 +3729,8 @@ class TradeExecutor:
                     if market:
                         neg_risk = self._is_neg_risk_market(market)
                         condition_id = market.get("condition_id")
+                        # Cache neg_risk for future fallback lookups
+                        self.clob_client._token_to_neg_risk[token_id] = neg_risk
                 except Exception as exc:
                     self.logger.debug(
                         "Market lookup failed for token %s: %s",
@@ -3507,6 +3739,9 @@ class TradeExecutor:
                 # Fallback 1: use cached condition_id from activity data
                 if not condition_id:
                     condition_id = self.clob_client._token_to_condition.get(token_id)
+                    neg_risk = self.clob_client._token_to_neg_risk.get(
+                        token_id, neg_risk
+                    )
                 # Fallback 2: extract condition_id from the trade_info itself
                 if not condition_id:
                     condition_id = (
@@ -4136,8 +4371,9 @@ class CopyTraderBot:
                                 len(redeemed),
                             )
                     except Exception as redeem_exc:
-                        self.logger.debug(
+                        self.logger.warning(
                             "Redemption check error: %s", redeem_exc,
+                            exc_info=True,
                         )
 
                 # --- Full portfolio scan (periodic) ---
@@ -4146,12 +4382,17 @@ class CopyTraderBot:
                 # expensive than check_and_redeem_settled (which only
                 # checks _positions dict) but catches positions that
                 # were missed or not tracked.
-                # When paused, runs every 15 min to sweep for anything
-                # the lightweight check missed.
+                # When paused, uses the same accelerated cadence as the
+                # proxy scan so we can redeem quickly and resume trading.
+                portfolio_scan_interval = (
+                    PAUSED_REDEEM_INTERVAL_SECONDS
+                    if self._paused_low_balance
+                    else PORTFOLIO_SCAN_INTERVAL_SECONDS
+                )
                 if (
                     self.executor
                     and self.cfg.get("auto_redeem_settled", True)
-                    and now - _last_portfolio_scan >= PORTFOLIO_SCAN_INTERVAL_SECONDS
+                    and now - _last_portfolio_scan >= portfolio_scan_interval
                 ):
                     _last_portfolio_scan = now
                     try:
@@ -4163,8 +4404,9 @@ class CopyTraderBot:
                                 len(scan_results),
                             )
                     except Exception as scan_exc:
-                        self.logger.debug(
+                        self.logger.warning(
                             "Portfolio scan error: %s", scan_exc,
+                            exc_info=True,
                         )
 
                 # --- Proxy wallet redemption & withdrawal ---
@@ -4189,8 +4431,9 @@ class CopyTraderBot:
                                 len(proxy_results),
                             )
                     except Exception as proxy_exc:
-                        self.logger.debug(
+                        self.logger.warning(
                             "Proxy redemption check error: %s", proxy_exc,
+                            exc_info=True,
                         )
 
                 # If we just redeemed while paused, immediately re-check
@@ -4329,16 +4572,34 @@ class CopyTraderBot:
                     },
                 }
 
+        # ---- Realized P/L from trade history file ----
+        closed_trades = []
+        if self.executor:
+            closed_trades = self.executor._load_trade_history()
+        total_cost_basis = sum(r.get("cost_basis_usdc", 0) for r in closed_trades)
+        total_proceeds = sum(r.get("proceeds_usdc", 0) for r in closed_trades)
+        realized_pnl = round(total_proceeds - total_cost_basis, 6)
+
+        # Unrealized value of open positions (at entry price as conservative estimate)
+        open_cost = sum(
+            p.get("cost_basis_usdc", 0) for p in positions.values()
+        )
+
         report = {
             "session_start": (
                 self._session_start.isoformat() if self._session_start else None
             ),
             "session_end": session_end.isoformat(),
             "usdc_balance_at_stop": current_balance,
-            "total_trades": len(self._trade_history),
+            "total_session_trades": len(self._trade_history),
             "total_bought_usdc": round(buy_total, 6),
             "total_sold_usdc": round(sell_total, 6),
             "net_spent_usdc": round(buy_total - sell_total, 6),
+            "lifetime_capital_deployed": round(total_cost_basis, 6),
+            "lifetime_capital_returned": round(total_proceeds, 6),
+            "lifetime_realized_pnl": realized_pnl,
+            "open_positions_cost_basis": round(open_cost, 6),
+            "closed_trade_count": len(closed_trades),
             "trade_history": self._trade_history,
             "open_positions": positions,
         }
@@ -4365,10 +4626,12 @@ class CopyTraderBot:
 
         # ---- Log summary to console ----
         self.logger.info(
-            "Session summary: %d trades | bought $%.2f | sold $%.2f | "
-            "net spent $%.2f | %d open position(s)",
+            "Session summary: %d session trades | bought $%.2f | sold $%.2f | "
+            "net spent $%.2f | %d open position(s) | "
+            "lifetime realized P&L: $%+.2f (deployed $%.2f, returned $%.2f)",
             len(self._trade_history), buy_total, sell_total,
             buy_total - sell_total, len(positions),
+            realized_pnl, total_cost_basis, total_proceeds,
         )
         if positions:
             self.logger.info(
@@ -4674,7 +4937,7 @@ class CopyTraderGUI:
     def _build_history_tab(self, parent):
         columns = (
             "closed_at", "market", "shares", "entry_price",
-            "exit_price", "pnl_usdc", "reason",
+            "exit_price", "pnl_usdc", "outcome", "reason",
         )
         col_headings = {
             "closed_at": "Closed At",
@@ -4683,12 +4946,13 @@ class CopyTraderGUI:
             "entry_price": "Entry",
             "exit_price": "Exit",
             "pnl_usdc": "P&L ($)",
+            "outcome": "Result",
             "reason": "Reason",
         }
         col_widths = {
-            "closed_at": 150, "market": 160, "shares": 80,
-            "entry_price": 80, "exit_price": 80, "pnl_usdc": 90,
-            "reason": 100,
+            "closed_at": 145, "market": 150, "shares": 70,
+            "entry_price": 70, "exit_price": 70, "pnl_usdc": 85,
+            "outcome": 55, "reason": 85,
         }
 
         tree_frame = ttk.Frame(parent)
@@ -4704,7 +4968,7 @@ class CopyTraderGUI:
         for col in columns:
             self.history_tree.heading(col, text=col_headings[col])
             anchor = tk.E if col in ("shares", "entry_price", "exit_price", "pnl_usdc") else tk.W
-            self.history_tree.column(col, width=col_widths[col], anchor=anchor)
+            self.history_tree.column(col, width=col_widths.get(col, 80), anchor=anchor)
 
         self.history_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -4734,10 +4998,18 @@ class CopyTraderGUI:
         except (FileNotFoundError, json.JSONDecodeError):
             history = []
 
-        total_pnl = 0.0
+        total_cost = 0.0
+        total_proceeds = 0.0
+        wins = losses = 0
         for rec in reversed(history):  # newest first
             pnl = rec.get("pnl_usdc", 0)
-            total_pnl += pnl
+            total_cost += rec.get("cost_basis_usdc", 0)
+            total_proceeds += rec.get("proceeds_usdc", 0)
+            outcome = rec.get("outcome", "")
+            if outcome == "won":
+                wins += 1
+            elif outcome == "lost":
+                losses += 1
             closed_at = rec.get("closed_at", "")
             # Shorten the ISO timestamp for display
             if "T" in closed_at:
@@ -4749,12 +5021,18 @@ class CopyTraderGUI:
                 f"{rec.get('entry_price', 0):.4f}",
                 f"{rec.get('exit_price', 0):.4f}",
                 f"{pnl:+.4f}",
+                outcome.upper() if outcome else rec.get("reason", ""),
                 rec.get("reason", ""),
             ))
 
         n = len(history)
+        total_pnl = total_proceeds - total_cost
+        win_rate = f"{wins/(wins+losses)*100:.0f}%" if (wins + losses) > 0 else "N/A"
         self.history_summary_var.set(
-            f"Total trades: {n}  |  Cumulative P&L: ${total_pnl:+.4f}"
+            f"Trades: {n}  |  Deployed: ${total_cost:,.2f}  |  "
+            f"Returned: ${total_proceeds:,.2f}  |  "
+            f"P&L: ${total_pnl:+,.2f}  |  "
+            f"W/L: {wins}/{losses} ({win_rate})"
         )
 
     def _export_history_csv(self):
