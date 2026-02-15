@@ -537,6 +537,7 @@ class PolymarketCLOBClient:
         self.logger = logger or logging.getLogger("CopyTrader")
         self._last_trade_ids = {}  # address -> set of seen trade IDs
         self._token_to_condition = {}  # token_id -> condition_id from activity
+        self._token_to_neg_risk = {}  # token_id -> neg_risk flag from activity/API
         self._token_to_slug = {}  # token_id -> market slug from activity
 
         # Authenticated CLOB client (py-clob-client SDK)
@@ -2144,6 +2145,8 @@ class TradeExecutor:
                         condition_id = market.get("condition_id")
                         if condition_id:
                             neg_risk = self._is_neg_risk_market(market)
+                            # Cache neg_risk for future fallback lookups
+                            self.clob_client._token_to_neg_risk[token_id] = neg_risk
 
                     # Fallback: use cached condition_id from activity data
                     # even when the Gamma/CLOB market lookup fails.
@@ -2151,9 +2154,12 @@ class TradeExecutor:
                         cached_cid = self.clob_client._token_to_condition.get(token_id)
                         if cached_cid:
                             condition_id = cached_cid
+                            neg_risk = self.clob_client._token_to_neg_risk.get(
+                                token_id, False
+                            )
                             self.logger.debug(
-                                "Using cached condition_id for token %s",
-                                token_id[:16] + "...",
+                                "Using cached condition_id for token %s (neg_risk=%s)",
+                                token_id[:16] + "...", neg_risk,
                             )
                         else:
                             no_market_count += 1
@@ -2580,6 +2586,9 @@ class TradeExecutor:
                         )
                         continue
                     neg_risk = self._is_neg_risk_market(market)
+                    # Cache neg_risk for future fallback lookups
+                    if self.clob_client:
+                        self.clob_client._token_to_neg_risk[token_id] = neg_risk
                     # Backfill redemption params into the position
                     pos["condition_id"] = condition_id
                     pos["neg_risk"] = neg_risk
@@ -3346,12 +3355,17 @@ class TradeExecutor:
                         condition_id = market.get("condition_id")
                         if condition_id:
                             neg_risk = self._is_neg_risk_market(market)
+                            # Cache neg_risk for future fallback lookups
+                            self.clob_client._token_to_neg_risk[token_id] = neg_risk
 
                     # Fallback: use cached condition_id from activity data
                     if not condition_id:
                         cached_cid = self.clob_client._token_to_condition.get(token_id)
                         if cached_cid:
                             condition_id = cached_cid
+                            neg_risk = self.clob_client._token_to_neg_risk.get(
+                                token_id, False
+                            )
                         else:
                             continue
 
@@ -3649,6 +3663,8 @@ class TradeExecutor:
                     if market:
                         neg_risk = self._is_neg_risk_market(market)
                         condition_id = market.get("condition_id")
+                        # Cache neg_risk for future fallback lookups
+                        self.clob_client._token_to_neg_risk[token_id] = neg_risk
                 except Exception as exc:
                     self.logger.debug(
                         "Market lookup failed for token %s: %s",
@@ -3657,6 +3673,9 @@ class TradeExecutor:
                 # Fallback 1: use cached condition_id from activity data
                 if not condition_id:
                     condition_id = self.clob_client._token_to_condition.get(token_id)
+                    neg_risk = self.clob_client._token_to_neg_risk.get(
+                        token_id, neg_risk
+                    )
                 # Fallback 2: extract condition_id from the trade_info itself
                 if not condition_id:
                     condition_id = (
@@ -4297,12 +4316,17 @@ class CopyTraderBot:
                 # expensive than check_and_redeem_settled (which only
                 # checks _positions dict) but catches positions that
                 # were missed or not tracked.
-                # When paused, runs every 15 min to sweep for anything
-                # the lightweight check missed.
+                # When paused, uses the same accelerated cadence as the
+                # proxy scan so we can redeem quickly and resume trading.
+                portfolio_scan_interval = (
+                    PAUSED_REDEEM_INTERVAL_SECONDS
+                    if self._paused_low_balance
+                    else PORTFOLIO_SCAN_INTERVAL_SECONDS
+                )
                 if (
                     self.executor
                     and self.cfg.get("auto_redeem_settled", True)
-                    and now - _last_portfolio_scan >= PORTFOLIO_SCAN_INTERVAL_SECONDS
+                    and now - _last_portfolio_scan >= portfolio_scan_interval
                 ):
                     _last_portfolio_scan = now
                     try:
@@ -4314,8 +4338,9 @@ class CopyTraderBot:
                                 len(scan_results),
                             )
                     except Exception as scan_exc:
-                        self.logger.debug(
+                        self.logger.warning(
                             "Portfolio scan error: %s", scan_exc,
+                            exc_info=True,
                         )
 
                 # --- Proxy wallet redemption & withdrawal ---
@@ -4340,8 +4365,9 @@ class CopyTraderBot:
                                 len(proxy_results),
                             )
                     except Exception as proxy_exc:
-                        self.logger.debug(
+                        self.logger.warning(
                             "Proxy redemption check error: %s", proxy_exc,
+                            exc_info=True,
                         )
 
                 # If we just redeemed while paused, immediately re-check
