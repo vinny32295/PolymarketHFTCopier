@@ -375,6 +375,8 @@ DEFAULT_CONFIG = {
     "proxy_redeem": True,
     "proxy_withdraw": True,
     "proxy_address": "",
+    "webhook_url": "",
+    "max_price_deviation_pct": 5,
 }
 
 
@@ -469,6 +471,38 @@ def _encode_abi(contract, fn_name, args):
         return contract.encode_abi(abi_element_identifier=fn_name, args=args)
     # web3.py v6 (legacy)
     return contract.encodeABI(fn_name=fn_name, args=args)
+
+
+# ---------------------------------------------------------------------------
+# Webhook notifications (Discord / Slack / generic)
+# ---------------------------------------------------------------------------
+
+def send_webhook(url, message, logger=None):
+    """Fire-and-forget a webhook notification.
+
+    Supports Discord and Slack webhook URLs natively (sends the appropriate
+    JSON payload).  For other URLs, sends ``{"text": message}``.
+
+    Runs in a daemon thread so it never blocks the bot loop.
+    """
+    if not url or not requests:
+        return
+
+    def _post():
+        try:
+            if "discord" in url:
+                payload = {"content": message[:2000]}
+            else:
+                # Slack and generic webhooks
+                payload = {"text": message[:4000]}
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.status_code >= 400 and logger:
+                logger.debug("Webhook returned %d: %s", resp.status_code, resp.text[:200])
+        except Exception as exc:
+            if logger:
+                logger.debug("Webhook failed: %s", exc)
+
+    threading.Thread(target=_post, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -1169,6 +1203,9 @@ class TradeExecutor:
         self._open_orders = {}
         self._order_ttl = cfg.get("order_ttl_seconds", 300)
 
+        # Optional webhook callback (set by CopyTraderBot after init)
+        self.notify_callback = None
+
         # Cached proxy wallet address (discovered once, reused)
         self._proxy_address = None
         self._proxy_discovery_done = False
@@ -1385,6 +1422,55 @@ class TradeExecutor:
             "usdc": usdc_amount,
         }
 
+    def _rollback_position(self, order_id, info, reason):
+        """Reverse the optimistic position update for an unfilled order.
+
+        When an order is submitted, the bot immediately updates _positions
+        with the expected tokens.  If the order is later cancelled, expired,
+        or stale-cancelled, we must undo that to avoid phantom positions
+        that have no on-chain backing.
+        """
+        token_id = info["token_id"]
+        price = info["price"]
+        side = info["side"]
+
+        if not price or price <= 0:
+            return
+
+        tokens = Decimal(str(info["usdc"])) / Decimal(str(price))
+        pos = self._positions.get(token_id)
+        if pos is None:
+            return
+
+        if side == "BUY":
+            old_tokens = pos["tokens"]
+            pos["tokens"] = max(pos["tokens"] - tokens, Decimal("0"))
+            if pos["tokens"] <= 0:
+                self.logger.info(
+                    "Rolled back phantom position %s (unfilled BUY %s, "
+                    "%.2f tokens removed entirely)",
+                    token_id[:16] + "...", reason, old_tokens,
+                )
+                del self._positions[token_id]
+            else:
+                self.logger.info(
+                    "Rolled back %.2f tokens from %s (unfilled BUY %s, "
+                    "%.2f tokens remain)",
+                    tokens, token_id[:16] + "...", reason,
+                    pos["tokens"],
+                )
+        elif side == "SELL":
+            # Sell was cancelled — restore the tokens we pre-subtracted
+            pos["tokens"] += tokens
+            self.logger.info(
+                "Restored %.2f tokens to %s (unfilled SELL %s, "
+                "%.2f tokens now)",
+                tokens, token_id[:16] + "...", reason,
+                pos["tokens"],
+            )
+
+        self._save_positions()
+
     def monitor_open_orders(self):
         """Check tracked orders, log fills, and cancel stale ones.
 
@@ -1433,6 +1519,7 @@ class TradeExecutor:
                     info["usdc"],
                     info["price"],
                 )
+                self._rollback_position(order_id, info, status.lower())
                 to_remove.append(order_id)
 
             elif now - info["placed_at"] > self._order_ttl:
@@ -1448,6 +1535,7 @@ class TradeExecutor:
                     info["price"],
                 )
                 self.clob_client.cancel_order(order_id)
+                self._rollback_position(order_id, info, "stale-cancelled")
                 self.invalidate_balance_cache()
                 cancelled += 1
                 to_remove.append(order_id)
@@ -1520,6 +1608,7 @@ class TradeExecutor:
                 continue
 
             sell_usdc = float(tokens * current_price_d)
+            market_label = pos.get("market_name") or (token_id[:16] + "...")
             self.logger.warning(
                 "AUTO-EXIT (%s): selling %.2f tokens of %s "
                 "(entry=%.4f, current=%.4f, value=$%.2f)",
@@ -1530,6 +1619,13 @@ class TradeExecutor:
                 current_price_d,
                 sell_usdc,
             )
+            if self.notify_callback:
+                self.notify_callback(
+                    "AUTO-EXIT %s: SELL $%.2f — %s (entry %.4f -> %.4f)" % (
+                        reason.upper(), sell_usdc, market_label,
+                        entry_price, current_price_d,
+                    )
+                )
 
             if self.cfg.get("dry_run", False):
                 self.logger.info(
@@ -1578,6 +1674,7 @@ class TradeExecutor:
                 self._log_closed_trade(
                     token_id, entry_price, current_price_d,
                     tokens, reason,
+                    market=pos.get("market_name"),
                 )
                 # Clear the position
                 del self._positions[token_id]
@@ -1622,6 +1719,7 @@ class TradeExecutor:
                     self._log_closed_trade(
                         token_id, entry_price, current_price_d,
                         tokens, "dust",
+                        market=pos.get("market_name"),
                     )
                     del self._positions[token_id]
                     self._save_positions()
@@ -1680,6 +1778,7 @@ class TradeExecutor:
                 self._log_closed_trade(
                     token_id, pos.get("entry_price", 0), 0,
                     pos.get("tokens", 0), "stale",
+                    market=pos.get("market_name"),
                 )
                 self._positions.pop(token_id, None)
                 self._save_positions()
@@ -1710,6 +1809,7 @@ class TradeExecutor:
                 self._log_closed_trade(
                     token_id, pos.get("entry_price", 0), 0,
                     pos.get("tokens", 0), "resolution_error",
+                    market=pos.get("market_name"),
                 )
                 self._positions.pop(token_id, None)
                 self._save_positions()
@@ -1762,6 +1862,7 @@ class TradeExecutor:
                 self._log_closed_trade(
                     token_id, pos.get("entry_price", 0), 1.0,
                     pos.get("tokens", 0), "redeemed",
+                    market=pos.get("market_name"),
                 )
                 self._positions.pop(token_id, None)
                 self._save_positions()
@@ -1783,6 +1884,7 @@ class TradeExecutor:
                     self._log_closed_trade(
                         token_id, pos.get("entry_price", 0), 0,
                         pos.get("tokens", 0), "failed_redeem",
+                        market=pos.get("market_name"),
                     )
                     self._positions.pop(token_id, None)
                 else:
@@ -1946,6 +2048,10 @@ class TradeExecutor:
                         tokens = Decimal(ct_balance) / Decimal("1000000")
                         price = self.clob_client.get_last_trade_price(token_id)
                         entry_price = Decimal(str(price)) if price and price > 0 else Decimal("0")
+                        seed_market_name = (
+                            market.get("question") or market.get("slug")
+                            if market else None
+                        )
                         self._positions[token_id] = {
                             "tokens": tokens,
                             "entry_price": entry_price,
@@ -1954,6 +2060,7 @@ class TradeExecutor:
                             "collateral_token": USDC_ADDRESS,
                             "parent_collection_id": "0x" + "00" * 32,
                             "index_sets": [1, 2],
+                            "market_name": seed_market_name,
                         }
                         self._save_positions()
                         active_seeded += 1
@@ -2010,6 +2117,7 @@ class TradeExecutor:
                         self._log_closed_trade(
                             token_id, pos.get("entry_price", 0), 1.0,
                             pos.get("tokens", 0), "redeemed",
+                            market=pos.get("market_name"),
                         )
                     self._positions.pop(token_id, None)
                     self._save_positions()
@@ -2256,15 +2364,17 @@ class TradeExecutor:
                 if ct_balance == 0:
                     self.logger.info(
                         "Market resolved but no on-chain tokens for %s — "
-                        "clearing stale position (likely redeemed externally)",
+                        "clearing phantom position (order likely never filled)",
                         token_id[:16] + "...",
                     )
-                    # Tokens already gone — likely redeemed via Polymarket
-                    # UI.  Log at entry_price (unknown actual exit).
+                    # No on-chain tokens.  Most likely the original buy
+                    # order was never filled (phantom position).  Log at
+                    # entry_price so P&L = $0 (no actual loss beyond gas).
                     self._log_closed_trade(
                         token_id, pos.get("entry_price", 0),
                         pos.get("entry_price", 0),
                         pos.get("tokens", 0), "redeemed_external",
+                        market=pos.get("market_name"),
                     )
                     del self._positions[token_id]
                     self._save_positions()
@@ -2306,6 +2416,7 @@ class TradeExecutor:
                     self._log_closed_trade(
                         token_id, pos.get("entry_price", 0), 1.0,
                         pos.get("tokens", 0), "redeemed",
+                        market=pos.get("market_name"),
                     )
                     del self._positions[token_id]
                     self._save_positions()
@@ -3421,6 +3532,66 @@ class TradeExecutor:
                     adjusted_price = float(Decimal(str(price)) * (Decimal("1") - slippage_mult))
                     adjusted_price = max(adjusted_price, 0.01)
 
+                # --- Stale price protection ---
+                # Fetch the current mid-price from the orderbook and compare
+                # to the whale's trade price.  If the market has moved more
+                # than max_price_deviation_pct, skip the trade to avoid
+                # executing at a stale/outdated price.
+                max_dev_pct = self.cfg.get("max_price_deviation_pct", 5)
+                if max_dev_pct > 0:
+                    try:
+                        book = self.clob_client.get_order_book(token_id)
+                        if book:
+                            bids = book.get("bids") or []
+                            asks = book.get("asks") or []
+                            best_bid = float(bids[0].get("price", 0)) if bids else 0
+                            best_ask = float(asks[0].get("price", 0)) if asks else 0
+                            if best_bid > 0 and best_ask > 0:
+                                mid_price = (best_bid + best_ask) / 2.0
+                                whale_price = float(price)
+                                if whale_price > 0:
+                                    deviation = abs(mid_price - whale_price) / whale_price * 100
+                                    if deviation > max_dev_pct:
+                                        self.logger.warning(
+                                            "STALE PRICE: whale traded at %.4f but "
+                                            "current mid=%.4f (%.1f%% deviation > %d%% "
+                                            "max) — skipping %s",
+                                            whale_price, mid_price, deviation,
+                                            max_dev_pct, token_id[:16] + "...",
+                                        )
+                                        return {
+                                            "status": "skipped_stale_price",
+                                            "side": side,
+                                            "amount_usdc": float(copy_amount),
+                                            "token_id": token_id,
+                                            "price": float(price),
+                                            "mid_price": mid_price,
+                                            "deviation_pct": round(deviation, 2),
+                                        }
+                                    # Use mid-price for the order instead of
+                                    # whale's potentially stale price.
+                                    if side == "BUY":
+                                        adjusted_price = min(
+                                            float(Decimal(str(mid_price)) * (Decimal("1") + slippage_mult)),
+                                            0.99,
+                                        )
+                                    else:
+                                        adjusted_price = max(
+                                            float(Decimal(str(mid_price)) * (Decimal("1") - slippage_mult)),
+                                            0.01,
+                                        )
+                                    self.logger.info(
+                                        "Price adjusted: whale=%.4f, mid=%.4f, "
+                                        "order=%.4f (deviation=%.1f%%)",
+                                        whale_price, mid_price, adjusted_price,
+                                        deviation,
+                                    )
+                    except Exception as book_exc:
+                        self.logger.debug(
+                            "Orderbook fetch failed (proceeding with whale price): %s",
+                            book_exc,
+                        )
+
                 result = self.clob_client.place_order(
                     token_id=token_id,
                     side=side,
@@ -3437,12 +3608,17 @@ class TradeExecutor:
                         if adjusted_price > 0
                         else Decimal("0")
                     )
+                    market_name = (
+                        market.get("question") or market.get("slug")
+                        if market else None
+                    )
                     redeem_params = {
                         "neg_risk": neg_risk,
                         "condition_id": condition_id,
                         "collateral_token": USDC_ADDRESS,
                         "parent_collection_id": "0x" + "00" * 32,
                         "index_sets": [1, 2],
+                        "market_name": market_name,
                     }
                     if side == "BUY":
                         pos = self._positions.get(token_id)
@@ -3477,6 +3653,7 @@ class TradeExecutor:
                                     token_id, pos.get("entry_price", 0),
                                     adjusted_price, sold_tokens,
                                     "copied_sell",
+                                    market=pos.get("market_name"),
                                 )
                                 del self._positions[token_id]
 
@@ -3578,6 +3755,11 @@ class CopyTraderBot:
         self.executor = None
         self.clob_client = None
 
+    def _notify(self, message):
+        """Send a webhook notification if configured."""
+        url = self.cfg.get("webhook_url", "")
+        send_webhook(url, message, logger=self.logger)
+
     def _init_web3(self):
         """Initialize Web3 provider from config."""
         if Web3 is None:
@@ -3626,6 +3808,7 @@ class CopyTraderBot:
                 clob_client=self.clob_client,
                 logger=self.logger,
             )
+            self.executor.notify_callback = self._notify
             self.logger.info("Executor initialized – wallet: %s", self.executor.address)
         except Exception as exc:
             self.logger.error("Failed to initialize executor: %s", exc)
@@ -3677,10 +3860,13 @@ class CopyTraderBot:
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         self.logger.info("Bot started")
+        self._notify("Bot started — monitoring %d address(es)" % len(
+            self.cfg.get("watched_addresses", [])))
 
     def stop(self):
         self.running = False
         self.logger.info("Bot stop requested")
+        self._notify("Bot stopped")
         # Report is generated at the end of _run_loop after the while
         # loop exits, so positions and balance are still accessible.
 
@@ -3758,6 +3944,10 @@ class CopyTraderBot:
                                     "— resuming trading",
                                     balance, resume_threshold,
                                 )
+                                self._notify(
+                                    "Balance recovered to $%.2f — resuming "
+                                    "trading" % balance
+                                )
                             else:
                                 # Log at INFO only every 5 minutes to
                                 # avoid flooding the logs while idle.
@@ -3780,6 +3970,10 @@ class CopyTraderBot:
                                 LOW_BALANCE_PAUSE_THRESHOLD,
                                 PAUSED_REDEEM_INTERVAL_SECONDS,
                                 resume_threshold,
+                            )
+                            self._notify(
+                                "LOW BALANCE $%.2f — pausing trades, waiting "
+                                "for settlements" % balance
                             )
                     except Exception as bal_exc:
                         self.logger.debug(
@@ -3950,6 +4144,15 @@ class CopyTraderBot:
                             if result and isinstance(result, dict):
                                 result["timestamp"] = datetime.now().isoformat()
                                 self._trade_history.append(result)
+                                if result.get("status") == "submitted":
+                                    self._notify(
+                                        "TRADE %s $%.2f @ %.4f — %s" % (
+                                            result.get("side", "?"),
+                                            result.get("amount_usdc", 0),
+                                            result.get("price", 0),
+                                            result.get("token_id", "")[:16] + "...",
+                                        )
+                                    )
                         else:
                             self.logger.warning(
                                 "Trade detected but executor not ready: %s",
@@ -3958,6 +4161,7 @@ class CopyTraderBot:
 
             except Exception as exc:
                 self.logger.error("Error in monitoring loop: %s", exc, exc_info=True)
+                self._notify("ERROR in monitoring loop: %s" % exc)
 
             # Sleep with early-exit check
             for _ in range(int(poll_interval)):
