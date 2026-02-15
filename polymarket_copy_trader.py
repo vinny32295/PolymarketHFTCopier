@@ -1332,8 +1332,9 @@ class TradeExecutor:
         # Optional webhook callback (set by CopyTraderBot after init)
         self.notify_callback = None
 
-        # Kill switch: stop the bot when cumulative losses exceed threshold
+        # Kill switch: stop the bot when session losses exceed threshold
         self.kill_switch_triggered = False
+        self._session_pnl = 0.0
 
         # Cached proxy wallet address (discovered once, reused)
         self._proxy_address = None
@@ -1549,19 +1550,20 @@ class TradeExecutor:
             pnl, total_pnl, total_cost, total_proceeds,
         )
 
-        # Kill switch: stop the bot if cumulative losses exceed threshold
+        # Kill switch: stop the bot if session losses exceed threshold
+        self._session_pnl += pnl
         max_loss = float(self.cfg.get("max_loss_usdc", 0))
-        if max_loss > 0 and total_pnl <= -max_loss:
+        if max_loss > 0 and self._session_pnl <= -max_loss:
             self.kill_switch_triggered = True
             self.logger.critical(
-                "KILL SWITCH: lifetime P&L $%+.2f hit max loss limit "
+                "KILL SWITCH: session P&L $%+.2f hit max loss limit "
                 "of -$%.2f — stopping bot",
-                total_pnl, max_loss,
+                self._session_pnl, max_loss,
             )
             if self.notify_callback:
                 self.notify_callback(
-                    "KILL SWITCH: P&L $%+.2f hit -$%.2f limit — bot stopped"
-                    % (total_pnl, max_loss)
+                    "KILL SWITCH: session P&L $%+.2f hit -$%.2f limit — bot stopped"
+                    % (self._session_pnl, max_loss)
                 )
 
         return record
