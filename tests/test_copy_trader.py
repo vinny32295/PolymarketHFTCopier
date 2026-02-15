@@ -44,43 +44,16 @@ import polymarket_copy_trader as bot
 
 
 class TestConfigHelpers(unittest.TestCase):
-    """Test config load/save and private key management."""
+    """Test private key management."""
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
-        self.config_path = os.path.join(self.tmpdir, "test_config.json")
         self.pk_path = os.path.join(self.tmpdir, "test_pk")
 
     def tearDown(self):
-        for f in [self.config_path, self.pk_path]:
-            if os.path.exists(f):
-                os.remove(f)
+        if os.path.exists(self.pk_path):
+            os.remove(self.pk_path)
         os.rmdir(self.tmpdir)
-
-    def test_save_and_load_config(self):
-        cfg = dict(bot.DEFAULT_CONFIG)
-        cfg["copy_percentage"] = 75
-        cfg["watched_addresses"] = ["0x" + "a" * 40]
-        bot.save_config(cfg, self.config_path)
-
-        loaded = bot.load_config(self.config_path)
-        self.assertEqual(loaded["copy_percentage"], 75)
-        self.assertEqual(loaded["watched_addresses"], ["0x" + "a" * 40])
-
-    def test_load_config_returns_defaults_when_missing(self):
-        """When no config file exists, load_config returns defaults without creating a file."""
-        cfg = bot.load_config(self.config_path)
-        self.assertFalse(os.path.exists(self.config_path))
-        self.assertEqual(cfg["copy_percentage"], 50)
-        self.assertEqual(cfg["watched_addresses"], [])
-
-    def test_load_config_merges_defaults(self):
-        """Config file with missing keys gets defaults merged in."""
-        with open(self.config_path, "w") as f:
-            json.dump({"rpc_url": "http://test"}, f)
-        cfg = bot.load_config(self.config_path)
-        self.assertEqual(cfg["rpc_url"], "http://test")
-        self.assertEqual(cfg["copy_percentage"], 50)  # default merged
 
     def test_save_and_load_private_key(self):
         cfg = {"private_key_file": self.pk_path}

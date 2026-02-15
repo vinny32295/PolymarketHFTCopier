@@ -352,8 +352,6 @@ PAUSED_REDEEM_INTERVAL_SECONDS = 30  # every 30 s while paused
 # for the wallet's complete trade history).
 PORTFOLIO_SCAN_INTERVAL_SECONDS = 900  # 15 minutes
 
-# Default config file path
-CONFIG_FILE = "config.json"
 LOG_FILE = "bot.log"
 
 # Default configuration template
@@ -425,29 +423,6 @@ def setup_logging(gui_handler=None):
 # Configuration helpers
 # ---------------------------------------------------------------------------
 
-def load_config(path=CONFIG_FILE):
-    """Load configuration from JSON file if it exists, otherwise return defaults.
-
-    The config file is **not** required — the GUI and headless mode both
-    work entirely from ``DEFAULT_CONFIG`` (overridden by user input / env
-    vars).  If a config file happens to exist it is loaded for convenience,
-    but one is never auto-created.
-    """
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            cfg = json.load(f)
-        # Merge any missing defaults
-        for key, val in DEFAULT_CONFIG.items():
-            cfg.setdefault(key, val)
-        return cfg
-    else:
-        return dict(DEFAULT_CONFIG)
-
-
-def save_config(cfg, path=CONFIG_FILE):
-    """Persist configuration to JSON file."""
-    with open(path, "w") as f:
-        json.dump(cfg, f, indent=2)
 
 
 def load_private_key(cfg):
@@ -600,8 +575,7 @@ class PolymarketCLOBClient:
                 cfg["clob_api_key"] = creds.api_key
                 cfg["clob_api_secret"] = creds.api_secret
                 cfg["clob_api_passphrase"] = creds.api_passphrase
-                save_config(cfg)
-                self.logger.info("Saved CLOB API credentials to config")
+                self.logger.info("Derived CLOB API credentials (stored in memory)")
 
                 # Reinitialize with full credentials
                 self.clob_sdk = ClobClient(
@@ -3234,7 +3208,7 @@ class TradeExecutor:
 
         self.logger.warning(
             "Could not discover proxy wallet for EOA %s. "
-            "Set PROXY_ADDRESS env var or proxy_address in config.json "
+            "Set PROXY_ADDRESS env var or proxy_address in the GUI "
             "to provide it manually.",
             self.address,
         )
@@ -4781,16 +4755,8 @@ class CopyTraderGUI:
     def __init__(self):
         _import_tkinter()
 
-        # Start from built-in defaults — no config file required.
-        # If a config.json happens to exist we merge it in for convenience.
+        # Start from built-in defaults — all settings come from the GUI.
         self.cfg = dict(DEFAULT_CONFIG)
-        if os.path.exists(CONFIG_FILE):
-            try:
-                with open(CONFIG_FILE, "r") as f:
-                    saved = json.load(f)
-                self.cfg.update(saved)
-            except (json.JSONDecodeError, OSError):
-                pass  # ignore corrupt / unreadable file
 
         self.bot = None
         self.logger = None
@@ -4843,8 +4809,6 @@ class CopyTraderGUI:
             ctrl, text="Stop Bot", command=self._stop_bot, state=tk.DISABLED
         )
         self.stop_btn.pack(side=tk.LEFT, padx=5)
-        self.save_btn = ttk.Button(ctrl, text="Save Config to File", command=self._save_config)
-        self.save_btn.pack(side=tk.RIGHT, padx=5)
         self.status_var = tk.StringVar(value="Status: Idle")
         ttk.Label(ctrl, textvariable=self.status_var).pack(side=tk.RIGHT, padx=10)
 
@@ -5320,27 +5284,13 @@ class CopyTraderGUI:
         self.log_area.delete("1.0", tk.END)
         self.log_area.configure(state="disabled")
 
-    def _save_config(self):
-        """Optional: persist current GUI settings to config.json on disk.
-
-        This is NOT required to run the bot — the bot reads its config
-        directly from the GUI fields.  Saving is provided as a convenience
-        so settings can be restored on next launch.
-        """
-        self._read_fields_to_config()
-        pk = self.pk_entry.get().strip()
-        if pk:
-            save_private_key(pk, self.cfg)
-        save_config(self.cfg)
-        self.logger.info("Configuration saved to %s (optional — bot uses GUI values directly)", CONFIG_FILE)
-
     def _start_bot(self):
         # Pull the latest values from the GUI fields into self.cfg.
         # No config file write is needed — the bot runs from memory.
         self._read_fields_to_config()
 
         # Persist the private key to its own file (needed by the bot at
-        # runtime) but do NOT write config.json.
+        # runtime).
         pk = self.pk_entry.get().strip()
         if pk:
             save_private_key(pk, self.cfg)
@@ -5426,23 +5376,14 @@ class HealthCheckServer:
 def run_headless():
     """Run the bot in headless mode using defaults + env vars.
 
-    A config.json file is **not** required.  If one exists it is loaded for
-    convenience, but all settings can be supplied via environment variables.
+    All settings come from environment variables or built-in defaults.
     """
     logger = setup_logging()
 
-    # Start from built-in defaults; optionally merge config.json if present.
+    # Start from built-in defaults.
     cfg = dict(DEFAULT_CONFIG)
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r") as f:
-                saved = json.load(f)
-            cfg.update(saved)
-            logger.info("Loaded settings from %s (optional)", CONFIG_FILE)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Ignoring unreadable %s: %s", CONFIG_FILE, exc)
 
-    # Allow env-var overrides so secrets stay out of config.json on the server
+    # Allow env-var overrides for headless operation
     if os.environ.get("RPC_URL"):
         cfg["rpc_url"] = os.environ["RPC_URL"]
     if os.environ.get("WS_RPC_URL"):
@@ -5562,26 +5503,8 @@ POLYMARKET COPY TRADER BOT — USAGE INSTRUCTIONS
 
 2. CONFIGURATION
    -------------
-   On first run the bot creates a config.json with default values.
-   You can also edit it manually:
-
-   {
-     "rpc_url": "https://polygon-rpc.com",
-     "ws_rpc_url": "wss://polygon-bor-rpc.publicnode.com",
-     "private_key_file": ".private_key",
-     "watched_addresses": [
-       "0xABC...123"
-     ],
-     "copy_percentage": 50,
-     "max_trade_usdc": 100.0,
-     "slippage_tolerance_bps": 100,
-     "gas_multiplier": 1.2,
-     "poll_interval_seconds": 15,
-     "use_clob_api": true,
-     "clob_api_key": "",
-     "clob_api_secret": "",
-     "clob_api_passphrase": ""
-   }
+   All settings are entered through the GUI. In headless mode, use
+   environment variables (see section 5).
 
    Recommended Polygon RPC providers:
    - Alchemy:  https://alchemy.com  (free tier available)
@@ -5599,7 +5522,7 @@ POLYMARKET COPY TRADER BOT — USAGE INSTRUCTIONS
    Option A – Automatic (recommended):
      Enter your private key in the GUI, then click
      "Derive Credentials from Private Key". The API key, secret, and
-     passphrase will be generated and saved to config.json.
+     passphrase will be generated and stored in memory.
 
    Option B – Automatic on first start:
      If no credentials are saved but a private key is present, the bot
@@ -5611,7 +5534,7 @@ POLYMARKET COPY TRADER BOT — USAGE INSTRUCTIONS
        client = ClobClient("https://clob.polymarket.com", 137, key="0x...")
        creds = client.create_or_derive_api_creds()
        print(creds)
-     Then paste apiKey, secret, passphrase into the GUI or config.json.
+     Then paste apiKey, secret, passphrase into the GUI.
 
    IMPORTANT: Each wallet can only have ONE active API key at a time.
    Calling create_or_derive_api_creds() is safe to repeat — it returns
@@ -5619,14 +5542,13 @@ POLYMARKET COPY TRADER BOT — USAGE INSTRUCTIONS
 
 4. PRIVATE KEY SETUP
    -----------------
-   Enter your private key in the GUI or save it to the file specified
-   by "private_key_file" in config.json (default: .private_key).
+   Enter your private key in the GUI. It will be saved to .private_key.
 
    The file is created with 0600 permissions (owner-only read/write).
 
    ⚠  SECURITY WARNINGS:
    • NEVER share your private key with anyone.
-   • NEVER commit .private_key or config.json with keys to version control.
+   • NEVER commit .private_key to version control.
    • Consider using a dedicated hot wallet with limited funds.
    • This bot has FULL control over the wallet whose key you provide.
    • Run on a secure, trusted machine only.
