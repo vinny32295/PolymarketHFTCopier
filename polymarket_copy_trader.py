@@ -3991,10 +3991,13 @@ class CopyTraderBot:
             str(self.cfg.get("resume_threshold_usdc", 5))
         )
         _last_pause_log = 0  # timestamp of last "still paused" INFO log
-        _last_redeem_check = 0  # timestamp of last settled-position redemption scan
-        _last_proxy_check = 0   # timestamp of last proxy wallet redemption scan
-        _last_portfolio_scan = 0  # timestamp of last full portfolio scan
-        _last_exit_check = 0  # timestamp of last exit-condition check
+        # Initialise to now so the main loop doesn't immediately re-run
+        # the same scans that the startup sequence just completed.
+        _now = time.time()
+        _last_redeem_check = _now
+        _last_proxy_check = _now
+        _last_portfolio_scan = _now
+        _last_exit_check = 0  # exit checks should start immediately
         exit_check_interval = self.cfg.get("exit_check_seconds", 5)
 
         while self.running:
