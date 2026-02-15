@@ -3974,6 +3974,12 @@ class TradeExecutor:
                 )
                 if result:
                     self.logger.info("Order submitted to CLOB: %s", result)
+
+                    # If the order was rejected, do NOT update positions
+                    order_status = result.get("status", "") if isinstance(result, dict) else ""
+                    if order_status in ("fok_rejected", "error"):
+                        return result
+
                     self.invalidate_balance_cache()
 
                     # Update position tracker — include all redemption params
