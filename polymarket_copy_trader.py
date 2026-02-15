@@ -102,8 +102,8 @@ MIN_ORDER_NOTIONAL_USDC = 1.05  # slightly above $1 to stay above min after fees
 LOW_BALANCE_PAUSE_THRESHOLD = Decimal("1.05")   # can't even fill the smallest order
 
 # Auto-exit thresholds for open positions
-TAKE_PROFIT_PRICE = Decimal("0.99")   # sell when token price reaches 99c (near-certain outcome)
-STOP_LOSS_PCT = Decimal("0.50")       # sell when price drops to 50% of entry price
+TAKE_PROFIT_PRICE = Decimal("1.00")   # hold to full redemption ($1.00) by default
+STOP_LOSS_PCT = Decimal("0")          # disabled by default — whale doesn't use stop-loss
 
 # Polymarket CLOB API base URL
 CLOB_API_BASE = "https://clob.polymarket.com"
@@ -358,18 +358,18 @@ DEFAULT_CONFIG = {
     "watched_addresses": [],
     "copy_percentage": 50,
     "max_trade_usdc": 100.0,
-    "slippage_tolerance_bps": 100,
+    "slippage_tolerance_bps": 50,
     "gas_multiplier": 1.2,
-    "poll_interval_seconds": 15,
+    "poll_interval_seconds": 5,
     "use_clob_api": True,
     "clob_api_key": "",
     "clob_api_secret": "",
     "clob_api_passphrase": "",
     "dry_run": False,
-    "order_ttl_seconds": 30,
+    "order_ttl_seconds": 60,
     "resume_threshold_usdc": 5.0,
-    "take_profit_price": 0.99,
-    "stop_loss_pct": 50,
+    "take_profit_price": 1.00,
+    "stop_loss_pct": 0,
     "exit_check_seconds": 5,
     "auto_redeem_settled": True,
     "proxy_redeem": True,
@@ -817,12 +817,15 @@ class PolymarketCLOBClient:
             return float(data.get("price", 0))
         return None
 
-    def place_order(self, token_id, side, size_usdc, price, neg_risk=False):
-        """Place a GTC (Good-Till-Cancelled) limit order on the Polymarket CLOB.
+    def place_order(self, token_id, side, size_usdc, price, neg_risk=False,
+                    use_fok=False):
+        """Place an order on the Polymarket CLOB.
 
-        The order rests on the book until it fills or is explicitly
-        cancelled.  The bot's order monitor tracks open orders and
-        cancels stale ones periodically.
+        By default places a GTC (Good-Till-Cancelled) limit order.  When
+        *use_fok* is True, places a FOK (Fill-or-Kill) market order that
+        fills instantly or is cancelled — avoiding stale limit orders that
+        sit on the book.  If the FOK is rejected (common with precision
+        issues), falls back to GTC automatically.
 
         Args:
             token_id: The conditional token ID to trade.
@@ -830,6 +833,7 @@ class PolymarketCLOBClient:
             size_usdc: Trade size in USDC.
             price: Price per share (0.0–1.0 range).
             neg_risk: Whether the market uses the neg-risk framework.
+            use_fok: If True, try FOK first for instant fill.
 
         Returns:
             Order response dict, or None on failure.
@@ -888,6 +892,38 @@ class PolymarketCLOBClient:
             if side.upper() == "BUY" and size_tokens < MIN_ORDER_SIZE_TOKENS:
                 size_tokens = float(MIN_ORDER_SIZE_TOKENS)
 
+            # --- FOK (Fill-or-Kill) attempt for instant fills ---
+            if use_fok and MarketOrderArgs is not None:
+                try:
+                    fok_args = MarketOrderArgs(
+                        token_id=token_id,
+                        amount=round(actual_usdc, 2),
+                        price=rounded_price,
+                    )
+                    if side.upper() == "BUY":
+                        signed_fok = self.clob_sdk.create_market_order(fok_args)
+                    else:
+                        # SELL FOK: amount is in shares, not USDC
+                        fok_args = MarketOrderArgs(
+                            token_id=token_id,
+                            amount=round(size_tokens, 2),
+                            price=rounded_price,
+                        )
+                        signed_fok = self.clob_sdk.create_market_order(fok_args)
+                    resp = self.clob_sdk.post_order(
+                        signed_fok, orderType=OrderType.FOK,
+                    )
+                    self.logger.info(
+                        "FOK order filled: %s $%.2f @ %.4f for token %s — %s",
+                        side, actual_usdc, price, token_id[:16] + "...", resp,
+                    )
+                    return resp
+                except Exception as fok_exc:
+                    self.logger.info(
+                        "FOK rejected (%s), falling back to GTC", fok_exc,
+                    )
+
+            # --- GTC (Good-Till-Cancelled) limit order ---
             limit_args = OrderArgs(
                 price=rounded_price,
                 size=size_tokens,
@@ -1629,8 +1665,8 @@ class TradeExecutor:
     def check_exit_conditions(self):
         """Scan all open positions and sell any that hit exit thresholds.
 
-        - **Take-profit**: current price >= 0.99  (near-certain outcome)
-        - **Stop-loss**:   current price <= 50% of entry price
+        - **Take-profit**: current price >= take_profit_price (default 1.00)
+        - **Stop-loss**:   current price <= stop_loss_pct% of entry (0 = disabled)
 
         Requires a CLOB client to fetch live prices and place sell orders.
         Returns a list of sell results (one per exited position), or an
@@ -1643,7 +1679,8 @@ class TradeExecutor:
 
         # Read thresholds from config (fall back to module-level defaults)
         tp_price = Decimal(str(self.cfg.get("take_profit_price", TAKE_PROFIT_PRICE)))
-        sl_pct = Decimal(str(self.cfg.get("stop_loss_pct", STOP_LOSS_PCT * 100))) / Decimal("100")
+        sl_raw = Decimal(str(self.cfg.get("stop_loss_pct", STOP_LOSS_PCT * 100)))
+        sl_pct = sl_raw / Decimal("100") if sl_raw > 0 else Decimal("0")
 
         results = []
         # Iterate over a snapshot so we can mutate _positions safely
@@ -1661,7 +1698,7 @@ class TradeExecutor:
             reason = None
             if current_price_d >= tp_price:
                 reason = "take-profit"
-            elif entry_price > 0 and current_price_d <= entry_price * sl_pct:
+            elif sl_pct > 0 and entry_price > 0 and current_price_d <= entry_price * sl_pct:
                 reason = "stop-loss"
 
             if reason is None:
@@ -3595,8 +3632,9 @@ class TradeExecutor:
                 # --- Stale price protection ---
                 # Fetch the current mid-price from the orderbook and compare
                 # to the whale's trade price.  If the market has moved more
-                # than max_price_deviation_pct, skip the trade to avoid
-                # executing at a stale/outdated price.
+                # than max_price_deviation_pct, skip the trade.  When within
+                # tolerance we keep the whale's price (not mid) so our entry
+                # is as close to the whale's as possible.
                 max_dev_pct = self.cfg.get("max_price_deviation_pct", 5)
                 if max_dev_pct > 0:
                     try:
@@ -3628,24 +3666,17 @@ class TradeExecutor:
                                             "mid_price": mid_price,
                                             "deviation_pct": round(deviation, 2),
                                         }
-                                    # Use mid-price for the order instead of
-                                    # whale's potentially stale price.
-                                    if side == "BUY":
-                                        adjusted_price = min(
-                                            float(Decimal(str(mid_price)) * (Decimal("1") + slippage_mult)),
-                                            0.99,
+                                    # Within tolerance — keep whale's price
+                                    # (already applied via adjusted_price above)
+                                    # so our entry matches the whale as closely
+                                    # as possible.
+                                    if deviation > 1:
+                                        self.logger.info(
+                                            "Price check OK: whale=%.4f, mid=%.4f "
+                                            "(deviation=%.1f%%, within %d%% limit)",
+                                            whale_price, mid_price, deviation,
+                                            max_dev_pct,
                                         )
-                                    else:
-                                        adjusted_price = max(
-                                            float(Decimal(str(mid_price)) * (Decimal("1") - slippage_mult)),
-                                            0.01,
-                                        )
-                                    self.logger.info(
-                                        "Price adjusted: whale=%.4f, mid=%.4f, "
-                                        "order=%.4f (deviation=%.1f%%)",
-                                        whale_price, mid_price, adjusted_price,
-                                        deviation,
-                                    )
                     except Exception as book_exc:
                         self.logger.debug(
                             "Orderbook fetch failed (proceeding with whale price): %s",
@@ -3657,6 +3688,7 @@ class TradeExecutor:
                     side=side,
                     size_usdc=float(copy_amount),
                     price=adjusted_price,
+                    use_fok=True,
                 )
                 if result:
                     self.logger.info("Order submitted to CLOB: %s", result)
@@ -3991,10 +4023,13 @@ class CopyTraderBot:
             str(self.cfg.get("resume_threshold_usdc", 5))
         )
         _last_pause_log = 0  # timestamp of last "still paused" INFO log
-        _last_redeem_check = 0  # timestamp of last settled-position redemption scan
-        _last_proxy_check = 0   # timestamp of last proxy wallet redemption scan
-        _last_portfolio_scan = 0  # timestamp of last full portfolio scan
-        _last_exit_check = 0  # timestamp of last exit-condition check
+        # Initialise to now so the main loop doesn't immediately re-run
+        # the same scans that the startup sequence just completed.
+        _now = time.time()
+        _last_redeem_check = _now
+        _last_proxy_check = _now
+        _last_portfolio_scan = _now
+        _last_exit_check = 0  # exit checks should start immediately
         exit_check_interval = self.cfg.get("exit_check_seconds", 5)
 
         while self.running:
@@ -4734,7 +4769,10 @@ class CopyTraderGUI:
             return
 
         import csv
-        csv_path = "trade_history.csv"
+        csv_path = os.path.join(
+            os.path.dirname(os.path.abspath(TRADE_HISTORY_FILE)),
+            "trade_history.csv",
+        )
         fieldnames = [
             "closed_at", "token_id", "market", "shares",
             "entry_price", "exit_price", "cost_basis_usdc",
