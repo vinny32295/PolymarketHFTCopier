@@ -292,6 +292,17 @@ CONDITIONAL_TOKENS_ABI = json.loads("""[
         {"name":"conditionId","type":"bytes32"},
         {"name":"indexSets","type":"uint256[]"}],
      "name":"redeemPositions","outputs":[],
+     "type":"function"},
+    {"constant":false,"inputs":[
+        {"name":"operator","type":"address"},
+        {"name":"approved","type":"bool"}],
+     "name":"setApprovalForAll","outputs":[],
+     "type":"function"},
+    {"constant":true,"inputs":[
+        {"name":"owner","type":"address"},
+        {"name":"operator","type":"address"}],
+     "name":"isApprovedForAll",
+     "outputs":[{"name":"","type":"bool"}],
      "type":"function"}
 ]""")
 
@@ -308,6 +319,17 @@ NEG_RISK_ADAPTER_ABI = json.loads("""[
         {"name":"conditionId","type":"bytes32"},
         {"name":"indexSets","type":"uint256[]"}],
      "name":"redeemPositions","outputs":[],
+     "type":"function"},
+    {"constant":false,"inputs":[
+        {"name":"operator","type":"address"},
+        {"name":"approved","type":"bool"}],
+     "name":"setApprovalForAll","outputs":[],
+     "type":"function"},
+    {"constant":true,"inputs":[
+        {"name":"owner","type":"address"},
+        {"name":"operator","type":"address"}],
+     "name":"isApprovedForAll",
+     "outputs":[{"name":"","type":"bool"}],
      "type":"function"}
 ]""")
 
@@ -1452,6 +1474,10 @@ class TradeExecutor:
             adjusted_price = float(current_price_d * (Decimal("1") - slippage_mult))
             adjusted_price = max(adjusted_price, 0.01)
 
+            # Ensure the exchange can transfer our conditional tokens
+            pos_neg_risk = pos.get("neg_risk", False)
+            self.ensure_ct_approval(neg_risk=pos_neg_risk)
+
             result = self.clob_client.place_order(
                 token_id=token_id,
                 side="SELL",
@@ -1541,6 +1567,10 @@ class TradeExecutor:
                     neg_risk = self._is_neg_risk_market(market)
             except Exception:
                 pass
+
+        # Fallback: use cached condition_id from activity data
+        if not condition_id and self.clob_client:
+            condition_id = self.clob_client._token_to_condition.get(token_id)
 
         if not condition_id:
             self.logger.warning(
@@ -1707,24 +1737,28 @@ class TradeExecutor:
 
                 if not condition_id:
                     market = self.clob_client.get_market_by_token(token_id)
-                    if not market:
-                        no_market_count += 1
-                        self.logger.debug(
-                            "No market info found for token %s", token_id[:16] + "...",
-                        )
-                        continue
+                    if market:
+                        condition_id = market.get("condition_id")
+                        if condition_id:
+                            neg_risk = self._is_neg_risk_market(market)
 
-                    condition_id = market.get("condition_id")
+                    # Fallback: use cached condition_id from activity data
+                    # even when the Gamma/CLOB market lookup fails.
                     if not condition_id:
-                        self.logger.debug(
-                            "No condition_id for token %s (%s)",
-                            token_id[:16] + "...",
-                            market.get("question", "?")[:40],
-                        )
-                        no_market_count += 1
-                        continue
-
-                    neg_risk = self._is_neg_risk_market(market)
+                        cached_cid = self.clob_client._token_to_condition.get(token_id)
+                        if cached_cid:
+                            condition_id = cached_cid
+                            self.logger.debug(
+                                "Using cached condition_id for token %s",
+                                token_id[:16] + "...",
+                            )
+                        else:
+                            no_market_count += 1
+                            self.logger.debug(
+                                "No market info or cached condition_id for token %s",
+                                token_id[:16] + "...",
+                            )
+                            continue
                 else:
                     market = None  # already have what we need
 
@@ -2629,7 +2663,12 @@ class TradeExecutor:
         ).call()
 
         # Sign the hash with our EOA private key
-        signed = self.w3.eth.account.signHash(safe_tx_hash, self.private_key)
+        # web3.py v7+ renamed signHash → unsafe_sign_hash
+        _sign_hash = getattr(
+            self.w3.eth.account, "unsafe_sign_hash",
+            getattr(self.w3.eth.account, "signHash", None),
+        )
+        signed = _sign_hash(safe_tx_hash, self.private_key)
         # Encode signature as r + s + v (65 bytes)
         signature = (
             signed.r.to_bytes(32, "big")
@@ -2766,12 +2805,18 @@ class TradeExecutor:
 
                 if not condition_id:
                     market = self.clob_client.get_market_by_token(token_id)
-                    if not market:
-                        continue
-                    condition_id = market.get("condition_id")
+                    if market:
+                        condition_id = market.get("condition_id")
+                        if condition_id:
+                            neg_risk = self._is_neg_risk_market(market)
+
+                    # Fallback: use cached condition_id from activity data
                     if not condition_id:
-                        continue
-                    neg_risk = self._is_neg_risk_market(market)
+                        cached_cid = self.clob_client._token_to_condition.get(token_id)
+                        if cached_cid:
+                            condition_id = cached_cid
+                        else:
+                            continue
 
                 # Check token balance on the correct contract for the proxy
                 ct_balance = self._get_token_balance(
@@ -2932,6 +2977,49 @@ class TradeExecutor:
         ).build_transaction(self._base_tx_params())
         return self._sign_and_send(tx)
 
+    def ensure_ct_approval(self, neg_risk=False):
+        """Approve the CTF Exchange to transfer conditional tokens for SELL orders.
+
+        For standard markets the exchange needs setApprovalForAll on the
+        ConditionalTokens contract.  For Neg Risk markets it also needs
+        approval on the NegRiskAdapter (wrapped tokens).
+        """
+        exchange = Web3.to_checksum_address(CTF_EXCHANGE_ADDRESS)
+        neg_exchange = Web3.to_checksum_address(NEG_RISK_CTF_EXCHANGE_ADDRESS)
+
+        # Standard CT approval for the CTF Exchange
+        try:
+            approved = self.conditional_tokens.functions.isApprovedForAll(
+                self.address, exchange,
+            ).call()
+            if not approved:
+                self.logger.info(
+                    "Approving CTF Exchange to transfer conditional tokens..."
+                )
+                tx = self.conditional_tokens.functions.setApprovalForAll(
+                    exchange, True,
+                ).build_transaction(self._base_tx_params())
+                self._sign_and_send(tx)
+        except Exception as exc:
+            self.logger.warning("CT approval check/set failed: %s", exc)
+
+        if neg_risk:
+            # Neg Risk adapter approval for the Neg Risk CTF Exchange
+            try:
+                approved = self.neg_risk_adapter.functions.isApprovedForAll(
+                    self.address, neg_exchange,
+                ).call()
+                if not approved:
+                    self.logger.info(
+                        "Approving NegRisk Exchange to transfer wrapped tokens..."
+                    )
+                    tx = self.neg_risk_adapter.functions.setApprovalForAll(
+                        neg_exchange, True,
+                    ).build_transaction(self._base_tx_params())
+                    self._sign_and_send(tx)
+            except Exception as exc:
+                self.logger.warning("NegRisk CT approval check/set failed: %s", exc)
+
     def _base_tx_params(self):
         """Common transaction parameters with EIP-1559 fees."""
         latest = self.w3.eth.get_block("latest")
@@ -3026,6 +3114,9 @@ class TradeExecutor:
                         condition_id = market.get("condition_id")
                 except Exception:
                     pass
+                # Fallback: use cached condition_id from activity data
+                if not condition_id:
+                    condition_id = self.clob_client._token_to_condition.get(token_id)
 
             # --- Enforce Polymarket order minimums early ---
             # The CLOB API requires both ≥5 tokens AND ≥$1 USDC notional.
@@ -3099,14 +3190,17 @@ class TradeExecutor:
                     "price": price,
                 }
 
-            # Ensure USDC approval on the correct exchange.
-            # Neg Risk markets use a different exchange contract.
-            raw_amount = int(copy_amount * Decimal("1000000"))
-            self.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
-            if neg_risk:
-                self.ensure_usdc_approval(
-                    NEG_RISK_CTF_EXCHANGE_ADDRESS, raw_amount,
-                )
+            # Ensure approvals on the correct exchange.
+            if side == "BUY":
+                raw_amount = int(copy_amount * Decimal("1000000"))
+                self.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
+                if neg_risk:
+                    self.ensure_usdc_approval(
+                        NEG_RISK_CTF_EXCHANGE_ADDRESS, raw_amount,
+                    )
+            else:
+                # SELL: exchange needs ERC1155 approval to transfer our tokens
+                self.ensure_ct_approval(neg_risk=neg_risk)
 
             # Place order via the CLOB API (requires py-clob-client + API creds)
             if self.clob_client and self.clob_client.clob_sdk:
