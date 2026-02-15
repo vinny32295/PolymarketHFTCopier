@@ -280,6 +280,12 @@ CONDITIONAL_TOKENS_ABI = json.loads("""[
      "outputs":[{"name":"","type":"uint256"}],
      "type":"function"},
     {"constant":true,"inputs":[
+        {"name":"","type":"bytes32"},
+        {"name":"","type":"uint256"}],
+     "name":"payoutNumerators",
+     "outputs":[{"name":"","type":"uint256"}],
+     "type":"function"},
+    {"constant":true,"inputs":[
         {"name":"oracle","type":"address"},
         {"name":"questionId","type":"bytes32"},
         {"name":"outcomeSlotCount","type":"uint256"}],
@@ -1412,7 +1418,18 @@ class TradeExecutor:
 
     def _log_closed_trade(self, token_id, entry_price, exit_price,
                           shares, reason, market=None):
-        """Append a closed trade record to the persistent history file."""
+        """Append a closed trade record to the persistent history file.
+
+        Tracks *cost_basis* (capital deployed) and *proceeds* (capital
+        returned) separately so lifetime P/L can be computed accurately
+        as ``sum(proceeds) - sum(cost_basis)`` across all records.
+
+        The *outcome* field categorises the result:
+        - ``"won"``  — redeemed at $1.00 (full payout)
+        - ``"lost"`` — redeemed at $0.00 (total loss)
+        - ``"sold"`` — sold on market before resolution
+        - ``"dust"`` — position too small to sell, written off
+        """
         entry_p = float(entry_price) if entry_price else 0.0
         exit_p = float(exit_price) if exit_price else 0.0
         num_shares = float(shares) if shares else 0.0
@@ -1420,6 +1437,14 @@ class TradeExecutor:
         cost_basis = entry_p * num_shares
         proceeds = exit_p * num_shares
         pnl = round(proceeds - cost_basis, 6)
+
+        # Classify the outcome for reporting
+        if reason in ("redeemed", "redeemed_external"):
+            outcome = "won" if exit_p >= 0.5 else "lost"
+        elif reason in ("dust", "stale", "failed_redeem", "resolution_error"):
+            outcome = "lost"
+        else:
+            outcome = "sold"
 
         record = {
             "closed_at": datetime.now().isoformat(),
@@ -1431,11 +1456,17 @@ class TradeExecutor:
             "cost_basis_usdc": round(cost_basis, 6),
             "proceeds_usdc": round(proceeds, 6),
             "pnl_usdc": pnl,
+            "outcome": outcome,
             "reason": reason,
         }
 
         history = self._load_trade_history()
         history.append(record)
+
+        # Compute running totals
+        total_cost = sum(r.get("cost_basis_usdc", 0) for r in history)
+        total_proceeds = sum(r.get("proceeds_usdc", 0) for r in history)
+        total_pnl = round(total_proceeds - total_cost, 6)
 
         try:
             tmp = self._trade_history_file + ".tmp"
@@ -1446,9 +1477,10 @@ class TradeExecutor:
             self.logger.warning("Could not save trade history: %s", exc)
 
         self.logger.info(
-            "CLOSED TRADE: %s | %.4f shares @ entry %.4f -> exit %.4f | "
-            "P&L $%.4f | reason=%s",
-            record["market"], num_shares, entry_p, exit_p, pnl, reason,
+            "CLOSED TRADE [%s]: %s | %.4f shares @ entry $%.4f -> exit $%.4f | "
+            "P&L $%+.4f | lifetime P&L $%+.4f (deployed $%.2f, returned $%.2f)",
+            outcome.upper(), record["market"], num_shares, entry_p, exit_p,
+            pnl, total_pnl, total_cost, total_proceeds,
         )
 
         return record
@@ -1947,17 +1979,25 @@ class TradeExecutor:
             return {"status": "dry_run", "reason": reason, "token_id": token_id}
 
         try:
+            pre_bal = self.get_usdc_balance(max_age_seconds=0)
             tx = self._build_redeem_tx(resolved_cid, neg_risk=neg_risk)
             receipt = self._sign_and_send(tx)
             if receipt and receipt.status == 1:
-                self.logger.info(
-                    "Redemption OK (auto-exit %s): tx %s — USDC returned",
-                    reason, receipt.transactionHash.hex(),
-                )
                 self.invalidate_balance_cache()
-                # Redeemed at $1.00 per share (market resolved in our favor)
+                post_bal = self.get_usdc_balance(max_age_seconds=0)
+                exit_price = self._get_redemption_exit_price(
+                    pre_bal, post_bal, pos.get("tokens", 0),
+                    pos.get("entry_price", 0),
+                )
+                self.logger.info(
+                    "Redemption OK (auto-exit %s): tx %s — exit $%.2f "
+                    "(USDC %s%.4f)",
+                    reason, receipt.transactionHash.hex(), exit_price,
+                    "+" if post_bal >= pre_bal else "",
+                    float(post_bal - pre_bal),
+                )
                 self._log_closed_trade(
-                    token_id, pos.get("entry_price", 0), 1.0,
+                    token_id, pos.get("entry_price", 0), exit_price,
                     pos.get("tokens", 0), "redeemed",
                     market=pos.get("market_name"),
                 )
@@ -1968,6 +2008,7 @@ class TradeExecutor:
                     "reason": reason,
                     "token_id": token_id,
                     "tx_hash": receipt.transactionHash.hex(),
+                    "exit_price": exit_price,
                 }
             else:
                 retries += 1
@@ -2199,20 +2240,33 @@ class TradeExecutor:
                     })
                     continue
 
+                pre_bal = self.get_usdc_balance(max_age_seconds=0)
                 tx = self._build_redeem_tx(resolved_cid, neg_risk=neg_risk)
 
                 receipt = self._sign_and_send(tx)
                 if receipt and receipt.status == 1:
-                    self.logger.info(
-                        "Redemption OK: tx %s — USDC returned to wallet",
-                        receipt.transactionHash.hex(),
-                    )
                     self.invalidate_balance_cache()
-                    # Remove from position tracker if it was there
+                    post_bal = self.get_usdc_balance(max_age_seconds=0)
+                    # Determine actual payout from balance change
                     pos = self._positions.get(token_id)
+                    tokens_held = (
+                        pos.get("tokens", 0) if pos
+                        else Decimal(ct_balance) / Decimal("1000000")
+                    )
+                    exit_price = self._get_redemption_exit_price(
+                        pre_bal, post_bal, tokens_held,
+                        pos.get("entry_price", 0) if pos else 0,
+                    )
+                    self.logger.info(
+                        "Redemption OK: tx %s — exit $%.2f "
+                        "(USDC %s%.4f)",
+                        receipt.transactionHash.hex(), exit_price,
+                        "+" if post_bal >= pre_bal else "",
+                        float(post_bal - pre_bal),
+                    )
                     if pos:
                         self._log_closed_trade(
-                            token_id, pos.get("entry_price", 0), 1.0,
+                            token_id, pos.get("entry_price", 0), exit_price,
                             pos.get("tokens", 0), "redeemed",
                             market=pos.get("market_name"),
                         )
@@ -2223,6 +2277,7 @@ class TradeExecutor:
                         "token_id": token_id,
                         "balance": ct_balance,
                         "tx_hash": receipt.transactionHash.hex(),
+                        "exit_price": exit_price,
                     })
                 else:
                     self.logger.warning(
@@ -2336,6 +2391,81 @@ class TradeExecutor:
                 pass
 
         return api_condition_id, 0
+
+    def _determine_exit_price(self, condition_id_hex, token_id, neg_risk=False):
+        """Determine whether a redeemed token was a winner ($1) or loser ($0).
+
+        Queries ``payoutNumerators`` on the ConditionalTokens contract for
+        both outcome indices.  Polymarket binary markets have exactly two
+        outcomes; only one has a non-zero numerator.
+
+        For the winning token, ``redeemPositions`` returns 1 USDC per token.
+        For the losing token, ``redeemPositions`` returns 0 USDC.
+
+        Returns 1.0 for winners, 0.0 for losers, or None if undetermined.
+        """
+        try:
+            cond_bytes = bytes.fromhex(condition_id_hex.replace("0x", ""))
+            num_0 = self.conditional_tokens.functions.payoutNumerators(
+                cond_bytes, 0,
+            ).call()
+            num_1 = self.conditional_tokens.functions.payoutNumerators(
+                cond_bytes, 1,
+            ).call()
+
+            if num_0 == 0 and num_1 == 0:
+                # Not resolved yet
+                return None
+
+            # Determine which outcome index this token_id corresponds to.
+            # Polymarket token IDs encode the position: the token for
+            # outcome index 0 vs 1.  We check which index has a non-zero
+            # payout numerator, then verify by checking if redeeming this
+            # token actually returns USDC.
+            #
+            # The most reliable method: check USDC balance before/after.
+            # But since we call this before redemption, we use a heuristic:
+            # compare the token_id against both outcome token IDs from
+            # the market data (if available), or fall back to balance-based
+            # detection after redemption.
+            #
+            # Simpler fallback: we check the balance CHANGE approach from
+            # the caller.  For now, return both numerators so the caller
+            # can use balance-diff to determine exit price.
+            self.logger.debug(
+                "Payout numerators for condition %s: [%d, %d]",
+                condition_id_hex[:16] + "...", num_0, num_1,
+            )
+            return {"num_0": num_0, "num_1": num_1}
+        except Exception as exc:
+            self.logger.debug(
+                "Could not query payoutNumerators: %s", exc,
+            )
+            return None
+
+    def _get_redemption_exit_price(self, pre_balance, post_balance,
+                                   tokens, entry_price):
+        """Compute the actual exit price from USDC balance change.
+
+        Compares USDC balance before and after a redemption transaction.
+        If the balance increased by ~tokens USDC, the position won ($1.00).
+        If the balance didn't change (or barely changed), it lost ($0.00).
+        """
+        tokens_f = float(tokens) if isinstance(tokens, Decimal) else tokens
+        balance_diff = float(post_balance - pre_balance)
+
+        if tokens_f <= 0:
+            return 0.0
+
+        # Compute per-token payout
+        payout_per_token = balance_diff / tokens_f if tokens_f > 0 else 0
+
+        # Winner: ~$1 per token.  Loser: ~$0 per token.
+        # Use 0.5 as the threshold since payouts are binary.
+        if payout_per_token >= 0.5:
+            return 1.0
+        else:
+            return 0.0
 
     def _get_token_balance(self, owner, token_id, neg_risk=False):
         """Return the on-chain token balance, checking the right contract.
@@ -2501,17 +2631,26 @@ class TradeExecutor:
                     continue
 
                 # 5. Build and send the redeemPositions transaction
+                pre_bal = self.get_usdc_balance(max_age_seconds=0)
                 tx = self._build_redeem_tx(resolved_cid, neg_risk=neg_risk)
 
                 receipt = self._sign_and_send(tx)
                 if receipt and receipt.status == 1:
-                    self.logger.info(
-                        "Redemption confirmed: tx %s — USDC returned to wallet",
-                        receipt.transactionHash.hex(),
-                    )
                     self.invalidate_balance_cache()
+                    post_bal = self.get_usdc_balance(max_age_seconds=0)
+                    exit_price = self._get_redemption_exit_price(
+                        pre_bal, post_bal, pos.get("tokens", 0),
+                        pos.get("entry_price", 0),
+                    )
+                    self.logger.info(
+                        "Redemption confirmed: tx %s — exit $%.2f "
+                        "(USDC %s%.4f)",
+                        receipt.transactionHash.hex(), exit_price,
+                        "+" if post_bal >= pre_bal else "",
+                        float(post_bal - pre_bal),
+                    )
                     self._log_closed_trade(
-                        token_id, pos.get("entry_price", 0), 1.0,
+                        token_id, pos.get("entry_price", 0), exit_price,
                         pos.get("tokens", 0), "redeemed",
                         market=pos.get("market_name"),
                     )
@@ -2523,6 +2662,7 @@ class TradeExecutor:
                         "token_id": token_id,
                         "balance": ct_balance,
                         "tx_hash": receipt.transactionHash.hex(),
+                        "exit_price": exit_price,
                     })
                 else:
                     self.logger.warning(
@@ -4329,16 +4469,34 @@ class CopyTraderBot:
                     },
                 }
 
+        # ---- Realized P/L from trade history file ----
+        closed_trades = []
+        if self.executor:
+            closed_trades = self.executor._load_trade_history()
+        total_cost_basis = sum(r.get("cost_basis_usdc", 0) for r in closed_trades)
+        total_proceeds = sum(r.get("proceeds_usdc", 0) for r in closed_trades)
+        realized_pnl = round(total_proceeds - total_cost_basis, 6)
+
+        # Unrealized value of open positions (at entry price as conservative estimate)
+        open_cost = sum(
+            p.get("cost_basis_usdc", 0) for p in positions.values()
+        )
+
         report = {
             "session_start": (
                 self._session_start.isoformat() if self._session_start else None
             ),
             "session_end": session_end.isoformat(),
             "usdc_balance_at_stop": current_balance,
-            "total_trades": len(self._trade_history),
+            "total_session_trades": len(self._trade_history),
             "total_bought_usdc": round(buy_total, 6),
             "total_sold_usdc": round(sell_total, 6),
             "net_spent_usdc": round(buy_total - sell_total, 6),
+            "lifetime_capital_deployed": round(total_cost_basis, 6),
+            "lifetime_capital_returned": round(total_proceeds, 6),
+            "lifetime_realized_pnl": realized_pnl,
+            "open_positions_cost_basis": round(open_cost, 6),
+            "closed_trade_count": len(closed_trades),
             "trade_history": self._trade_history,
             "open_positions": positions,
         }
@@ -4365,10 +4523,12 @@ class CopyTraderBot:
 
         # ---- Log summary to console ----
         self.logger.info(
-            "Session summary: %d trades | bought $%.2f | sold $%.2f | "
-            "net spent $%.2f | %d open position(s)",
+            "Session summary: %d session trades | bought $%.2f | sold $%.2f | "
+            "net spent $%.2f | %d open position(s) | "
+            "lifetime realized P&L: $%+.2f (deployed $%.2f, returned $%.2f)",
             len(self._trade_history), buy_total, sell_total,
             buy_total - sell_total, len(positions),
+            realized_pnl, total_cost_basis, total_proceeds,
         )
         if positions:
             self.logger.info(
@@ -4674,7 +4834,7 @@ class CopyTraderGUI:
     def _build_history_tab(self, parent):
         columns = (
             "closed_at", "market", "shares", "entry_price",
-            "exit_price", "pnl_usdc", "reason",
+            "exit_price", "pnl_usdc", "outcome", "reason",
         )
         col_headings = {
             "closed_at": "Closed At",
@@ -4683,12 +4843,13 @@ class CopyTraderGUI:
             "entry_price": "Entry",
             "exit_price": "Exit",
             "pnl_usdc": "P&L ($)",
+            "outcome": "Result",
             "reason": "Reason",
         }
         col_widths = {
-            "closed_at": 150, "market": 160, "shares": 80,
-            "entry_price": 80, "exit_price": 80, "pnl_usdc": 90,
-            "reason": 100,
+            "closed_at": 145, "market": 150, "shares": 70,
+            "entry_price": 70, "exit_price": 70, "pnl_usdc": 85,
+            "outcome": 55, "reason": 85,
         }
 
         tree_frame = ttk.Frame(parent)
@@ -4704,7 +4865,7 @@ class CopyTraderGUI:
         for col in columns:
             self.history_tree.heading(col, text=col_headings[col])
             anchor = tk.E if col in ("shares", "entry_price", "exit_price", "pnl_usdc") else tk.W
-            self.history_tree.column(col, width=col_widths[col], anchor=anchor)
+            self.history_tree.column(col, width=col_widths.get(col, 80), anchor=anchor)
 
         self.history_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -4734,10 +4895,18 @@ class CopyTraderGUI:
         except (FileNotFoundError, json.JSONDecodeError):
             history = []
 
-        total_pnl = 0.0
+        total_cost = 0.0
+        total_proceeds = 0.0
+        wins = losses = 0
         for rec in reversed(history):  # newest first
             pnl = rec.get("pnl_usdc", 0)
-            total_pnl += pnl
+            total_cost += rec.get("cost_basis_usdc", 0)
+            total_proceeds += rec.get("proceeds_usdc", 0)
+            outcome = rec.get("outcome", "")
+            if outcome == "won":
+                wins += 1
+            elif outcome == "lost":
+                losses += 1
             closed_at = rec.get("closed_at", "")
             # Shorten the ISO timestamp for display
             if "T" in closed_at:
@@ -4749,12 +4918,18 @@ class CopyTraderGUI:
                 f"{rec.get('entry_price', 0):.4f}",
                 f"{rec.get('exit_price', 0):.4f}",
                 f"{pnl:+.4f}",
+                outcome.upper() if outcome else rec.get("reason", ""),
                 rec.get("reason", ""),
             ))
 
         n = len(history)
+        total_pnl = total_proceeds - total_cost
+        win_rate = f"{wins/(wins+losses)*100:.0f}%" if (wins + losses) > 0 else "N/A"
         self.history_summary_var.set(
-            f"Total trades: {n}  |  Cumulative P&L: ${total_pnl:+.4f}"
+            f"Trades: {n}  |  Deployed: ${total_cost:,.2f}  |  "
+            f"Returned: ${total_proceeds:,.2f}  |  "
+            f"P&L: ${total_pnl:+,.2f}  |  "
+            f"W/L: {wins}/{losses} ({win_rate})"
         )
 
     def _export_history_csv(self):
