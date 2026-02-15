@@ -218,6 +218,10 @@ ERC20_ABI = json.loads("""[
     {"constant":false,"inputs":[{"name":"_spender","type":"address"},
      {"name":"_value","type":"uint256"}],
      "name":"approve","outputs":[{"name":"","type":"bool"}],
+     "type":"function"},
+    {"constant":false,"inputs":[{"name":"_to","type":"address"},
+     {"name":"_value","type":"uint256"}],
+     "name":"transfer","outputs":[{"name":"","type":"bool"}],
      "type":"function"}
 ]""")
 
@@ -785,6 +789,17 @@ class PolymarketCLOBClient:
                                 MIN_ORDER_NOTIONAL_USDC)
 
             if effective_usdc > size_usdc:
+                if side.upper() == "SELL":
+                    # SELL orders: never bump beyond what we actually hold.
+                    # If the position value is below the exchange minimum,
+                    # skip the order rather than inflating to tokens we
+                    # don't own (which would fail with "not enough balance").
+                    self.logger.warning(
+                        "SELL size $%.2f below minimum $%.2f — skipping "
+                        "(cannot inflate sell beyond held tokens)",
+                        size_usdc, effective_usdc,
+                    )
+                    return None
                 size_shares = round(effective_usdc / price, 2)
                 self.logger.warning(
                     "Order size %.2f USDC (%.2f tokens) below minimums; "
@@ -796,8 +811,8 @@ class PolymarketCLOBClient:
                 )
             actual_usdc = effective_usdc
 
-            # Use FOK (Fill-or-Kill) market order — fills instantly or
-            # gets cancelled, so no balance is locked in open orders.
+            # Try FOK (Fill-or-Kill) first — fills instantly or gets
+            # cancelled, so no balance is locked in open orders.
             order_args = MarketOrderArgs(
                 token_id=token_id,
                 price=round(price, 2),
@@ -806,16 +821,48 @@ class PolymarketCLOBClient:
                 order_type=OrderType.FOK,
             )
 
-            signed_order = self.clob_sdk.create_market_order(order_args)
-            resp = self.clob_sdk.post_order(
-                signed_order, orderType=OrderType.FOK,
-            )
-
-            self.logger.info(
-                "FOK order placed: %s $%.2f @ %.4f for token %s — %s",
-                side, actual_usdc, price, token_id[:16] + "...", resp,
-            )
-            return resp
+            try:
+                signed_order = self.clob_sdk.create_market_order(order_args)
+                resp = self.clob_sdk.post_order(
+                    signed_order, orderType=OrderType.FOK,
+                )
+                self.logger.info(
+                    "FOK order placed: %s $%.2f @ %.4f for token %s — %s",
+                    side, actual_usdc, price, token_id[:16] + "...", resp,
+                )
+                return resp
+            except Exception as fok_exc:
+                fok_msg = str(fok_exc)
+                if "fully filled" not in fok_msg:
+                    # Not a liquidity issue — propagate
+                    raise
+                # FOK failed due to insufficient liquidity at this price.
+                # Fall back to a GTC limit order so it rests on the book.
+                self.logger.warning(
+                    "FOK could not fill; retrying as GTC limit: "
+                    "%s $%.2f @ %.4f for token %s",
+                    side, actual_usdc, price, token_id[:16] + "...",
+                )
+                rounded_price = round(price, 2)
+                if rounded_price <= 0:
+                    self.logger.error("Price rounds to zero – cannot place GTC order")
+                    return None
+                size_tokens = round(actual_usdc / rounded_price, 2)
+                limit_args = OrderArgs(
+                    price=rounded_price,
+                    size=size_tokens,
+                    side=side.upper(),
+                    token_id=token_id,
+                )
+                signed_limit = self.clob_sdk.create_order(limit_args)
+                resp = self.clob_sdk.post_order(
+                    signed_limit, orderType=OrderType.GTC,
+                )
+                self.logger.info(
+                    "GTC limit order placed: %s $%.2f @ %.4f for token %s — %s",
+                    side, actual_usdc, price, token_id[:16] + "...", resp,
+                )
+                return resp
 
         except Exception as exc:
             self.logger.error("Failed to place CLOB order: %s", exc, exc_info=True)
@@ -1466,10 +1513,26 @@ class TradeExecutor:
                     "clob_response": result,
                 })
             else:
-                self.logger.warning(
-                    "Auto-exit %s order failed for token %s",
-                    reason, token_id[:16] + "...",
+                # If the sell value is below the exchange minimum, this
+                # position is dust and will never be sellable.  Remove it
+                # so we don't retry every cycle.
+                min_sell_usdc = max(
+                    float(MIN_ORDER_SIZE_TOKENS) * adjusted_price,
+                    float(MIN_ORDER_NOTIONAL_USDC),
                 )
+                if sell_usdc < min_sell_usdc:
+                    self.logger.info(
+                        "Position %s is dust ($%.2f < min $%.2f) — "
+                        "removing from tracking",
+                        token_id[:16] + "...", sell_usdc, min_sell_usdc,
+                    )
+                    del self._positions[token_id]
+                    self._save_positions()
+                else:
+                    self.logger.warning(
+                        "Auto-exit %s order failed for token %s",
+                        reason, token_id[:16] + "...",
+                    )
 
         return results
 
