@@ -964,9 +964,15 @@ class PolymarketCLOBClient:
                     )
                     return resp
                 except Exception as fok_exc:
-                    self.logger.info(
-                        "FOK rejected (%s), falling back to GTC", fok_exc,
+                    # FOK failed — the market has moved away from our price.
+                    # Do NOT fall through to a GTC limit order at a stale
+                    # price.  A GTC at the whale's old price will almost
+                    # never fill and just locks up balance.  Abort instead.
+                    self.logger.warning(
+                        "FOK rejected (%s) — aborting (no stale GTC fallback)",
+                        fok_exc,
                     )
+                    return {"status": "fok_rejected", "reason": str(fok_exc)}
 
             # --- GTC (Good-Till-Cancelled) limit order ---
             limit_args = OrderArgs(
@@ -1063,10 +1069,16 @@ class PolymarketCLOBClient:
             return None
 
     def get_new_trades(self, address):
-        """Return only trades we have not seen before for *address*."""
+        """Return only trades we have not seen before for *address*.
+
+        Trades older than ``trade_max_age_seconds`` (default 30) are
+        automatically discarded so the bot never executes at a stale price.
+        """
         address = address.lower()
         all_trades = self.get_trades_for_address(address)
         seen = self._last_trade_ids.get(address, set())
+        max_age = self.cfg.get("trade_max_age_seconds", 30)
+        now = time.time()
         new_trades = []
         for trade in all_trades:
             tid = (
@@ -1076,8 +1088,37 @@ class PolymarketCLOBClient:
                 or trade.get("transactionHash", "")
             )
             if tid and tid not in seen:
-                new_trades.append(trade)
                 seen.add(tid)
+
+                # --- Staleness filter ---
+                # Try to extract the trade timestamp so we can skip trades
+                # that are too old by the time we detect them.
+                trade_ts = (
+                    trade.get("matchTime")          # CLOB API epoch-second
+                    or trade.get("timestamp")
+                    or trade.get("createdAt")
+                    or trade.get("blockTimestamp")
+                )
+                if trade_ts is not None:
+                    try:
+                        ts_val = float(trade_ts)
+                        # If value looks like epoch-millis, convert
+                        if ts_val > 1e12:
+                            ts_val = ts_val / 1000.0
+                        age = now - ts_val
+                        if age > max_age:
+                            self.logger.info(
+                                "STALE TRADE: skipping trade %s (age=%.1fs > "
+                                "max=%ds) for %s",
+                                str(tid)[:16], age, max_age, address[:10],
+                            )
+                            continue
+                        # Annotate trade with detection latency for logging
+                        trade["_detection_latency_s"] = round(age, 2)
+                    except (ValueError, TypeError):
+                        pass  # unparseable timestamp — proceed anyway
+
+                new_trades.append(trade)
         self._last_trade_ids[address] = seen
         return new_trades
 
@@ -3764,18 +3805,11 @@ class TradeExecutor:
             # allowance approval use the real order size (not the pre-bump
             # amount that place_order would silently inflate).
             #
-            # Use the slippage-adjusted, rounded price so the minimum here
-            # matches what place_order() will actually submit.  Previously
-            # this used the raw market price, which was too low once
-            # slippage bumped the effective price up.
+            # Use the whale's price directly — no adverse slippage applied.
             price_f = float(price) if not isinstance(price, float) else price
             if price_f > 0:
-                slippage_mult_f = float(self.slippage_bps) / 10000.0
-                if side == "BUY":
-                    effective_price = min(price_f * (1 + slippage_mult_f), 0.99)
-                else:
-                    effective_price = max(price_f * (1 - slippage_mult_f), 0.01)
-                effective_price = round(effective_price, 2)
+                effective_price = round(price_f, 2)
+                effective_price = max(min(effective_price, 0.99), 0.01)
                 min_viable_usdc = max(
                     MIN_ORDER_SIZE_TOKENS * effective_price,
                     MIN_ORDER_NOTIONAL_USDC,
@@ -3821,10 +3855,13 @@ class TradeExecutor:
                         )
                         copy_amount = held_usdc
 
+            # Log latency info if the trade was annotated by get_new_trades()
+            detection_latency = trade_info.get("_detection_latency_s")
+            latency_str = " [latency=%.1fs]" % detection_latency if detection_latency else ""
             self.logger.info(
-                "COPY TRADE: %s %.2f USDC of token %s (original: %.2f USDC, price: %s)",
+                "COPY TRADE: %s %.2f USDC of token %s (original: %.2f USDC, price: %s)%s",
                 side, copy_amount, token_id[:16] + "..." if len(token_id) > 16 else token_id,
-                original_usdc, price,
+                original_usdc, price, latency_str,
             )
 
             # --- DRY RUN: log but do not execute ---
@@ -3855,13 +3892,21 @@ class TradeExecutor:
 
             # Place order via the CLOB API (requires py-clob-client + API creds)
             if self.clob_client and self.clob_client.clob_sdk:
-                # Apply slippage to price
-                slippage_mult = Decimal(str(self.slippage_bps)) / Decimal("10000")
+                # Use the current mid-price (fetched during stale-price check)
+                # as our limit price instead of blindly applying slippage to
+                # the whale's historical price.  The whale's price is stale by
+                # the time we execute — using it (+ adverse slippage) guaranteed
+                # we'd pay MORE on buys and receive LESS on sells.
+                #
+                # New approach: use the whale's price directly as our limit.
+                # For BUYs this means we won't pay more than the whale did.
+                # For SELLs we won't sell for less than the whale did.
+                # The FOK order type ensures instant fill or no fill — no
+                # stale GTC orders sitting on the book.
+                adjusted_price = float(Decimal(str(price)))
                 if side == "BUY":
-                    adjusted_price = float(Decimal(str(price)) * (Decimal("1") + slippage_mult))
                     adjusted_price = min(adjusted_price, 0.99)
                 else:
-                    adjusted_price = float(Decimal(str(price)) * (Decimal("1") - slippage_mult))
                     adjusted_price = max(adjusted_price, 0.01)
 
                 # --- Stale price protection ---
@@ -4463,9 +4508,22 @@ class CopyTraderBot:
                         for addr in self.cfg.get("watched_addresses", []):
                             api_trades = self.clob_client.get_new_trades(addr)
                             if api_trades:
+                                latencies = [
+                                    t.get("_detection_latency_s")
+                                    for t in api_trades
+                                    if t.get("_detection_latency_s") is not None
+                                ]
+                                latency_info = ""
+                                if latencies:
+                                    latency_info = (
+                                        " (avg latency=%.1fs, max=%.1fs)"
+                                        % (sum(latencies) / len(latencies),
+                                           max(latencies))
+                                    )
                                 self.logger.info(
-                                    "CLOB API: %d new trade(s) from %s",
+                                    "CLOB API: %d new trade(s) from %s%s",
                                     len(api_trades), addr[:10] + "...",
+                                    latency_info,
                                 )
                                 new_trades.extend(api_trades)
 
@@ -4508,11 +4566,12 @@ class CopyTraderBot:
                 self.logger.error("Error in monitoring loop: %s", exc, exc_info=True)
                 self._notify("ERROR in monitoring loop: %s" % exc)
 
-            # Sleep with early-exit check
-            for _ in range(int(poll_interval)):
-                if not self.running:
-                    break
-                time.sleep(1)
+            # Sleep with early-exit check (supports sub-second poll intervals)
+            sleep_remaining = float(poll_interval)
+            sleep_step = min(0.5, sleep_remaining)
+            while sleep_remaining > 0 and self.running:
+                time.sleep(sleep_step)
+                sleep_remaining -= sleep_step
 
         self._generate_stop_report()
         self.logger.info("Bot stopped")
