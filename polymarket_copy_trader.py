@@ -112,6 +112,10 @@ GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 # Polymarket Data API (user activity, positions, trades)
 DATA_API_BASE = "https://data-api.polymarket.com"
 
+# Positions persistence file — stores redemption params so they
+# survive restarts and don't depend on the Gamma API at redeem time.
+POSITIONS_FILE = "positions.json"
+
 # Polymarket Proxy Wallet Factory on Polygon
 # Deploys lightweight proxy wallets for Polymarket users; each EOA has
 # at most one proxy.  The factory exposes a mapping to look up the proxy
@@ -1110,10 +1114,11 @@ class TradeExecutor:
         self._proxy_discovery_done = False
         self._proxy_is_safe = False  # True when proxy is a Gnosis Safe
 
-        # Position tracker: token_id -> {tokens: Decimal, entry_price: Decimal}
-        # Prevents selling tokens we never bought, caps sells to what we
-        # actually hold, and enables take-profit / stop-loss exits.
-        self._positions = {}  # type: dict[str, dict]
+        # Position tracker: token_id -> {tokens, entry_price, neg_risk,
+        #   condition_id, collateral_token, parent_collection_id, index_sets}
+        # Stores all redemption parameters at trade time so we never need
+        # to look them up again via the Gamma API.
+        self._positions = self._load_positions()
 
         # Contract handles
         self.usdc = w3.eth.contract(
@@ -1143,6 +1148,66 @@ class TradeExecutor:
     def _reset_nonce(self):
         with self._nonce_lock:
             self._nonce = None
+
+    # ------------------------------------------------------------------
+    # Position persistence
+    # ------------------------------------------------------------------
+
+    @property
+    def _positions_file(self):
+        return self.cfg.get("positions_file", POSITIONS_FILE)
+
+    def _load_positions(self):
+        """Load positions from disk.  Returns empty dict on failure."""
+        try:
+            with open(self._positions_file, "r") as fh:
+                raw = json.load(fh)
+            positions = {}
+            for tid, entry in raw.items():
+                positions[tid] = {
+                    "tokens": Decimal(str(entry.get("tokens", 0))),
+                    "entry_price": Decimal(str(entry.get("entry_price", 0))),
+                    "neg_risk": entry.get("neg_risk", False),
+                    "condition_id": entry.get("condition_id"),
+                    "collateral_token": entry.get("collateral_token", USDC_ADDRESS),
+                    "parent_collection_id": entry.get(
+                        "parent_collection_id", "0x" + "00" * 32,
+                    ),
+                    "index_sets": entry.get("index_sets", [1, 2]),
+                }
+            self.logger.info(
+                "Loaded %d position(s) from %s", len(positions), self._positions_file,
+            )
+            return positions
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            self.logger.warning("Could not load positions file: %s", exc)
+            return {}
+
+    def _save_positions(self):
+        """Persist current positions to disk (atomic write)."""
+        try:
+            serialisable = {}
+            for tid, pos in self._positions.items():
+                serialisable[tid] = {
+                    "tokens": str(pos["tokens"]),
+                    "entry_price": str(pos["entry_price"]),
+                    "neg_risk": pos.get("neg_risk", False),
+                    "condition_id": pos.get("condition_id"),
+                    "collateral_token": pos.get("collateral_token", USDC_ADDRESS),
+                    "parent_collection_id": pos.get(
+                        "parent_collection_id", "0x" + "00" * 32,
+                    ),
+                    "index_sets": pos.get("index_sets", [1, 2]),
+                }
+            pf = self._positions_file
+            tmp = pf + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(serialisable, fh, indent=2)
+            os.replace(tmp, pf)
+        except Exception as exc:
+            self.logger.warning("Could not save positions: %s", exc)
 
     def get_usdc_balance(self, max_age_seconds=15):
         """Return USDC balance as a Decimal (6 decimals).
@@ -1376,6 +1441,7 @@ class TradeExecutor:
                 self.invalidate_balance_cache()
                 # Clear the position
                 del self._positions[token_id]
+                self._save_positions()
 
                 order_id = None
                 if isinstance(result, dict):
@@ -1468,26 +1534,34 @@ class TradeExecutor:
 
         for token_id in token_ids:
             try:
-                # 2. Look up market info to get condition_id and neg_risk
-                market = self.clob_client.get_market_by_token(token_id)
-                if not market:
-                    no_market_count += 1
-                    self.logger.debug(
-                        "No market info found for token %s", token_id[:16] + "...",
-                    )
-                    continue
+                # 2. Look up market info — first check persisted positions,
+                #    then fall back to API lookup.
+                existing_pos = self._positions.get(token_id)
+                condition_id = existing_pos.get("condition_id") if existing_pos else None
+                neg_risk = existing_pos.get("neg_risk", False) if existing_pos else False
 
-                condition_id = market.get("condition_id")
                 if not condition_id:
-                    self.logger.debug(
-                        "No condition_id for token %s (%s)",
-                        token_id[:16] + "...",
-                        market.get("question", "?")[:40],
-                    )
-                    no_market_count += 1
-                    continue
+                    market = self.clob_client.get_market_by_token(token_id)
+                    if not market:
+                        no_market_count += 1
+                        self.logger.debug(
+                            "No market info found for token %s", token_id[:16] + "...",
+                        )
+                        continue
 
-                neg_risk = self._is_neg_risk_market(market)
+                    condition_id = market.get("condition_id")
+                    if not condition_id:
+                        self.logger.debug(
+                            "No condition_id for token %s (%s)",
+                            token_id[:16] + "...",
+                            market.get("question", "?")[:40],
+                        )
+                        no_market_count += 1
+                        continue
+
+                    neg_risk = self._is_neg_risk_market(market)
+                else:
+                    market = None  # already have what we need
 
                 # 3. Check on-chain balance (correct contract for market type)
                 ct_balance = self._get_token_balance(
@@ -1515,7 +1589,12 @@ class TradeExecutor:
                             "tokens": tokens,
                             "entry_price": entry_price,
                             "neg_risk": neg_risk,
+                            "condition_id": condition_id,
+                            "collateral_token": USDC_ADDRESS,
+                            "parent_collection_id": "0x" + "00" * 32,
+                            "index_sets": [1, 2],
                         }
+                        self._save_positions()
                         active_seeded += 1
                         if entry_price > 0:
                             self.logger.info(
@@ -1566,6 +1645,7 @@ class TradeExecutor:
                     self.invalidate_balance_cache()
                     # Remove from position tracker if it was there
                     self._positions.pop(token_id, None)
+                    self._save_positions()
                     results.append({
                         "status": "redeemed",
                         "token_id": token_id,
@@ -1772,20 +1852,26 @@ class TradeExecutor:
                 continue
 
             try:
-                # 1. Look up market via Gamma API to get condition_id
-                market = self.clob_client.get_market_by_token(token_id)
-                if not market:
-                    continue
+                # 1. Use persisted condition_id if available; fall back to API
+                condition_id = pos.get("condition_id")
+                neg_risk = pos.get("neg_risk", False)
 
-                condition_id = market.get("condition_id")
                 if not condition_id:
-                    self.logger.debug(
-                        "Market for token %s has no condition_id, skipping",
-                        token_id[:16] + "...",
-                    )
-                    continue
-
-                neg_risk = pos.get("neg_risk", self._is_neg_risk_market(market))
+                    market = self.clob_client.get_market_by_token(token_id)
+                    if not market:
+                        continue
+                    condition_id = market.get("condition_id")
+                    if not condition_id:
+                        self.logger.debug(
+                            "Market for token %s has no condition_id, skipping",
+                            token_id[:16] + "...",
+                        )
+                        continue
+                    neg_risk = self._is_neg_risk_market(market)
+                    # Backfill redemption params into the position
+                    pos["condition_id"] = condition_id
+                    pos["neg_risk"] = neg_risk
+                    self._save_positions()
 
                 # 2. On-chain resolution check.  Tries the API's
                 #    condition_id directly, then derives the real CTF
@@ -1807,6 +1893,7 @@ class TradeExecutor:
                         token_id[:16] + "...",
                     )
                     del self._positions[token_id]
+                    self._save_positions()
                     continue
 
                 self.logger.info(
@@ -1843,6 +1930,7 @@ class TradeExecutor:
                     )
                     self.invalidate_balance_cache()
                     del self._positions[token_id]
+                    self._save_positions()
                     results.append({
                         "status": "redeemed",
                         "condition_id": condition_id,
@@ -2506,16 +2594,19 @@ class TradeExecutor:
         results = []
         for token_id in token_ids:
             try:
-                # Look up market first to determine Neg Risk status
-                market = self.clob_client.get_market_by_token(token_id)
-                if not market:
-                    continue
+                # Use persisted condition_id if available; fall back to API
+                existing_pos = self._positions.get(token_id)
+                condition_id = existing_pos.get("condition_id") if existing_pos else None
+                neg_risk = existing_pos.get("neg_risk", False) if existing_pos else False
 
-                condition_id = market.get("condition_id")
                 if not condition_id:
-                    continue
-
-                neg_risk = self._is_neg_risk_market(market)
+                    market = self.clob_client.get_market_by_token(token_id)
+                    if not market:
+                        continue
+                    condition_id = market.get("condition_id")
+                    if not condition_id:
+                        continue
+                    neg_risk = self._is_neg_risk_market(market)
 
                 # Check token balance on the correct contract for the proxy
                 ct_balance = self._get_token_balance(
@@ -2760,14 +2851,18 @@ class TradeExecutor:
             )
             price = trade_info.get("price", 0.5)
 
-            # Detect whether this is a Neg Risk market (needed for correct
-            # exchange approval and later redemption).
+            # Detect whether this is a Neg Risk market and capture the
+            # condition_id — both are needed for correct exchange approval
+            # and later redemption.
             neg_risk = False
+            condition_id = None
+            market = None
             if self.clob_client:
                 try:
                     market = self.clob_client.get_market_by_token(token_id)
                     if market:
                         neg_risk = self._is_neg_risk_market(market)
+                        condition_id = market.get("condition_id")
                 except Exception:
                     pass
 
@@ -2873,12 +2968,19 @@ class TradeExecutor:
                     self.logger.info("Order submitted to CLOB: %s", result)
                     self.invalidate_balance_cache()
 
-                    # Update position tracker
+                    # Update position tracker — include all redemption params
                     tokens = (
                         copy_amount / Decimal(str(adjusted_price))
                         if adjusted_price > 0
                         else Decimal("0")
                     )
+                    redeem_params = {
+                        "neg_risk": neg_risk,
+                        "condition_id": condition_id,
+                        "collateral_token": USDC_ADDRESS,
+                        "parent_collection_id": "0x" + "00" * 32,
+                        "index_sets": [1, 2],
+                    }
                     if side == "BUY":
                         pos = self._positions.get(token_id)
                         if pos:
@@ -2894,12 +2996,12 @@ class TradeExecutor:
                             )
                             pos["tokens"] = total_tokens
                             pos["entry_price"] = avg_price
-                            pos["neg_risk"] = neg_risk
+                            pos.update(redeem_params)
                         else:
                             self._positions[token_id] = {
                                 "tokens": tokens,
                                 "entry_price": Decimal(str(adjusted_price)),
-                                "neg_risk": neg_risk,
+                                **redeem_params,
                             }
                     elif side == "SELL":
                         pos = self._positions.get(token_id)
@@ -2908,6 +3010,19 @@ class TradeExecutor:
                             # Remove position entirely if fully closed
                             if pos["tokens"] <= 0:
                                 del self._positions[token_id]
+
+                    # Log redemption parameters for every trade
+                    self.logger.info(
+                        "Redemption params for token %s: "
+                        "conditionId=%s, collateralToken=%s, "
+                        "parentCollectionId=0x00..00, indexSets=[1,2], "
+                        "neg_risk=%s",
+                        token_id[:16] + "...",
+                        condition_id[:16] + "..." if condition_id else "UNKNOWN",
+                        USDC_ADDRESS,
+                        neg_risk,
+                    )
+
                     cur_tokens = (
                         self._positions[token_id]["tokens"]
                         if token_id in self._positions
@@ -2918,6 +3033,9 @@ class TradeExecutor:
                         token_id[:16] + "...",
                         cur_tokens,
                     )
+
+                    # Persist to disk so redemption params survive restarts
+                    self._save_positions()
 
                     # Track the order for fill monitoring
                     order_id = None
