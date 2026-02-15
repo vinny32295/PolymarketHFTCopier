@@ -370,6 +370,7 @@ DEFAULT_CONFIG = {
     "resume_threshold_usdc": 5.0,
     "take_profit_price": 0.99,
     "stop_loss_pct": 50,
+    "exit_check_seconds": 5,
     "auto_redeem_settled": True,
     "proxy_redeem": True,
     "proxy_withdraw": True,
@@ -1632,14 +1633,24 @@ class TradeExecutor:
 
         return results
 
+    # Maximum number of failed redemption/resolution attempts before we
+    # give up on a position and remove it from tracking.
+    MAX_REDEEM_RETRIES = 5
+
     def _try_onchain_redeem(self, token_id, pos, reason):
         """Attempt on-chain redemption for a position whose orderbook is dead.
 
         When the CLOB returns "orderbook does not exist", the market has
         resolved and the tokens can only be redeemed on-chain — not sold.
 
+        Transient failures (no condition_id, RPC errors, failed txs) are
+        retried up to MAX_REDEEM_RETRIES times before the position is
+        removed.  This prevents a single hiccup from logging a false
+        100% loss.
+
         Returns a result dict on success, or None.
         """
+        retries = pos.get("_redeem_retries", 0)
         condition_id = pos.get("condition_id")
         neg_risk = pos.get("neg_risk", False)
 
@@ -1658,17 +1669,28 @@ class TradeExecutor:
             condition_id = self.clob_client._token_to_condition.get(token_id)
 
         if not condition_id:
-            self.logger.warning(
-                "Cannot redeem token %s — no condition_id available. "
-                "Removing stale position from tracking.",
-                token_id[:16] + "...",
-            )
-            self._log_closed_trade(
-                token_id, pos.get("entry_price", 0), 0,
-                pos.get("tokens", 0), "stale",
-            )
-            self._positions.pop(token_id, None)
-            self._save_positions()
+            retries += 1
+            pos["_redeem_retries"] = retries
+            if retries >= self.MAX_REDEEM_RETRIES:
+                self.logger.warning(
+                    "Cannot redeem token %s — no condition_id after %d "
+                    "attempts. Removing stale position from tracking.",
+                    token_id[:16] + "...", retries,
+                )
+                self._log_closed_trade(
+                    token_id, pos.get("entry_price", 0), 0,
+                    pos.get("tokens", 0), "stale",
+                )
+                self._positions.pop(token_id, None)
+                self._save_positions()
+            else:
+                self.logger.info(
+                    "Cannot redeem token %s — no condition_id (attempt "
+                    "%d/%d). Will retry next cycle.",
+                    token_id[:16] + "...", retries,
+                    self.MAX_REDEEM_RETRIES,
+                )
+                self._save_positions()
             return None
 
         # Check if actually resolved on-chain
@@ -1677,31 +1699,40 @@ class TradeExecutor:
                 condition_id, neg_risk=neg_risk,
             )
         except Exception as exc:
-            self.logger.warning(
-                "On-chain resolution check failed for token %s: %s",
-                token_id[:16] + "...", exc,
-            )
-            # Remove from tracking to stop retry spam
-            self._log_closed_trade(
-                token_id, pos.get("entry_price", 0), 0,
-                pos.get("tokens", 0), "resolution_error",
-            )
-            self._positions.pop(token_id, None)
-            self._save_positions()
+            retries += 1
+            pos["_redeem_retries"] = retries
+            if retries >= self.MAX_REDEEM_RETRIES:
+                self.logger.warning(
+                    "On-chain resolution check failed for token %s "
+                    "after %d attempts: %s — removing from tracking",
+                    token_id[:16] + "...", retries, exc,
+                )
+                self._log_closed_trade(
+                    token_id, pos.get("entry_price", 0), 0,
+                    pos.get("tokens", 0), "resolution_error",
+                )
+                self._positions.pop(token_id, None)
+                self._save_positions()
+            else:
+                self.logger.info(
+                    "On-chain resolution check failed for token %s: "
+                    "%s (attempt %d/%d). Will retry.",
+                    token_id[:16] + "...", exc, retries,
+                    self.MAX_REDEEM_RETRIES,
+                )
+                self._save_positions()
             return None
 
         if payout_denom == 0:
+            # Market not resolved yet — keep the position so the
+            # stop-loss can still fire once the orderbook comes back,
+            # or we can redeem when it does resolve.
             self.logger.info(
                 "Market not resolved on-chain for token %s — "
-                "orderbook dead but not settled yet. Removing from tracking.",
+                "orderbook dead but not settled yet. Keeping position "
+                "for retry.",
                 token_id[:16] + "...",
             )
-            self._log_closed_trade(
-                token_id, pos.get("entry_price", 0), 0,
-                pos.get("tokens", 0), "unresolved_market",
-            )
-            self._positions.pop(token_id, None)
-            self._save_positions()
             return None
 
         # Market IS resolved — redeem on-chain!
@@ -1741,27 +1772,48 @@ class TradeExecutor:
                     "tx_hash": receipt.transactionHash.hex(),
                 }
             else:
+                retries += 1
+                pos["_redeem_retries"] = retries
+                if retries >= self.MAX_REDEEM_RETRIES:
+                    self.logger.warning(
+                        "Redemption tx failed for token %s after %d "
+                        "attempts — removing from tracking",
+                        token_id[:16] + "...", retries,
+                    )
+                    self._log_closed_trade(
+                        token_id, pos.get("entry_price", 0), 0,
+                        pos.get("tokens", 0), "failed_redeem",
+                    )
+                    self._positions.pop(token_id, None)
+                else:
+                    self.logger.info(
+                        "Redemption tx failed for token %s (attempt "
+                        "%d/%d). Will retry.",
+                        token_id[:16] + "...", retries,
+                        self.MAX_REDEEM_RETRIES,
+                    )
+                self._save_positions()
+        except Exception as exc:
+            retries += 1
+            pos["_redeem_retries"] = retries
+            if retries >= self.MAX_REDEEM_RETRIES:
                 self.logger.warning(
-                    "Redemption tx failed for token %s — removing from tracking",
-                    token_id[:16] + "...",
+                    "On-chain redeem failed for token %s after %d "
+                    "attempts: %s — removing from tracking",
+                    token_id[:16] + "...", retries, exc,
                 )
                 self._log_closed_trade(
                     token_id, pos.get("entry_price", 0), 0,
                     pos.get("tokens", 0), "failed_redeem",
                 )
                 self._positions.pop(token_id, None)
-                self._save_positions()
-        except Exception as exc:
-            self.logger.warning(
-                "On-chain redeem failed for token %s: %s — "
-                "removing from tracking",
-                token_id[:16] + "...", exc,
-            )
-            self._log_closed_trade(
-                token_id, pos.get("entry_price", 0), 0,
-                pos.get("tokens", 0), "failed_redeem",
-            )
-            self._positions.pop(token_id, None)
+            else:
+                self.logger.info(
+                    "On-chain redeem failed for token %s: %s "
+                    "(attempt %d/%d). Will retry.",
+                    token_id[:16] + "...", exc, retries,
+                    self.MAX_REDEEM_RETRIES,
+                )
             self._save_positions()
 
         return None
@@ -2204,12 +2256,15 @@ class TradeExecutor:
                 if ct_balance == 0:
                     self.logger.info(
                         "Market resolved but no on-chain tokens for %s — "
-                        "clearing stale position",
+                        "clearing stale position (likely redeemed externally)",
                         token_id[:16] + "...",
                     )
+                    # Tokens already gone — likely redeemed via Polymarket
+                    # UI.  Log at entry_price (unknown actual exit).
                     self._log_closed_trade(
-                        token_id, pos.get("entry_price", 0), 0,
-                        pos.get("tokens", 0), "stale",
+                        token_id, pos.get("entry_price", 0),
+                        pos.get("entry_price", 0),
+                        pos.get("tokens", 0), "redeemed_external",
                     )
                     del self._positions[token_id]
                     self._save_positions()
@@ -3686,6 +3741,8 @@ class CopyTraderBot:
         _last_redeem_check = 0  # timestamp of last settled-position redemption scan
         _last_proxy_check = 0   # timestamp of last proxy wallet redemption scan
         _last_portfolio_scan = 0  # timestamp of last full portfolio scan
+        _last_exit_check = 0  # timestamp of last exit-condition check
+        exit_check_interval = self.cfg.get("exit_check_seconds", 5)
 
         while self.running:
             try:
@@ -3742,7 +3799,14 @@ class CopyTraderBot:
 
                 # --- Auto-exit positions at take-profit / stop-loss ---
                 # Runs even while paused so we protect existing positions.
-                if self.executor:
+                # Uses its own faster timer (default 5s) independent of
+                # the poll interval to catch price moves quickly.
+                now_exit = time.time()
+                if (
+                    self.executor
+                    and now_exit - _last_exit_check >= exit_check_interval
+                ):
+                    _last_exit_check = now_exit
                     try:
                         self.executor.check_exit_conditions()
                     except Exception as exit_exc:
@@ -4188,6 +4252,15 @@ class CopyTraderGUI:
         self.poll_entry = ttk.Entry(parent, width=20)
         self.poll_entry.grid(row=row, column=1, sticky=tk.W, pady=3)
 
+        # Exit check interval
+        row += 1
+        ttk.Label(parent, text="Exit Check Interval (seconds):").grid(row=row, column=0, sticky=tk.W, pady=3)
+        exit_frame = ttk.Frame(parent)
+        exit_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
+        self.exit_check_entry = ttk.Entry(exit_frame, width=10)
+        self.exit_check_entry.pack(side=tk.LEFT)
+        ttk.Label(exit_frame, text="(how often TP/SL prices are checked)").pack(side=tk.LEFT, padx=5)
+
         # Use CLOB API checkbox
         row += 1
         self.use_clob_var = tk.BooleanVar(value=True)
@@ -4417,6 +4490,7 @@ class CopyTraderGUI:
         self.take_profit_entry.insert(0, str(self.cfg.get("take_profit_price", 0.99)))
         self.stop_loss_entry.insert(0, str(self.cfg.get("stop_loss_pct", 50)))
         self.poll_entry.insert(0, str(self.cfg.get("poll_interval_seconds", 15)))
+        self.exit_check_entry.insert(0, str(self.cfg.get("exit_check_seconds", 5)))
         self.use_clob_var.set(self.cfg.get("use_clob_api", True))
         self.dry_run_var.set(self.cfg.get("dry_run", False))
         self.auto_redeem_var.set(self.cfg.get("auto_redeem_settled", True))
@@ -4467,6 +4541,12 @@ class CopyTraderGUI:
             pass
         try:
             self.cfg["poll_interval_seconds"] = int(self.poll_entry.get().strip())
+        except ValueError:
+            pass
+        try:
+            val = int(self.exit_check_entry.get().strip())
+            if val >= 1:
+                self.cfg["exit_check_seconds"] = val
         except ValueError:
             pass
         self.cfg["watched_addresses"] = list(self.addr_listbox.get(0, tk.END))
@@ -4657,6 +4737,8 @@ def run_headless():
         cfg["take_profit_price"] = float(os.environ["TAKE_PROFIT_PRICE"])
     if os.environ.get("STOP_LOSS_PCT"):
         cfg["stop_loss_pct"] = float(os.environ["STOP_LOSS_PCT"])
+    if os.environ.get("EXIT_CHECK_SECONDS"):
+        cfg["exit_check_seconds"] = int(os.environ["EXIT_CHECK_SECONDS"])
     if os.environ.get("AUTO_REDEEM_SETTLED"):
         cfg["auto_redeem_settled"] = os.environ["AUTO_REDEEM_SETTLED"].lower() in ("1", "true", "yes")
     if os.environ.get("PROXY_REDEEM"):
