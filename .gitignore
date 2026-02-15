@@ -19,9 +19,10 @@ build/
 venv/
 env/
 
-# Logs
+# Logs & session reports
 bot.log
 *.log
+session_*_report.json
 
 # IDE
 .vscode/

@@ -312,6 +312,10 @@ NEG_RISK_ADAPTER_ABI = json.loads("""[
 # How often to check for redeemable (settled) positions (seconds)
 REDEEM_CHECK_INTERVAL_SECONDS = 300  # 5 minutes
 
+# When paused for low balance, check for settlements much more
+# aggressively so we can redeem USDC and resume trading quickly.
+PAUSED_REDEEM_INTERVAL_SECONDS = 30  # every 30 s while paused
+
 # How often to run the full portfolio scan (more expensive than the
 # periodic check_and_redeem_settled because it queries the Data API
 # for the wallet's complete trade history).
@@ -337,9 +341,8 @@ DEFAULT_CONFIG = {
     "clob_api_secret": "",
     "clob_api_passphrase": "",
     "dry_run": False,
-    "fixed_trade_usdc": 0.0,
     "order_ttl_seconds": 30,
-    "resume_threshold_usdc": 150.0,
+    "resume_threshold_usdc": 5.0,
     "auto_redeem_settled": True,
     "proxy_redeem": True,
     "proxy_withdraw": True,
@@ -753,12 +756,11 @@ class PolymarketCLOBClient:
         return None
 
     def place_order(self, token_id, side, size_usdc, price, neg_risk=False):
-        """Place a Fill-or-Kill (FOK) market order on the Polymarket CLOB.
+        """Place a GTC (Good-Till-Cancelled) limit order on the Polymarket CLOB.
 
-        FOK orders either fill immediately at the given price or are
-        cancelled — no funds are left locked in open limit orders.
-
-        Requires the py-clob-client SDK with valid API credentials.
+        The order rests on the book until it fills or is explicitly
+        cancelled.  The bot's order monitor tracks open orders and
+        cancels stale ones periodically.
 
         Args:
             token_id: The conditional token ID to trade.
@@ -791,9 +793,6 @@ class PolymarketCLOBClient:
             if effective_usdc > size_usdc:
                 if side.upper() == "SELL":
                     # SELL orders: never bump beyond what we actually hold.
-                    # If the position value is below the exchange minimum,
-                    # skip the order rather than inflating to tokens we
-                    # don't own (which would fail with "not enough balance").
                     self.logger.warning(
                         "SELL size $%.2f below minimum $%.2f — skipping "
                         "(cannot inflate sell beyond held tokens)",
@@ -811,58 +810,27 @@ class PolymarketCLOBClient:
                 )
             actual_usdc = effective_usdc
 
-            # Try FOK (Fill-or-Kill) first — fills instantly or gets
-            # cancelled, so no balance is locked in open orders.
-            order_args = MarketOrderArgs(
-                token_id=token_id,
-                price=round(price, 2),
-                amount=round(actual_usdc, 6),
-                side=side.upper(),
-                order_type=OrderType.FOK,
-            )
+            rounded_price = round(price, 2)
+            if rounded_price <= 0:
+                self.logger.error("Price rounds to zero – cannot place order")
+                return None
+            size_tokens = round(actual_usdc / rounded_price, 2)
 
-            try:
-                signed_order = self.clob_sdk.create_market_order(order_args)
-                resp = self.clob_sdk.post_order(
-                    signed_order, orderType=OrderType.FOK,
-                )
-                self.logger.info(
-                    "FOK order placed: %s $%.2f @ %.4f for token %s — %s",
-                    side, actual_usdc, price, token_id[:16] + "...", resp,
-                )
-                return resp
-            except Exception as fok_exc:
-                fok_msg = str(fok_exc)
-                if "fully filled" not in fok_msg:
-                    # Not a liquidity issue — propagate
-                    raise
-                # FOK failed due to insufficient liquidity at this price.
-                # Fall back to a GTC limit order so it rests on the book.
-                self.logger.warning(
-                    "FOK could not fill; retrying as GTC limit: "
-                    "%s $%.2f @ %.4f for token %s",
-                    side, actual_usdc, price, token_id[:16] + "...",
-                )
-                rounded_price = round(price, 2)
-                if rounded_price <= 0:
-                    self.logger.error("Price rounds to zero – cannot place GTC order")
-                    return None
-                size_tokens = round(actual_usdc / rounded_price, 2)
-                limit_args = OrderArgs(
-                    price=rounded_price,
-                    size=size_tokens,
-                    side=side.upper(),
-                    token_id=token_id,
-                )
-                signed_limit = self.clob_sdk.create_order(limit_args)
-                resp = self.clob_sdk.post_order(
-                    signed_limit, orderType=OrderType.GTC,
-                )
-                self.logger.info(
-                    "GTC limit order placed: %s $%.2f @ %.4f for token %s — %s",
-                    side, actual_usdc, price, token_id[:16] + "...", resp,
-                )
-                return resp
+            limit_args = OrderArgs(
+                price=rounded_price,
+                size=size_tokens,
+                side=side.upper(),
+                token_id=token_id,
+            )
+            signed_order = self.clob_sdk.create_order(limit_args)
+            resp = self.clob_sdk.post_order(
+                signed_order, orderType=OrderType.GTC,
+            )
+            self.logger.info(
+                "GTC order placed: %s $%.2f @ %.4f for token %s — %s",
+                side, actual_usdc, price, token_id[:16] + "...", resp,
+            )
+            return resp
 
         except Exception as exc:
             self.logger.error("Failed to place CLOB order: %s", exc, exc_info=True)
@@ -1142,7 +1110,6 @@ class TradeExecutor:
         self.logger = logger or logging.getLogger("CopyTrader")
         self.copy_pct = Decimal(str(cfg.get("copy_percentage", 50))) / Decimal("100")
         self.max_trade = Decimal(str(cfg.get("max_trade_usdc", 100)))
-        self.fixed_trade = Decimal(str(cfg.get("fixed_trade_usdc", 0)))
         self.gas_multiplier = cfg.get("gas_multiplier", 1.2)
         self.slippage_bps = cfg.get("slippage_tolerance_bps", 100)
         self._nonce_lock = threading.Lock()
@@ -2801,14 +2768,10 @@ class TradeExecutor:
     def compute_copy_amount(self, original_usdc_amount):
         """Return the copy amount in USDC.
 
-        If fixed_trade_usdc > 0, use that flat amount for every trade.
-        Otherwise scale the original by copy_percentage, capped to max_trade.
+        Scales the original trade by copy_percentage, capped to max_trade.
         When the balance is available, also capped to 95% of it.
         """
-        if self.fixed_trade > 0:
-            base = self.fixed_trade
-        else:
-            base = Decimal(str(original_usdc_amount)) * self.copy_pct
+        base = Decimal(str(original_usdc_amount)) * self.copy_pct
         amount = min(base, self.max_trade)
         try:
             balance = self.get_usdc_balance()
@@ -3155,12 +3118,16 @@ class CopyTraderBot:
         self.logger = logger
         self.running = False
         self._thread = None
+        self._session_start = None
 
         # Low-balance pause state.  When the USDC balance is too low to
         # place any order the bot stops copying new trades and waits for
         # open positions to settle.  Trading resumes once the balance
-        # reaches resume_threshold_usdc (default $100, configurable).
+        # reaches resume_threshold_usdc (default $5, configurable).
         self._paused_low_balance = False
+
+        # Trade history for the current session (for the stop report)
+        self._trade_history = []
 
         # Web3 connection (lazy init)
         self.w3 = None
@@ -3242,8 +3209,7 @@ class CopyTraderBot:
             cfg=self.cfg, private_key=pk, logger=self.logger,
         )
         # Cancel any stale open orders from a previous session so balance
-        # isn't locked up.  With FOK orders this shouldn't happen going
-        # forward, but cleans up legacy GTC orders.
+        # isn't locked up in GTC orders that never filled.
         try:
             resp = self.clob_client.cancel_all_orders()
             if resp:
@@ -3263,6 +3229,8 @@ class CopyTraderBot:
             self.logger.warning("Bot is already running")
             return
         self.running = True
+        self._session_start = datetime.now()
+        self._trade_history = []
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         self.logger.info("Bot started")
@@ -3270,6 +3238,8 @@ class CopyTraderBot:
     def stop(self):
         self.running = False
         self.logger.info("Bot stop requested")
+        # Report is generated at the end of _run_loop after the while
+        # loop exits, so positions and balance are still accessible.
 
     def _run_loop(self):
         """Main monitoring loop."""
@@ -3282,9 +3252,9 @@ class CopyTraderBot:
             watched = self.cfg.get("watched_addresses", [])
             self.on_chain_monitor = OnChainMonitor(self.w3, watched, self.logger)
 
-            # Startup portfolio scan — discover and redeem any settled
-            # positions from the wallet's trade history, and seed active
-            # positions into the tracker.
+            # ---- Startup redemption (runs BEFORE copy-trading begins) ----
+            self.logger.info("Startup: redeeming settled positions before monitoring...")
+
             if self.executor and self.cfg.get("auto_redeem_settled", True):
                 try:
                     self.executor.scan_and_redeem_portfolio()
@@ -3294,8 +3264,6 @@ class CopyTraderBot:
                         scan_exc,
                     )
 
-            # Proxy wallet scan — redeem resolved positions held in the
-            # Polymarket proxy wallet and withdraw USDC to the EOA.
             if self.executor and self.cfg.get("proxy_redeem", True):
                 try:
                     self.executor.scan_and_redeem_proxy_portfolio()
@@ -3305,6 +3273,17 @@ class CopyTraderBot:
                         proxy_exc,
                     )
 
+            # Report balance after redemptions so user knows what's available
+            if self.executor:
+                try:
+                    balance = self.executor.get_usdc_balance(max_age_seconds=0)
+                    self.logger.info(
+                        "Startup redemption complete — USDC balance: $%.2f",
+                        balance,
+                    )
+                except Exception:
+                    pass
+
         poll_interval = self.cfg.get("poll_interval_seconds", 15)
         self.logger.info(
             "Monitoring %d address(es), poll interval %ds",
@@ -3313,7 +3292,7 @@ class CopyTraderBot:
         )
 
         resume_threshold = Decimal(
-            str(self.cfg.get("resume_threshold_usdc", 100))
+            str(self.cfg.get("resume_threshold_usdc", 5))
         )
         _last_pause_log = 0  # timestamp of last "still paused" INFO log
         _last_redeem_check = 0  # timestamp of last settled-position redemption scan
@@ -3341,8 +3320,7 @@ class CopyTraderBot:
                                 if now - _last_pause_log >= 300:
                                     self.logger.info(
                                         "Paused (low balance $%.2f, need $%s "
-                                        "to resume) — waiting for trades to "
-                                        "settle",
+                                        "to resume) — waiting for settlements",
                                         balance, resume_threshold,
                                     )
                                     _last_pause_log = now
@@ -3351,9 +3329,11 @@ class CopyTraderBot:
                             _last_pause_log = time.time()
                             self.logger.warning(
                                 "Balance $%.2f below $%s — pausing new trades. "
-                                "Will resume when balance reaches $%s.",
+                                "Will check for settlements every %ds and "
+                                "resume when balance reaches $%s.",
                                 balance,
                                 LOW_BALANCE_PAUSE_THRESHOLD,
+                                PAUSED_REDEEM_INTERVAL_SECONDS,
                                 resume_threshold,
                             )
                     except Exception as bal_exc:
@@ -3383,20 +3363,28 @@ class CopyTraderBot:
                         )
 
                 # --- Auto-redeem settled positions back to USDC ---
-                # Runs every REDEEM_CHECK_INTERVAL_SECONDS (default 5 min)
-                # even while paused — recovering USDC helps resume trading.
+                # When paused (low balance) we check every 30 s so we
+                # can redeem as trades resolve and resume quickly.
+                # Otherwise checks every 5 min.
                 now = time.time()
+                redeem_interval = (
+                    PAUSED_REDEEM_INTERVAL_SECONDS
+                    if self._paused_low_balance
+                    else REDEEM_CHECK_INTERVAL_SECONDS
+                )
+                _did_redeem = False
                 if (
                     self.executor
                     and self.cfg.get("auto_redeem_settled", True)
-                    and now - _last_redeem_check >= REDEEM_CHECK_INTERVAL_SECONDS
+                    and now - _last_redeem_check >= redeem_interval
                 ):
                     _last_redeem_check = now
                     try:
                         redeemed = self.executor.check_and_redeem_settled()
                         if redeemed:
+                            _did_redeem = True
                             self.logger.info(
-                                "Auto-redeem: %d position(s) processed",
+                                "Auto-redeem: %d position(s) redeemed",
                                 len(redeemed),
                             )
                     except Exception as redeem_exc:
@@ -3410,6 +3398,8 @@ class CopyTraderBot:
                 # expensive than check_and_redeem_settled (which only
                 # checks _positions dict) but catches positions that
                 # were missed or not tracked.
+                # When paused, runs every 15 min to sweep for anything
+                # the lightweight check missed.
                 if (
                     self.executor
                     and self.cfg.get("auto_redeem_settled", True)
@@ -3419,6 +3409,7 @@ class CopyTraderBot:
                     try:
                         scan_results = self.executor.scan_and_redeem_portfolio()
                         if scan_results:
+                            _did_redeem = True
                             self.logger.info(
                                 "Portfolio scan: %d position(s) processed",
                                 len(scan_results),
@@ -3429,17 +3420,22 @@ class CopyTraderBot:
                         )
 
                 # --- Proxy wallet redemption & withdrawal ---
-                # Runs on the same cadence as auto-redeem.  Recovering
-                # USDC from the proxy helps the bot resume trading.
+                # Uses the same accelerated cadence while paused.
+                proxy_interval = (
+                    PAUSED_REDEEM_INTERVAL_SECONDS
+                    if self._paused_low_balance
+                    else REDEEM_CHECK_INTERVAL_SECONDS
+                )
                 if (
                     self.executor
                     and self.cfg.get("proxy_redeem", True)
-                    and now - _last_proxy_check >= REDEEM_CHECK_INTERVAL_SECONDS
+                    and now - _last_proxy_check >= proxy_interval
                 ):
                     _last_proxy_check = now
                     try:
                         proxy_results = self.executor.scan_and_redeem_proxy_portfolio()
                         if proxy_results:
+                            _did_redeem = True
                             self.logger.info(
                                 "Proxy check: %d result(s) processed",
                                 len(proxy_results),
@@ -3448,6 +3444,22 @@ class CopyTraderBot:
                         self.logger.debug(
                             "Proxy redemption check error: %s", proxy_exc,
                         )
+
+                # If we just redeemed while paused, immediately re-check
+                # balance so we can resume without waiting another cycle.
+                if _did_redeem and self._paused_low_balance and self.executor:
+                    try:
+                        self.executor.invalidate_balance_cache()
+                        balance = self.executor.get_usdc_balance(max_age_seconds=0)
+                        if balance >= resume_threshold:
+                            self._paused_low_balance = False
+                            self.logger.info(
+                                "Redemption recovered funds — balance $%.2f "
+                                "(>= $%s), resuming trading",
+                                balance, resume_threshold,
+                            )
+                    except Exception:
+                        pass  # will be rechecked next cycle
 
                 # --- Skip trade detection & execution while paused ---
                 if self._paused_low_balance:
@@ -3482,7 +3494,10 @@ class CopyTraderBot:
                     # --- Execute copies ---
                     for trade in new_trades:
                         if self.executor:
-                            self.executor.execute_copy_trade(trade)
+                            result = self.executor.execute_copy_trade(trade)
+                            if result and isinstance(result, dict):
+                                result["timestamp"] = datetime.now().isoformat()
+                                self._trade_history.append(result)
                         else:
                             self.logger.warning(
                                 "Trade detected but executor not ready: %s",
@@ -3498,7 +3513,110 @@ class CopyTraderBot:
                     break
                 time.sleep(1)
 
+        self._generate_stop_report()
         self.logger.info("Bot stopped")
+
+    def _generate_stop_report(self):
+        """Write a session log file and a P/L report with redemption params.
+
+        Creates two files in the working directory:
+        - ``session_<timestamp>.log``  — copy of the bot log
+        - ``session_<timestamp>_report.json`` — structured P/L + positions
+        """
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        session_end = datetime.now()
+
+        # ---- Build P/L report ----
+        buy_total = sum(
+            t.get("amount_usdc", 0)
+            for t in self._trade_history
+            if t.get("side") == "BUY" and t.get("status") == "submitted"
+        )
+        sell_total = sum(
+            t.get("amount_usdc", 0)
+            for t in self._trade_history
+            if t.get("side") == "SELL" and t.get("status") == "submitted"
+        )
+
+        # Current balance
+        current_balance = None
+        if self.executor:
+            try:
+                current_balance = float(self.executor.get_usdc_balance(max_age_seconds=0))
+            except Exception:
+                pass
+
+        # Collect open positions with full redemption params
+        positions = {}
+        if self.executor and hasattr(self.executor, "_positions"):
+            for token_id, pos in self.executor._positions.items():
+                tokens = pos.get("tokens", 0)
+                if isinstance(tokens, Decimal):
+                    tokens = float(tokens)
+                entry_price = pos.get("entry_price", 0)
+                if isinstance(entry_price, Decimal):
+                    entry_price = float(entry_price)
+                positions[token_id] = {
+                    "tokens": tokens,
+                    "entry_price": entry_price,
+                    "cost_basis_usdc": round(tokens * entry_price, 6),
+                    "redemption_params": {
+                        "conditionId": pos.get("condition_id", "UNKNOWN"),
+                        "collateralToken": pos.get("collateral_token", USDC_ADDRESS),
+                        "parentCollectionId": pos.get(
+                            "parent_collection_id", "0x" + "00" * 32,
+                        ),
+                        "indexSets": pos.get("index_sets", [1, 2]),
+                        "neg_risk": pos.get("neg_risk", False),
+                    },
+                }
+
+        report = {
+            "session_start": (
+                self._session_start.isoformat() if self._session_start else None
+            ),
+            "session_end": session_end.isoformat(),
+            "usdc_balance_at_stop": current_balance,
+            "total_trades": len(self._trade_history),
+            "total_bought_usdc": round(buy_total, 6),
+            "total_sold_usdc": round(sell_total, 6),
+            "net_spent_usdc": round(buy_total - sell_total, 6),
+            "trade_history": self._trade_history,
+            "open_positions": positions,
+        }
+
+        # ---- Write report JSON ----
+        report_path = f"session_{ts}_report.json"
+        try:
+            with open(report_path, "w") as f:
+                json.dump(report, f, indent=2, default=str)
+            self.logger.info("P/L report saved: %s", report_path)
+        except Exception as exc:
+            self.logger.warning("Failed to save P/L report: %s", exc)
+
+        # ---- Write session log ----
+        log_path = f"session_{ts}.log"
+        try:
+            src = "bot.log"
+            if os.path.exists(src):
+                import shutil
+                shutil.copy2(src, log_path)
+                self.logger.info("Session log saved: %s", log_path)
+        except Exception as exc:
+            self.logger.warning("Failed to save session log: %s", exc)
+
+        # ---- Log summary to console ----
+        self.logger.info(
+            "Session summary: %d trades | bought $%.2f | sold $%.2f | "
+            "net spent $%.2f | %d open position(s)",
+            len(self._trade_history), buy_total, sell_total,
+            buy_total - sell_total, len(positions),
+        )
+        if positions:
+            self.logger.info(
+                "Open positions with redemption params saved to %s",
+                report_path,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -3632,23 +3750,26 @@ class CopyTraderGUI:
         # Max trade size
         row += 1
         ttk.Label(parent, text="Max Trade (USDC):").grid(row=row, column=0, sticky=tk.W, pady=3)
-        self.max_trade_entry = ttk.Entry(parent, width=20)
-        self.max_trade_entry.grid(row=row, column=1, sticky=tk.W, pady=3)
-
-        # Fixed trade size
-        row += 1
-        ttk.Label(parent, text="Fixed Trade (USDC):").grid(row=row, column=0, sticky=tk.W, pady=3)
-        fixed_frame = ttk.Frame(parent)
-        fixed_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
-        self.fixed_trade_entry = ttk.Entry(fixed_frame, width=10)
-        self.fixed_trade_entry.pack(side=tk.LEFT)
-        ttk.Label(fixed_frame, text="(0 = use % scaling)").pack(side=tk.LEFT, padx=5)
+        max_frame = ttk.Frame(parent)
+        max_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
+        self.max_trade_entry = ttk.Entry(max_frame, width=10)
+        self.max_trade_entry.pack(side=tk.LEFT)
+        ttk.Label(max_frame, text="(caps each copy trade)").pack(side=tk.LEFT, padx=5)
 
         # Slippage
         row += 1
         ttk.Label(parent, text="Slippage Tolerance (bps):").grid(row=row, column=0, sticky=tk.W, pady=3)
         self.slippage_entry = ttk.Entry(parent, width=20)
         self.slippage_entry.grid(row=row, column=1, sticky=tk.W, pady=3)
+
+        # Resume threshold
+        row += 1
+        ttk.Label(parent, text="Resume Threshold (USDC):").grid(row=row, column=0, sticky=tk.W, pady=3)
+        resume_frame = ttk.Frame(parent)
+        resume_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
+        self.resume_threshold_entry = ttk.Entry(resume_frame, width=10)
+        self.resume_threshold_entry.pack(side=tk.LEFT)
+        ttk.Label(resume_frame, text="(min balance to resume after pause)").pack(side=tk.LEFT, padx=5)
 
         # Poll interval
         row += 1
@@ -3767,8 +3888,8 @@ class CopyTraderGUI:
         self.ws_rpc_entry.insert(0, self.cfg.get("ws_rpc_url", ""))
         self.copy_pct_var.set(self.cfg.get("copy_percentage", 50))
         self.max_trade_entry.insert(0, str(self.cfg.get("max_trade_usdc", 100)))
-        self.fixed_trade_entry.insert(0, str(self.cfg.get("fixed_trade_usdc", 0)))
         self.slippage_entry.insert(0, str(self.cfg.get("slippage_tolerance_bps", 100)))
+        self.resume_threshold_entry.insert(0, str(self.cfg.get("resume_threshold_usdc", 5)))
         self.poll_entry.insert(0, str(self.cfg.get("poll_interval_seconds", 15)))
         self.use_clob_var.set(self.cfg.get("use_clob_api", True))
         self.dry_run_var.set(self.cfg.get("dry_run", False))
@@ -3799,11 +3920,11 @@ class CopyTraderGUI:
         except ValueError:
             pass
         try:
-            self.cfg["fixed_trade_usdc"] = float(self.fixed_trade_entry.get().strip())
+            self.cfg["slippage_tolerance_bps"] = int(self.slippage_entry.get().strip())
         except ValueError:
             pass
         try:
-            self.cfg["slippage_tolerance_bps"] = int(self.slippage_entry.get().strip())
+            self.cfg["resume_threshold_usdc"] = float(self.resume_threshold_entry.get().strip())
         except ValueError:
             pass
         try:
@@ -4011,7 +4132,7 @@ def run_headless():
     logger.info("Watched addresses: %s", cfg["watched_addresses"])
     logger.info("Copy %%: %s | Max trade: %s USDC | Resume threshold: $%s | Dry run: %s | Auto-redeem: %s",
                 cfg.get("copy_percentage"), cfg.get("max_trade_usdc"),
-                cfg.get("resume_threshold_usdc", 100), cfg.get("dry_run", False),
+                cfg.get("resume_threshold_usdc", 5), cfg.get("dry_run", False),
                 cfg.get("auto_redeem_settled", True))
     logger.info("Proxy redeem: %s | Proxy withdraw: %s",
                 cfg.get("proxy_redeem", True), cfg.get("proxy_withdraw", True))

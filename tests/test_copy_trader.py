@@ -154,7 +154,7 @@ class TestCLOBClient(unittest.TestCase):
 
 
 class TestPlaceOrderMinSize(unittest.TestCase):
-    """Test minimum order size enforcement and FOK order placement."""
+    """Test minimum order size enforcement and GTC order placement."""
 
     def _make_client(self):
         cfg = dict(bot.DEFAULT_CONFIG)
@@ -171,77 +171,81 @@ class TestPlaceOrderMinSize(unittest.TestCase):
         client._token_to_condition = {}
         client._token_to_slug = {}
         client.clob_sdk = MagicMock()
-        client.clob_sdk.create_market_order.return_value = {"signed": True}
+        client.clob_sdk.create_order.return_value = {"signed": True}
         client.clob_sdk.post_order.return_value = {"orderID": "test123"}
         return client
 
-    def _get_order_amount(self, client):
-        """Extract the amount (USDC) kwarg passed to MarketOrderArgs."""
-        call_kwargs = bot.MarketOrderArgs.call_args[1]
-        return call_kwargs["amount"]
+    def _get_order_size(self, client):
+        """Extract the size (tokens) kwarg passed to OrderArgs."""
+        call_kwargs = bot.OrderArgs.call_args[1]
+        return call_kwargs["size"]
 
-    def _get_order_type(self, client):
-        """Extract the order_type kwarg passed to MarketOrderArgs."""
-        call_kwargs = bot.MarketOrderArgs.call_args[1]
-        return call_kwargs["order_type"]
+    def _get_order_price(self, client):
+        """Extract the price kwarg passed to OrderArgs."""
+        call_kwargs = bot.OrderArgs.call_args[1]
+        return call_kwargs["price"]
+
+    def _get_order_usdc(self, client):
+        """Compute USDC from OrderArgs size * price."""
+        call_kwargs = bot.OrderArgs.call_args[1]
+        return round(call_kwargs["size"] * call_kwargs["price"], 2)
 
     def test_normal_size_not_bumped(self):
         """When USDC >= $1 and tokens >= 5, amount is not changed."""
         client = self._make_client()
-        # $5 USDC at price 0.50 -> effective = max(5, 2.5, 1) = $5
+        # $5 USDC at price 0.50 -> 10 tokens, no bump
         client.place_order("token1", "BUY", 5.0, 0.50)
-        self.assertEqual(self._get_order_amount(client), 5.0)
+        self.assertEqual(self._get_order_size(client), 10.0)
 
     def test_small_tokens_bumped(self):
         """When tokens < 5, USDC amount bumped to cover 5 tokens."""
         client = self._make_client()
-        # $2 USDC at price 0.90 -> effective = max(2, 4.5, 1) = $4.50
+        # $2 at price 0.90 -> effective = max(2, 4.5, 1.05) = $4.50 -> 5 tokens
         client.place_order("token1", "BUY", 2.0, 0.90)
-        self.assertEqual(self._get_order_amount(client), 4.5)
+        self.assertEqual(self._get_order_size(client), 5.0)
 
     def test_small_notional_bumped(self):
         """When USDC < $1.05 notional minimum, bumped to $1.05."""
         client = self._make_client()
-        # $0.30 USDC at price 0.05 -> effective = max(0.30, 0.25, 1.05) = $1.05
+        # $0.30 at price 0.05 -> effective = max(0.30, 0.25, 1.05) = $1.05 -> 21 tokens
         client.place_order("token1", "BUY", 0.30, 0.05)
-        self.assertEqual(self._get_order_amount(client), 1.05)
+        self.assertEqual(self._get_order_size(client), 21.0)
 
     def test_both_minimums_token_wins(self):
         """When both minimums trigger, the larger USDC requirement wins."""
         client = self._make_client()
-        # $0.50 at price 0.80 -> effective = max(0.50, 4.0, 1.05) = $4.0
+        # $0.50 at price 0.80 -> effective = max(0.50, 4.0, 1.05) = $4.0 -> 5 tokens
         client.place_order("token1", "BUY", 0.50, 0.80)
-        self.assertEqual(self._get_order_amount(client), 4.0)
+        self.assertEqual(self._get_order_size(client), 5.0)
 
     def test_both_minimums_notional_wins(self):
         """When notional minimum requires more USDC than token minimum."""
         client = self._make_client()
-        # $0.50 at price 0.10 -> effective = max(0.50, 0.50, 1.05) = $1.05
+        # $0.50 at price 0.10 -> effective = max(0.50, 0.50, 1.05) = $1.05 -> 10.5 tokens
         client.place_order("token1", "BUY", 0.50, 0.10)
-        self.assertEqual(self._get_order_amount(client), 1.05)
+        self.assertEqual(self._get_order_size(client), 10.5)
 
     def test_zero_price_returns_none(self):
         """Price of 0 should return None, not divide by zero."""
         client = self._make_client()
         result = client.place_order("token1", "BUY", 5.0, 0.0)
         self.assertIsNone(result)
-        client.clob_sdk.create_market_order.assert_not_called()
+        client.clob_sdk.create_order.assert_not_called()
 
     def test_exact_minimum_not_bumped(self):
         """Exactly 5 tokens and >= $1 USDC should not be bumped."""
         client = self._make_client()
-        # $5 USDC at price 1.0 -> effective = max(5, 5, 1) = $5.0
+        # $5 USDC at price 1.0 -> 5 tokens, no bump
         client.place_order("token1", "BUY", 5.0, 1.0)
-        self.assertEqual(self._get_order_amount(client), 5.0)
+        self.assertEqual(self._get_order_size(client), 5.0)
 
-    def test_order_uses_fok_type(self):
-        """Orders should use Fill-or-Kill order type."""
+    def test_order_uses_gtc_type(self):
+        """Orders should use GTC (Good-Till-Cancelled) order type."""
         client = self._make_client()
         client.place_order("token1", "BUY", 5.0, 0.50)
-        self.assertEqual(self._get_order_type(client), bot.OrderType.FOK)
-        # post_order should also be called with FOK
+        # post_order should be called with GTC
         post_kwargs = client.clob_sdk.post_order.call_args[1]
-        self.assertEqual(post_kwargs["orderType"], bot.OrderType.FOK)
+        self.assertEqual(post_kwargs["orderType"], bot.OrderType.GTC)
 
 
 class TestTradeExecutorCopyAmount(unittest.TestCase):
@@ -1067,13 +1071,13 @@ class TestLowBalancePauseResume(unittest.TestCase):
         self.assertTrue(b._paused_low_balance)
 
     def test_stays_paused_below_resume_threshold(self):
-        """Bot should remain paused if balance < configured threshold."""
+        """Bot should remain paused if balance < configured threshold ($5)."""
         b = self._make_bot()
         b._paused_low_balance = True
         b.executor = MagicMock()
-        b.executor.get_usdc_balance.return_value = Decimal("50.00")
+        b.executor.get_usdc_balance.return_value = Decimal("3.00")
 
-        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 100)))
+        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 5)))
         balance = b.executor.get_usdc_balance(max_age_seconds=0)
         if b._paused_low_balance and balance >= resume_threshold:
             b._paused_low_balance = False
@@ -1081,13 +1085,13 @@ class TestLowBalancePauseResume(unittest.TestCase):
         self.assertTrue(b._paused_low_balance)
 
     def test_resumes_at_resume_threshold(self):
-        """Bot should resume trading when balance >= configured threshold ($150 default)."""
+        """Bot should resume trading when balance >= configured threshold ($5 default)."""
         b = self._make_bot()
         b._paused_low_balance = True
         b.executor = MagicMock()
-        b.executor.get_usdc_balance.return_value = Decimal("150.00")
+        b.executor.get_usdc_balance.return_value = Decimal("5.00")
 
-        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 150)))
+        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 5)))
         balance = b.executor.get_usdc_balance(max_age_seconds=0)
         if b._paused_low_balance and balance >= resume_threshold:
             b._paused_low_balance = False
@@ -1099,9 +1103,9 @@ class TestLowBalancePauseResume(unittest.TestCase):
         b = self._make_bot()
         b._paused_low_balance = True
         b.executor = MagicMock()
-        b.executor.get_usdc_balance.return_value = Decimal("250.00")
+        b.executor.get_usdc_balance.return_value = Decimal("10.00")
 
-        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 100)))
+        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 5)))
         balance = b.executor.get_usdc_balance(max_age_seconds=0)
         if b._paused_low_balance and balance >= resume_threshold:
             b._paused_low_balance = False
@@ -1164,7 +1168,7 @@ class TestLowBalancePauseResume(unittest.TestCase):
         b = self._make_bot()
         b.executor = MagicMock()
         b.clob_client = MagicMock()
-        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 100)))
+        resume_threshold = Decimal(str(b.cfg.get("resume_threshold_usdc", 5)))
 
         # Phase 1: Normal trading (balance is healthy)
         b.executor.get_usdc_balance.return_value = Decimal("500.00")
@@ -1177,23 +1181,23 @@ class TestLowBalancePauseResume(unittest.TestCase):
             b._paused_low_balance = True
         self.assertTrue(b._paused_low_balance)
 
-        # Phase 3: Partial recovery ($50) - not enough to resume
-        b.executor.get_usdc_balance.return_value = Decimal("50.00")
+        # Phase 3: Partial recovery ($3) - not enough to resume (need $5)
+        b.executor.get_usdc_balance.return_value = Decimal("3.00")
         balance = b.executor.get_usdc_balance(max_age_seconds=0)
         if b._paused_low_balance and balance >= resume_threshold:
             b._paused_low_balance = False
         self.assertTrue(b._paused_low_balance)
 
-        # Phase 4: Full recovery ($150+) - resumes
-        b.executor.get_usdc_balance.return_value = Decimal("160.00")
+        # Phase 4: Full recovery ($5+) - resumes
+        b.executor.get_usdc_balance.return_value = Decimal("6.00")
         balance = b.executor.get_usdc_balance(max_age_seconds=0)
         if b._paused_low_balance and balance >= resume_threshold:
             b._paused_low_balance = False
         self.assertFalse(b._paused_low_balance)
 
     def test_default_resume_threshold_in_config(self):
-        """Verify the default resume_threshold_usdc is 150 in DEFAULT_CONFIG."""
-        self.assertEqual(bot.DEFAULT_CONFIG["resume_threshold_usdc"], 150.0)
+        """Verify the default resume_threshold_usdc is 5 in DEFAULT_CONFIG."""
+        self.assertEqual(bot.DEFAULT_CONFIG["resume_threshold_usdc"], 5.0)
         self.assertEqual(bot.LOW_BALANCE_PAUSE_THRESHOLD, Decimal("1.05"))
 
     def test_env_var_override(self):
