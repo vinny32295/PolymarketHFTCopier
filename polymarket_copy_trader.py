@@ -70,7 +70,7 @@ except ImportError:
 # Constants – Polymarket / Polygon addresses and ABIs
 # ---------------------------------------------------------------------------
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # Polymarket CTF Exchange (Conditional Token Framework) on Polygon
 # Reference: https://docs.polymarket.com/
