@@ -2480,13 +2480,13 @@ class TestSafeExecution(unittest.TestCase):
         mock_safe.functions.execTransaction.return_value.build_transaction.return_value = {}
         executor.w3.eth.contract.side_effect = None
         executor.w3.eth.contract.return_value = mock_safe
-        executor.w3.eth.account.signHash.return_value = MagicMock(r=1, s=2, v=28)
+        executor.w3.eth.account.unsafe_sign_hash.return_value = MagicMock(r=1, s=2, v=28)
         executor._sign_and_send.return_value = MagicMock(status=1)
 
         executor._execute_via_safe(self.SAFE_ADDR, bot.USDC_ADDRESS, b"\x01")
 
-        # Verify signHash was called with the Safe tx hash
-        executor.w3.eth.account.signHash.assert_called_once_with(
+        # Verify unsafe_sign_hash (web3 v7+) was called with the Safe tx hash
+        executor.w3.eth.account.unsafe_sign_hash.assert_called_once_with(
             safe_tx_hash, executor.private_key,
         )
 
