@@ -426,7 +426,13 @@ def setup_logging(gui_handler=None):
 # ---------------------------------------------------------------------------
 
 def load_config(path=CONFIG_FILE):
-    """Load configuration from JSON file, creating defaults if missing."""
+    """Load configuration from JSON file if it exists, otherwise return defaults.
+
+    The config file is **not** required — the GUI and headless mode both
+    work entirely from ``DEFAULT_CONFIG`` (overridden by user input / env
+    vars).  If a config file happens to exist it is loaded for convenience,
+    but one is never auto-created.
+    """
     if os.path.exists(path):
         with open(path, "r") as f:
             cfg = json.load(f)
@@ -435,7 +441,6 @@ def load_config(path=CONFIG_FILE):
             cfg.setdefault(key, val)
         return cfg
     else:
-        save_config(DEFAULT_CONFIG, path)
         return dict(DEFAULT_CONFIG)
 
 
@@ -4770,7 +4775,17 @@ class CopyTraderGUI:
     def __init__(self):
         _import_tkinter()
 
-        self.cfg = load_config()
+        # Start from built-in defaults — no config file required.
+        # If a config.json happens to exist we merge it in for convenience.
+        self.cfg = dict(DEFAULT_CONFIG)
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r") as f:
+                    saved = json.load(f)
+                self.cfg.update(saved)
+            except (json.JSONDecodeError, OSError):
+                pass  # ignore corrupt / unreadable file
+
         self.bot = None
         self.logger = None
 
@@ -4822,7 +4837,7 @@ class CopyTraderGUI:
             ctrl, text="Stop Bot", command=self._stop_bot, state=tk.DISABLED
         )
         self.stop_btn.pack(side=tk.LEFT, padx=5)
-        self.save_btn = ttk.Button(ctrl, text="Save Config", command=self._save_config)
+        self.save_btn = ttk.Button(ctrl, text="Save Config to File", command=self._save_config)
         self.save_btn.pack(side=tk.RIGHT, padx=5)
         self.status_var = tk.StringVar(value="Status: Idle")
         ttk.Label(ctrl, textvariable=self.status_var).pack(side=tk.RIGHT, padx=10)
@@ -5300,15 +5315,30 @@ class CopyTraderGUI:
         self.log_area.configure(state="disabled")
 
     def _save_config(self):
+        """Optional: persist current GUI settings to config.json on disk.
+
+        This is NOT required to run the bot — the bot reads its config
+        directly from the GUI fields.  Saving is provided as a convenience
+        so settings can be restored on next launch.
+        """
         self._read_fields_to_config()
         pk = self.pk_entry.get().strip()
         if pk:
             save_private_key(pk, self.cfg)
         save_config(self.cfg)
-        self.logger.info("Configuration saved")
+        self.logger.info("Configuration saved to %s (optional — bot uses GUI values directly)", CONFIG_FILE)
 
     def _start_bot(self):
-        self._save_config()
+        # Pull the latest values from the GUI fields into self.cfg.
+        # No config file write is needed — the bot runs from memory.
+        self._read_fields_to_config()
+
+        # Persist the private key to its own file (needed by the bot at
+        # runtime) but do NOT write config.json.
+        pk = self.pk_entry.get().strip()
+        if pk:
+            save_private_key(pk, self.cfg)
+
         if not self.cfg.get("watched_addresses"):
             messagebox.showwarning("No Addresses", "Add at least one trader address to watch.")
             return
@@ -5388,9 +5418,23 @@ class HealthCheckServer:
 # ---------------------------------------------------------------------------
 
 def run_headless():
-    """Run the bot in headless mode using config.json + env vars."""
+    """Run the bot in headless mode using defaults + env vars.
+
+    A config.json file is **not** required.  If one exists it is loaded for
+    convenience, but all settings can be supplied via environment variables.
+    """
     logger = setup_logging()
-    cfg = load_config()
+
+    # Start from built-in defaults; optionally merge config.json if present.
+    cfg = dict(DEFAULT_CONFIG)
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                saved = json.load(f)
+            cfg.update(saved)
+            logger.info("Loaded settings from %s (optional)", CONFIG_FILE)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Ignoring unreadable %s: %s", CONFIG_FILE, exc)
 
     # Allow env-var overrides so secrets stay out of config.json on the server
     if os.environ.get("RPC_URL"):
@@ -5433,7 +5477,7 @@ def run_headless():
         cfg["proxy_address"] = os.environ["PROXY_ADDRESS"].strip()
 
     if not cfg.get("watched_addresses"):
-        logger.error("No watched addresses configured. Set WATCHED_ADDRESSES env var or edit config.json.")
+        logger.error("No watched addresses configured. Set the WATCHED_ADDRESSES env var (comma-separated).")
         sys.exit(1)
 
     logger.info("=== Polymarket Copy Trader — Headless Mode ===")

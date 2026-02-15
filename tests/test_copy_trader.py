@@ -67,9 +67,10 @@ class TestConfigHelpers(unittest.TestCase):
         self.assertEqual(loaded["copy_percentage"], 75)
         self.assertEqual(loaded["watched_addresses"], ["0x" + "a" * 40])
 
-    def test_load_config_creates_default(self):
+    def test_load_config_returns_defaults_when_missing(self):
+        """When no config file exists, load_config returns defaults without creating a file."""
         cfg = bot.load_config(self.config_path)
-        self.assertTrue(os.path.exists(self.config_path))
+        self.assertFalse(os.path.exists(self.config_path))
         self.assertEqual(cfg["copy_percentage"], 50)
         self.assertEqual(cfg["watched_addresses"], [])
 

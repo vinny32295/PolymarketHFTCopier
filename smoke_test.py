@@ -71,27 +71,34 @@ def check_imports():
 
 
 def check_config():
-    print("\n3. Checking config.json...")
-    try:
-        with open("config.json", "r") as f:
-            cfg = json.load(f)
-        print(f"   {PASS} config.json loaded")
-        print(f"   {INFO} RPC URL: {'set' if cfg.get('rpc_url') else 'empty'}")
-        print(f"   {INFO} WS RPC URL: {'set' if cfg.get('ws_rpc_url') else 'empty'}")
-        print(f"   {INFO} CLOB API enabled: {cfg.get('use_clob_api', True)}")
-        print(f"   {INFO} CLOB API key: {'set' if cfg.get('clob_api_key') else 'empty'}")
-        print(f"   {INFO} Copy percentage: {cfg.get('copy_percentage', 50)}%")
-        print(f"   {INFO} Max trade: {cfg.get('max_trade_usdc', 100)} USDC")
-        print(f"   {INFO} Dry run: {cfg.get('dry_run', False)}")
-        n = len(cfg.get("watched_addresses", []))
-        print(f"   {INFO} Watched addresses: {n}")
-        return cfg
-    except FileNotFoundError:
-        print(f"   {INFO} config.json not found — will be created on first run")
-        return {}
-    except json.JSONDecodeError as e:
-        print(f"   {FAIL} config.json is invalid JSON: {e}")
-        return None
+    print("\n3. Checking configuration...")
+    # config.json is optional — the bot uses built-in defaults + GUI input.
+    # If a file exists we load it for display purposes only.
+    import os
+    cfg = {}
+    if os.path.exists("config.json"):
+        try:
+            with open("config.json", "r") as f:
+                cfg = json.load(f)
+            print(f"   {PASS} config.json found (optional — bot works without it)")
+        except json.JSONDecodeError as e:
+            print(f"   {INFO} config.json exists but is invalid JSON: {e}")
+            print(f"   {INFO} The bot will ignore it and use built-in defaults")
+            return {}
+    else:
+        print(f"   {PASS} No config.json needed — bot uses built-in defaults + GUI input")
+
+    # Show whatever settings we have (from file or defaults)
+    print(f"   {INFO} RPC URL: {'set' if cfg.get('rpc_url') else 'not set (enter in GUI)'}")
+    print(f"   {INFO} WS RPC URL: {'set' if cfg.get('ws_rpc_url') else 'not set (enter in GUI)'}")
+    print(f"   {INFO} CLOB API enabled: {cfg.get('use_clob_api', True)}")
+    print(f"   {INFO} CLOB API key: {'set' if cfg.get('clob_api_key') else 'not set (enter in GUI)'}")
+    print(f"   {INFO} Copy percentage: {cfg.get('copy_percentage', 50)}%")
+    print(f"   {INFO} Max trade: {cfg.get('max_trade_usdc', 100)} USDC")
+    print(f"   {INFO} Dry run: {cfg.get('dry_run', False)}")
+    n = len(cfg.get("watched_addresses", []))
+    print(f"   {INFO} Watched addresses: {n}")
+    return cfg
 
 
 def check_rpc(rpc_url):
@@ -250,7 +257,7 @@ def main():
     results.append(("Package imports", check_imports()))
 
     cfg = check_config()
-    results.append(("Config file", cfg is not None))
+    results.append(("Configuration", cfg is not None))
 
     rpc_url = args.rpc or (cfg.get("rpc_url") if cfg else "")
     w3 = None
@@ -288,7 +295,7 @@ def main():
     else:
         print(f"\n  All checks passed! You're ready to run the bot.")
         print(f"\n  Recommended first steps:")
-        print(f"    1. Enable dry-run mode in the GUI (or set dry_run: true in config.json)")
+        print(f"    1. Enable dry-run mode in the GUI")
         print(f"    2. Add a known active trader address")
         print(f"    3. Start the bot and watch the logs")
         print(f"    4. Once you're happy, disable dry-run to go live")
