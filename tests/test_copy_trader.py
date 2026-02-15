@@ -845,7 +845,7 @@ class TestCLOBClientOrderMethods(unittest.TestCase):
 class TestAutoExitConditions(unittest.TestCase):
     """Test take-profit (>= .99) and stop-loss (<= 50% of entry) auto-exits."""
 
-    def _make_executor(self, dry_run=False):
+    def _make_executor(self, dry_run=False, stop_loss_pct=None):
         w3 = MagicMock()
         mock_account = MagicMock()
         mock_account.address = "0x" + "1" * 40
@@ -855,6 +855,8 @@ class TestAutoExitConditions(unittest.TestCase):
         cfg = dict(bot.DEFAULT_CONFIG)
         cfg["dry_run"] = dry_run
         cfg["slippage_tolerance_bps"] = 100
+        if stop_loss_pct is not None:
+            cfg["stop_loss_pct"] = stop_loss_pct
 
         executor = bot.TradeExecutor(
             w3=w3,
@@ -911,7 +913,7 @@ class TestAutoExitConditions(unittest.TestCase):
 
     def test_stop_loss_at_50_pct(self):
         """Position should be sold when price drops to 50% of entry."""
-        executor = self._make_executor()
+        executor = self._make_executor(stop_loss_pct=50)
         # Entry at 0.60, stop-loss triggers at 0.30
         executor._positions["tok1"] = {"tokens": Decimal("10"), "entry_price": Decimal("0.60")}
         executor.clob_client.get_last_trade_price.return_value = 0.30
@@ -925,7 +927,7 @@ class TestAutoExitConditions(unittest.TestCase):
 
     def test_stop_loss_below_50_pct(self):
         """Position should be sold when price drops well below 50% of entry."""
-        executor = self._make_executor()
+        executor = self._make_executor(stop_loss_pct=50)
         executor._positions["tok1"] = {"tokens": Decimal("10"), "entry_price": Decimal("0.80")}
         # 50% of 0.80 = 0.40; price is 0.10
         executor.clob_client.get_last_trade_price.return_value = 0.10
@@ -985,7 +987,7 @@ class TestAutoExitConditions(unittest.TestCase):
 
     def test_multiple_positions_exits(self):
         """Multiple positions can exit in the same check cycle."""
-        executor = self._make_executor()
+        executor = self._make_executor(stop_loss_pct=50)
         # tok1: take-profit (price at 0.99)
         executor._positions["tok1"] = {"tokens": Decimal("5"), "entry_price": Decimal("0.50")}
         # tok2: stop-loss (entry 0.80, price at 0.30 — below 50%)
@@ -1034,7 +1036,7 @@ class TestAutoExitConditions(unittest.TestCase):
     def test_exit_thresholds_are_correct(self):
         """Verify the exit threshold constants have expected values."""
         self.assertEqual(bot.TAKE_PROFIT_PRICE, Decimal("0.99"))
-        self.assertEqual(bot.STOP_LOSS_PCT, Decimal("0.50"))
+        self.assertEqual(bot.STOP_LOSS_PCT, Decimal("0"))
 
 
 class TestLowBalancePauseResume(unittest.TestCase):

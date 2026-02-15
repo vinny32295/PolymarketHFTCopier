@@ -103,7 +103,7 @@ LOW_BALANCE_PAUSE_THRESHOLD = Decimal("1.05")   # can't even fill the smallest o
 
 # Auto-exit thresholds for open positions
 TAKE_PROFIT_PRICE = Decimal("0.99")   # sell near top instead of waiting for resolution
-STOP_LOSS_PCT = Decimal("0.50")       # exit if price drops to 50% of entry (e.g. 0.80 → 0.40)
+STOP_LOSS_PCT = Decimal("0")          # disabled — follow whale's hold-to-resolution strategy
 
 # Polymarket CLOB API base URL
 CLOB_API_BASE = "https://clob.polymarket.com"
@@ -375,7 +375,7 @@ DEFAULT_CONFIG = {
     "order_ttl_seconds": 60,
     "resume_threshold_usdc": 5.0,
     "take_profit_price": 0.99,
-    "stop_loss_pct": 50,
+    "stop_loss_pct": 0,
     "exit_check_seconds": 5,
     "auto_redeem_settled": True,
     "proxy_redeem": True,
