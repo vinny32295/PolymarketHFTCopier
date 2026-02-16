@@ -28,6 +28,8 @@ session_*_report.json
 trade_history.json
 trade_history.csv
 positions.json
+whale_comparison.json
+session_trades.json
 
 # IDE
 .vscode/
