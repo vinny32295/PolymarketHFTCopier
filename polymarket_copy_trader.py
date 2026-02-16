@@ -830,7 +830,22 @@ class PolymarketCLOBClient:
         """Fetch the order book for a token (public endpoint)."""
         if self.clob_sdk:
             try:
-                return self.clob_sdk.get_order_book(token_id)
+                book = self.clob_sdk.get_order_book(token_id)
+                # SDK may return an OrderBookSummary object instead of a dict;
+                # normalise to dict so callers can use .get("bids") etc.
+                if book and not isinstance(book, dict):
+                    def _entry(e):
+                        if isinstance(e, dict):
+                            return e
+                        return {
+                            "price": str(getattr(e, "price", "0")),
+                            "size": str(getattr(e, "size", "0")),
+                        }
+                    return {
+                        "bids": [_entry(b) for b in (getattr(book, "bids", []) or [])],
+                        "asks": [_entry(a) for a in (getattr(book, "asks", []) or [])],
+                    }
+                return book
             except Exception as exc:
                 self.logger.debug("CLOB SDK get_order_book failed: %s", exc)
 
@@ -4156,12 +4171,34 @@ class TradeExecutor:
 
                     self.invalidate_balance_cache()
 
-                    # Update position tracker — include all redemption params
-                    tokens = (
+                    # Update position tracker — use actual fill amounts from
+                    # CLOB response when available (FOK fills may execute at a
+                    # better price, giving more tokens than limit_price implies).
+                    actual_tokens = None
+                    actual_price = None
+                    if isinstance(result, dict):
+                        taking = result.get("takingAmount")
+                        making = result.get("makingAmount")
+                        if side == "BUY" and taking:
+                            try:
+                                actual_tokens = Decimal(str(taking))
+                                if making:
+                                    actual_price = Decimal(str(making)) / actual_tokens
+                            except Exception:
+                                pass
+                        elif side == "SELL" and making:
+                            try:
+                                actual_tokens = Decimal(str(making))
+                                if taking:
+                                    actual_price = Decimal(str(taking)) / actual_tokens
+                            except Exception:
+                                pass
+                    tokens = actual_tokens if actual_tokens else (
                         copy_amount / Decimal(str(adjusted_price))
                         if adjusted_price > 0
                         else Decimal("0")
                     )
+                    fill_price = float(actual_price) if actual_price else adjusted_price
                     market_name = (
                         market.get("question") or market.get("slug")
                         if market else None
@@ -4189,12 +4226,12 @@ class TradeExecutor:
                             # Weighted-average entry price (both bot and whale)
                             old_tokens = pos["tokens"]
                             old_cost = old_tokens * pos["entry_price"]
-                            new_cost = tokens * Decimal(str(adjusted_price))
+                            new_cost = tokens * Decimal(str(fill_price))
                             total_tokens = old_tokens + tokens
                             avg_price = (
                                 (old_cost + new_cost) / total_tokens
                                 if total_tokens > 0
-                                else Decimal(str(adjusted_price))
+                                else Decimal(str(fill_price))
                             )
                             # Track whale's VWAP alongside ours
                             old_whale = pos.get("whale_entry_price", pos["entry_price"])
@@ -4212,7 +4249,7 @@ class TradeExecutor:
                         else:
                             self._positions[token_id] = {
                                 "tokens": tokens,
-                                "entry_price": Decimal(str(adjusted_price)),
+                                "entry_price": Decimal(str(fill_price)),
                                 "whale_entry_price": Decimal(str(price)),
                                 "opened_at": datetime.now().isoformat(),
                                 **redeem_params,
@@ -4226,7 +4263,7 @@ class TradeExecutor:
                             if pos["tokens"] <= 0:
                                 self._log_closed_trade(
                                     token_id, pos.get("entry_price", 0),
-                                    adjusted_price, sold_tokens,
+                                    fill_price, sold_tokens,
                                     "copied_sell",
                                     market=pos.get("market_name"),
                                     whale_entry_price=pos.get("whale_entry_price"),
@@ -4270,7 +4307,7 @@ class TradeExecutor:
                     if order_id:
                         self.track_order(
                             order_id, side, token_id,
-                            adjusted_price, float(copy_amount),
+                            fill_price, float(copy_amount),
                         )
 
                     return {
@@ -4278,7 +4315,8 @@ class TradeExecutor:
                         "side": side,
                         "amount_usdc": float(copy_amount),
                         "token_id": token_id,
-                        "price": adjusted_price,
+                        "price": fill_price,
+                        "fill_tokens": float(tokens),
                         "whale_price": float(price),
                         "original_usdc": float(original_usdc),
                         "clob_response": result,
