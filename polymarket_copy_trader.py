@@ -378,6 +378,7 @@ DEFAULT_CONFIG = {
     "take_profit_pct": 0,
     "stop_loss_pct": 0,
     "exit_check_seconds": 5,
+    "exit_mode": "whale",
     "auto_redeem_settled": True,
     "proxy_redeem": True,
     "proxy_withdraw": True,
@@ -1896,8 +1897,17 @@ class TradeExecutor:
     def check_exit_conditions(self):
         """Scan all open positions and sell any that hit exit thresholds.
 
-        - **Take-profit**: current price >= take_profit_price (default 1.00)
-        - **Stop-loss**:   current price <= stop_loss_pct% of entry (0 = disabled)
+        In **whale** exit_mode (default), the bot only exits when:
+        - The whale sells (copied_sell, handled elsewhere)
+        - The market resolves (redeemed)
+        - Take-profit catches an extraordinary price run (safety catch)
+
+        Stop-loss is DISABLED in whale mode to avoid selling into temporary
+        dips that the whale holds through.  Polymarket is binary — a dip
+        to $0.10 can still resolve at $1.00.
+
+        In **auto** exit_mode, the legacy behaviour is preserved: both
+        take-profit and stop-loss are active.
 
         Requires a CLOB client to fetch live prices and place sell orders.
         Returns a list of sell results (one per exited position), or an
@@ -1907,6 +1917,8 @@ class TradeExecutor:
             return []
         if not self._positions:
             return []
+
+        exit_mode = self.cfg.get("exit_mode", "whale")
 
         # Read thresholds from config (fall back to module-level defaults)
         tp_price = Decimal(str(self.cfg.get("take_profit_price", TAKE_PROFIT_PRICE)))
@@ -1942,10 +1954,13 @@ class TradeExecutor:
                 )
                 if gain_pct >= tp_pct:
                     reason = "take-profit"
-            # Absolute price take-profit (original behaviour)
+            # Absolute price take-profit (safety catch for extraordinary runs)
             if reason is None and current_price_d >= tp_price:
                 reason = "take-profit"
-            elif reason is None and sl_pct > 0 and entry_price > 0 and current_price_d <= entry_price * sl_pct:
+            # Stop-loss: only active in "auto" mode — whale mode holds through dips
+            elif (reason is None and exit_mode != "whale"
+                  and sl_pct > 0 and entry_price > 0
+                  and current_price_d <= entry_price * sl_pct):
                 reason = "stop-loss"
 
             if reason is None:
@@ -4052,11 +4067,16 @@ class TradeExecutor:
                 slippage_mult = Decimal(str(self.slippage_bps)) / Decimal("10000")
                 whale_price = float(price)
 
-                # Fallback: whale price + slippage (used if orderbook unavailable)
+                # --- FOK at whale price (buys) / whale price - slippage (sells) ---
+                # For BUYS: use the whale's exact price as our FOK limit.
+                # If the market has moved above whale price, our FOK won't fill
+                # and we skip the trade.  Better to miss than overpay — paying
+                # more than the whale guarantees we underperform them.
+                #
+                # For SELLS (copied_sell): apply slippage tolerance since we
+                # need to exit and a small concession is acceptable.
                 if side == "BUY":
-                    adjusted_price = float(
-                        Decimal(str(price)) * (Decimal("1") + slippage_mult)
-                    )
+                    adjusted_price = float(price)
                     adjusted_price = min(adjusted_price, 0.99)
                 else:
                     adjusted_price = float(
@@ -4064,7 +4084,7 @@ class TradeExecutor:
                     )
                     adjusted_price = max(adjusted_price, 0.01)
 
-                # --- Fetch live orderbook for smart pricing ---
+                # --- Fetch live orderbook for stale-price safety check ---
                 max_dev_pct = self.cfg.get("max_price_deviation_pct", 5)
                 best_bid = 0
                 best_ask = 0
@@ -4077,7 +4097,7 @@ class TradeExecutor:
                         best_ask = float(asks[0].get("price", 0)) if asks else 0
                 except Exception as book_exc:
                     self.logger.debug(
-                        "Orderbook fetch failed (using whale price + slippage): %s",
+                        "Orderbook fetch failed (using whale price): %s",
                         book_exc,
                     )
 
@@ -4105,48 +4125,19 @@ class TradeExecutor:
                                 "deviation_pct": round(deviation, 2),
                             }
 
-                    # --- Use current market price instead of stale whale price ---
-                    # For BUY: use the best_ask (what we'd actually pay) + small
-                    #   slippage buffer so our FOK has room to fill.
-                    # For SELL: use the best_bid (what we'd actually receive) -
-                    #   small slippage buffer.
-                    # This is strictly better than whale_price + slippage because
-                    # it reflects where the market IS, not where it WAS.
-                    if side == "BUY":
-                        market_price = float(
-                            Decimal(str(best_ask)) * (Decimal("1") + slippage_mult)
-                        )
-                        market_price = min(market_price, 0.99)
-                        # Use the BETTER price (lower for buys) between market
-                        # and whale-based, but prefer market when it would
-                        # actually fill (whale price may be too low to fill now)
-                        if best_ask > whale_price:
-                            # Market moved up since whale bought — use market
-                            # price so our FOK actually fills
-                            adjusted_price = market_price
-                        else:
-                            # Market is at or below whale price — we get an
-                            # even better entry than the whale
-                            adjusted_price = min(market_price, adjusted_price)
-                    else:
+                    # For SELLS only: use best_bid for better fill if available
+                    if side == "SELL":
                         market_price = float(
                             Decimal(str(best_bid)) * (Decimal("1") - slippage_mult)
                         )
                         market_price = max(market_price, 0.01)
-                        if best_bid < whale_price:
-                            # Market moved down since whale sold — use market
-                            # price so our FOK actually fills
-                            adjusted_price = market_price
-                        else:
-                            # Market is at or above whale price — we get an
-                            # even better exit than the whale
-                            adjusted_price = max(market_price, adjusted_price)
+                        adjusted_price = max(market_price, adjusted_price)
 
-                    self.logger.info(
-                        "SMART PRICE: whale=%.4f, bid=%.4f, ask=%.4f, "
-                        "using=%.4f (%s)",
-                        whale_price, best_bid, best_ask, adjusted_price, side,
-                    )
+                self.logger.info(
+                    "WHALE PRICE FOK: whale=%.4f, bid=%.4f, ask=%.4f, "
+                    "limit=%.4f (%s)",
+                    whale_price, best_bid, best_ask, adjusted_price, side,
+                )
 
                 result = self.clob_client.place_order(
                     token_id=token_id,

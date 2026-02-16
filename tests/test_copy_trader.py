@@ -818,7 +818,8 @@ class TestCLOBClientOrderMethods(unittest.TestCase):
 class TestAutoExitConditions(unittest.TestCase):
     """Test take-profit (>= .99) and stop-loss (<= 50% of entry) auto-exits."""
 
-    def _make_executor(self, dry_run=False, stop_loss_pct=None):
+    def _make_executor(self, dry_run=False, stop_loss_pct=None,
+                       exit_mode=None):
         w3 = MagicMock()
         mock_account = MagicMock()
         mock_account.address = "0x" + "1" * 40
@@ -830,6 +831,8 @@ class TestAutoExitConditions(unittest.TestCase):
         cfg["slippage_tolerance_bps"] = 100
         if stop_loss_pct is not None:
             cfg["stop_loss_pct"] = stop_loss_pct
+        if exit_mode is not None:
+            cfg["exit_mode"] = exit_mode
 
         executor = bot.TradeExecutor(
             w3=w3,
@@ -885,8 +888,8 @@ class TestAutoExitConditions(unittest.TestCase):
         self.assertEqual(results[0]["reason"], "take-profit")
 
     def test_stop_loss_at_50_pct(self):
-        """Position should be sold when price drops to 50% of entry."""
-        executor = self._make_executor(stop_loss_pct=50)
+        """Position should be sold when price drops to 50% of entry (auto mode)."""
+        executor = self._make_executor(stop_loss_pct=50, exit_mode="auto")
         # Entry at 0.60, stop-loss triggers at 0.30
         executor._positions["tok1"] = {"tokens": Decimal("10"), "entry_price": Decimal("0.60")}
         executor.clob_client.get_last_trade_price.return_value = 0.30
@@ -899,8 +902,8 @@ class TestAutoExitConditions(unittest.TestCase):
         self.assertNotIn("tok1", executor._positions)
 
     def test_stop_loss_below_50_pct(self):
-        """Position should be sold when price drops well below 50% of entry."""
-        executor = self._make_executor(stop_loss_pct=50)
+        """Position should be sold when price drops well below 50% of entry (auto mode)."""
+        executor = self._make_executor(stop_loss_pct=50, exit_mode="auto")
         executor._positions["tok1"] = {"tokens": Decimal("10"), "entry_price": Decimal("0.80")}
         # 50% of 0.80 = 0.40; price is 0.10
         executor.clob_client.get_last_trade_price.return_value = 0.10
@@ -958,9 +961,21 @@ class TestAutoExitConditions(unittest.TestCase):
         # Position should still exist in dry run
         self.assertIn("tok1", executor._positions)
 
+    def test_whale_mode_ignores_stop_loss(self):
+        """In whale exit mode (default), stop-loss is disabled — hold through dips."""
+        executor = self._make_executor(stop_loss_pct=50)  # whale mode is default
+        # Entry at 0.60, price drops to 0.10 — would trigger stop-loss in auto mode
+        executor._positions["tok1"] = {"tokens": Decimal("10"), "entry_price": Decimal("0.60")}
+        executor.clob_client.get_last_trade_price.return_value = 0.10
+
+        results = executor.check_exit_conditions()
+        # Whale mode: stop-loss should NOT trigger
+        self.assertEqual(results, [])
+        self.assertIn("tok1", executor._positions)
+
     def test_multiple_positions_exits(self):
-        """Multiple positions can exit in the same check cycle."""
-        executor = self._make_executor(stop_loss_pct=50)
+        """Multiple positions can exit in the same check cycle (auto mode)."""
+        executor = self._make_executor(stop_loss_pct=50, exit_mode="auto")
         # tok1: take-profit (price at 0.99)
         executor._positions["tok1"] = {"tokens": Decimal("5"), "entry_price": Decimal("0.50")}
         # tok2: stop-loss (entry 0.80, price at 0.30 — below 50%)
