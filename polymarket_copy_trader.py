@@ -5085,10 +5085,27 @@ class CopyTraderGUI:
         ttk.Label(row_f, textvariable=self.dash_positions_var, font=("Courier", 11)).pack(side=tk.LEFT, padx=(0, 20))
         ttk.Label(row_f, textvariable=self.dash_total_pnl_var, font=("Courier", 11, "bold")).pack(side=tk.LEFT)
 
+        # Whale comparison bar
+        whale_frame = ttk.LabelFrame(parent, text="Bot vs Whale Comparison", padding=8)
+        whale_frame.pack(fill=tk.X, pady=(0, 6))
+
+        self.dash_whale_bot_pnl_var = tk.StringVar(value="Bot P/L: --")
+        self.dash_whale_whale_pnl_var = tk.StringVar(value="Whale P/L: --")
+        self.dash_whale_slippage_var = tk.StringVar(value="Slippage Cost: --")
+        self.dash_whale_winrate_var = tk.StringVar(value="W/L: --")
+
+        whale_row = ttk.Frame(whale_frame)
+        whale_row.pack(fill=tk.X)
+        ttk.Label(whale_row, textvariable=self.dash_whale_bot_pnl_var, font=("Courier", 10, "bold")).pack(side=tk.LEFT, padx=(0, 20))
+        ttk.Label(whale_row, textvariable=self.dash_whale_whale_pnl_var, font=("Courier", 10, "bold")).pack(side=tk.LEFT, padx=(0, 20))
+        ttk.Label(whale_row, textvariable=self.dash_whale_slippage_var, font=("Courier", 10)).pack(side=tk.LEFT, padx=(0, 20))
+        ttk.Label(whale_row, textvariable=self.dash_whale_winrate_var, font=("Courier", 10)).pack(side=tk.LEFT)
+
         # Positions treeview
-        columns = ("market", "shares", "avg_price", "cur_price", "cost_basis",
-                    "cur_value", "float_pnl", "pnl_pct", "time_held")
+        columns = ("direction", "market", "shares", "avg_price", "cur_price",
+                    "cost_basis", "cur_value", "float_pnl", "pnl_pct", "time_held")
         col_headings = {
+            "direction": "",
             "market": "Market",
             "shares": "Shares",
             "avg_price": "Avg Price",
@@ -5100,9 +5117,9 @@ class CopyTraderGUI:
             "time_held": "Time Held",
         }
         col_widths = {
-            "market": 220, "shares": 75, "avg_price": 75, "cur_price": 75,
-            "cost_basis": 85, "cur_value": 85, "float_pnl": 85, "pnl_pct": 70,
-            "time_held": 90,
+            "direction": 30, "market": 210, "shares": 75, "avg_price": 75,
+            "cur_price": 75, "cost_basis": 85, "cur_value": 85,
+            "float_pnl": 85, "pnl_pct": 70, "time_held": 90,
         }
 
         tree_frame = ttk.Frame(parent)
@@ -5117,7 +5134,7 @@ class CopyTraderGUI:
 
         for col in columns:
             self.dash_tree.heading(col, text=col_headings[col])
-            anchor = tk.E if col != "market" else tk.W
+            anchor = tk.CENTER if col == "direction" else (tk.W if col == "market" else tk.E)
             self.dash_tree.column(col, width=col_widths.get(col, 80), anchor=anchor)
 
         self.dash_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -5166,6 +5183,10 @@ class CopyTraderGUI:
             self.dash_total_pnl_var.set("Floating P/L: --")
             self.dash_positions_var.set("Open Positions: 0")
             self.dash_summary_var.set("Bot not running")
+            self.dash_whale_bot_pnl_var.set("Bot P/L: --")
+            self.dash_whale_whale_pnl_var.set("Whale P/L: --")
+            self.dash_whale_slippage_var.set("Slippage Cost: --")
+            self.dash_whale_winrate_var.set("W/L: --")
             return
 
         executor = self.bot.executor
@@ -5240,7 +5261,19 @@ class CopyTraderGUI:
             else:
                 time_held = "--"
 
+            # Direction indicator: up/down/flat
+            if cur_price is not None:
+                if cur_price_d > entry_price:
+                    direction = "UP"
+                elif cur_price_d < entry_price:
+                    direction = "DOWN"
+                else:
+                    direction = "--"
+            else:
+                direction = "--"
+
             self.dash_tree.insert("", tk.END, values=(
+                direction,
                 market_name[:45],
                 f"{tokens:.2f}",
                 f"${entry_price:.4f}",
@@ -5261,6 +5294,46 @@ class CopyTraderGUI:
             f"Total Cost Basis: ${total_cost:.2f}  |  "
             f"Total Current Value: ${total_value:.2f}  |  "
             f"Net: {'+'if total_float_pnl >= 0 else ''}${total_float_pnl:.2f}"
+        )
+
+        # Whale comparison panel (read from whale_comparison.json)
+        self._refresh_whale_comparison()
+
+    def _refresh_whale_comparison(self):
+        """Load whale_comparison.json and update the comparison labels."""
+        try:
+            with open(WHALE_COMPARISON_FILE, "r") as fh:
+                wc = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.dash_whale_bot_pnl_var.set("Bot P/L: $0.00 (no closed trades)")
+            self.dash_whale_whale_pnl_var.set("Whale P/L: $0.00")
+            self.dash_whale_slippage_var.set("Slippage Cost: $0.00")
+            self.dash_whale_winrate_var.set("W/L: 0/0 (0%)")
+            return
+
+        bot_pnl = wc.get("bot_pnl_usdc", 0)
+        whale_pnl = wc.get("whale_pnl_usdc", 0)
+        slippage = wc.get("total_slippage_cost_usdc", 0)
+        wins = wc.get("wins", 0)
+        losses = wc.get("losses", 0)
+        win_rate = wc.get("win_rate_pct", 0)
+        total_trades = wc.get("total_trades", 0)
+
+        # Bot P/L with direction
+        bot_dir = "UP" if bot_pnl > 0 else ("DOWN" if bot_pnl < 0 else "--")
+        self.dash_whale_bot_pnl_var.set(
+            f"Bot P/L: {bot_dir} ${bot_pnl:+,.2f} ({total_trades} trades)"
+        )
+
+        # Whale P/L with direction
+        whale_dir = "UP" if whale_pnl > 0 else ("DOWN" if whale_pnl < 0 else "--")
+        self.dash_whale_whale_pnl_var.set(
+            f"Whale P/L: {whale_dir} ${whale_pnl:+,.2f}"
+        )
+
+        self.dash_whale_slippage_var.set(f"Slippage Cost: ${slippage:+,.2f}")
+        self.dash_whale_winrate_var.set(
+            f"W/L: {wins}/{losses} ({win_rate:.0f}%)"
         )
 
     def _dash_get_price(self, token_id):
