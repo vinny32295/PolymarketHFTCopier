@@ -118,6 +118,8 @@ DATA_API_BASE = "https://data-api.polymarket.com"
 # survive restarts and don't depend on the Gamma API at redeem time.
 POSITIONS_FILE = "positions.json"
 TRADE_HISTORY_FILE = "trade_history.json"
+SESSION_TRADES_FILE = "session_trades.json"
+WHALE_COMPARISON_FILE = "whale_comparison.json"
 
 # Polymarket Proxy Wallet Factory on Polygon
 # Deploys lightweight proxy wallets for Polymarket users; each EOA has
@@ -1438,9 +1440,13 @@ class TradeExecutor:
                 raw = json.load(fh)
             positions = {}
             for tid, entry in raw.items():
+                ep = Decimal(str(entry.get("entry_price", 0)))
                 positions[tid] = {
                     "tokens": Decimal(str(entry.get("tokens", 0))),
-                    "entry_price": Decimal(str(entry.get("entry_price", 0))),
+                    "entry_price": ep,
+                    "whale_entry_price": Decimal(
+                        str(entry.get("whale_entry_price", ep))
+                    ),
                     "neg_risk": entry.get("neg_risk", False),
                     "condition_id": entry.get("condition_id"),
                     "collateral_token": entry.get("collateral_token", USDC_ADDRESS),
@@ -1465,9 +1471,11 @@ class TradeExecutor:
         try:
             serialisable = {}
             for tid, pos in self._positions.items():
+                whale_ep = pos.get("whale_entry_price", pos["entry_price"])
                 serialisable[tid] = {
                     "tokens": str(pos["tokens"]),
                     "entry_price": str(pos["entry_price"]),
+                    "whale_entry_price": str(whale_ep),
                     "neg_risk": pos.get("neg_risk", False),
                     "condition_id": pos.get("condition_id"),
                     "collateral_token": pos.get("collateral_token", USDC_ADDRESS),
@@ -1530,12 +1538,16 @@ class TradeExecutor:
             return []
 
     def _log_closed_trade(self, token_id, entry_price, exit_price,
-                          shares, reason, market=None):
+                          shares, reason, market=None,
+                          whale_entry_price=None):
         """Append a closed trade record to the persistent history file.
 
         Tracks *cost_basis* (capital deployed) and *proceeds* (capital
         returned) separately so lifetime P/L can be computed accurately
         as ``sum(proceeds) - sum(cost_basis)`` across all records.
+
+        Also tracks the whale's entry price for comparison so we can
+        compute the whale's hypothetical P/L vs our actual P/L.
 
         The *outcome* field categorises the result:
         - ``"won"``  — redeemed at $1.00 (full payout)
@@ -1546,10 +1558,17 @@ class TradeExecutor:
         entry_p = float(entry_price) if entry_price else 0.0
         exit_p = float(exit_price) if exit_price else 0.0
         num_shares = float(shares) if shares else 0.0
+        whale_p = float(whale_entry_price) if whale_entry_price else entry_p
 
         cost_basis = entry_p * num_shares
         proceeds = exit_p * num_shares
         pnl = round(proceeds - cost_basis, 6)
+
+        # Whale hypothetical P/L (same exit, but at whale's entry)
+        whale_cost_basis = whale_p * num_shares
+        whale_proceeds = exit_p * num_shares
+        whale_pnl = round(whale_proceeds - whale_cost_basis, 6)
+        slippage_cost = round(cost_basis - whale_cost_basis, 6)
 
         # Classify the outcome for reporting
         if reason == "redeemed":
@@ -1570,6 +1589,10 @@ class TradeExecutor:
             "cost_basis_usdc": round(cost_basis, 6),
             "proceeds_usdc": round(proceeds, 6),
             "pnl_usdc": pnl,
+            "whale_entry_price": whale_p,
+            "whale_cost_basis_usdc": round(whale_cost_basis, 6),
+            "whale_pnl_usdc": whale_pnl,
+            "slippage_cost_usdc": slippage_cost,
             "outcome": outcome,
             "reason": reason,
         }
@@ -1577,10 +1600,19 @@ class TradeExecutor:
         history = self._load_trade_history()
         history.append(record)
 
-        # Compute running totals
+        # Compute running totals (bot and whale)
         total_cost = sum(r.get("cost_basis_usdc", 0) for r in history)
         total_proceeds = sum(r.get("proceeds_usdc", 0) for r in history)
         total_pnl = round(total_proceeds - total_cost, 6)
+        total_whale_cost = sum(r.get("whale_cost_basis_usdc", r.get("cost_basis_usdc", 0)) for r in history)
+        total_whale_pnl = round(total_proceeds - total_whale_cost, 6)
+        total_slippage = round(total_cost - total_whale_cost, 6)
+
+        # Win/loss counts
+        wins = sum(1 for r in history if r.get("outcome") == "won")
+        losses = sum(1 for r in history if r.get("outcome") == "lost")
+        total_trades = wins + losses
+        win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
 
         try:
             tmp = self._trade_history_file + ".tmp"
@@ -1590,11 +1622,36 @@ class TradeExecutor:
         except Exception as exc:
             self.logger.warning("Could not save trade history: %s", exc)
 
+        # --- Also persist whale comparison summary ---
+        try:
+            comparison = {
+                "updated_at": datetime.now().isoformat(),
+                "total_trades": len(history),
+                "wins": wins,
+                "losses": losses,
+                "win_rate_pct": round(win_rate, 1),
+                "bot_pnl_usdc": total_pnl,
+                "bot_cost_basis_usdc": round(total_cost, 6),
+                "whale_pnl_usdc": total_whale_pnl,
+                "whale_cost_basis_usdc": round(total_whale_cost, 6),
+                "total_slippage_cost_usdc": total_slippage,
+                "capital_returned_usdc": round(total_proceeds, 6),
+            }
+            tmp_wc = WHALE_COMPARISON_FILE + ".tmp"
+            with open(tmp_wc, "w") as fh:
+                json.dump(comparison, fh, indent=2)
+            os.replace(tmp_wc, WHALE_COMPARISON_FILE)
+        except Exception as exc:
+            self.logger.debug("Could not save whale comparison: %s", exc)
+
         self.logger.info(
             "CLOSED TRADE [%s]: %s | %.4f shares @ entry $%.4f -> exit $%.4f | "
-            "P&L $%+.4f | lifetime P&L $%+.4f (deployed $%.2f, returned $%.2f)",
+            "Bot P&L $%+.4f | Whale P&L $%+.4f (slippage $%+.4f) | "
+            "W/L %d/%d (%.0f%%) | lifetime Bot $%+.4f vs Whale $%+.4f",
             outcome.upper(), record["market"], num_shares, entry_p, exit_p,
-            pnl, total_pnl, total_cost, total_proceeds,
+            pnl, whale_pnl, slippage_cost,
+            wins, losses, win_rate,
+            total_pnl, total_whale_pnl,
         )
 
         # Kill switch: stop the bot if session losses exceed threshold
@@ -1950,6 +2007,7 @@ class TradeExecutor:
                     token_id, entry_price, current_price_d,
                     tokens, reason,
                     market=pos.get("market_name"),
+                    whale_entry_price=pos.get("whale_entry_price"),
                 )
                 # Clear the position
                 del self._positions[token_id]
@@ -1995,6 +2053,7 @@ class TradeExecutor:
                         token_id, entry_price, current_price_d,
                         tokens, "dust",
                         market=pos.get("market_name"),
+                        whale_entry_price=pos.get("whale_entry_price"),
                     )
                     del self._positions[token_id]
                     self._save_positions()
@@ -2054,6 +2113,7 @@ class TradeExecutor:
                     token_id, pos.get("entry_price", 0), 0,
                     pos.get("tokens", 0), "stale",
                     market=pos.get("market_name"),
+                    whale_entry_price=pos.get("whale_entry_price"),
                 )
                 self._positions.pop(token_id, None)
                 self._save_positions()
@@ -2085,6 +2145,7 @@ class TradeExecutor:
                     token_id, pos.get("entry_price", 0), 0,
                     pos.get("tokens", 0), "resolution_error",
                     market=pos.get("market_name"),
+                    whale_entry_price=pos.get("whale_entry_price"),
                 )
                 self._positions.pop(token_id, None)
                 self._save_positions()
@@ -2146,6 +2207,7 @@ class TradeExecutor:
                     token_id, pos.get("entry_price", 0), exit_price,
                     pos.get("tokens", 0), "redeemed",
                     market=pos.get("market_name"),
+                    whale_entry_price=pos.get("whale_entry_price"),
                 )
                 self._positions.pop(token_id, None)
                 self._save_positions()
@@ -2169,6 +2231,7 @@ class TradeExecutor:
                         token_id, pos.get("entry_price", 0), 0,
                         pos.get("tokens", 0), "failed_redeem",
                         market=pos.get("market_name"),
+                        whale_entry_price=pos.get("whale_entry_price"),
                     )
                     self._positions.pop(token_id, None)
                 else:
@@ -2191,6 +2254,7 @@ class TradeExecutor:
                 self._log_closed_trade(
                     token_id, pos.get("entry_price", 0), 0,
                     pos.get("tokens", 0), "failed_redeem",
+                    whale_entry_price=pos.get("whale_entry_price"),
                 )
                 self._positions.pop(token_id, None)
             else:
@@ -2433,6 +2497,7 @@ class TradeExecutor:
                             token_id, pos.get("entry_price", 0), exit_price,
                             pos.get("tokens", 0), "redeemed",
                             market=pos.get("market_name"),
+                            whale_entry_price=pos.get("whale_entry_price"),
                         )
                     else:
                         # Position wasn't tracked yet (discovered already
@@ -2843,6 +2908,7 @@ class TradeExecutor:
                         token_id, pos.get("entry_price", 0), exit_price,
                         pos.get("tokens", 0), "redeemed",
                         market=pos.get("market_name"),
+                        whale_entry_price=pos.get("whale_entry_price"),
                     )
                     del self._positions[token_id]
                     self._save_positions()
@@ -4108,7 +4174,7 @@ class TradeExecutor:
                     if side == "BUY":
                         pos = self._positions.get(token_id)
                         if pos:
-                            # Weighted-average entry price
+                            # Weighted-average entry price (both bot and whale)
                             old_tokens = pos["tokens"]
                             old_cost = old_tokens * pos["entry_price"]
                             new_cost = tokens * Decimal(str(adjusted_price))
@@ -4118,13 +4184,24 @@ class TradeExecutor:
                                 if total_tokens > 0
                                 else Decimal(str(adjusted_price))
                             )
+                            # Track whale's VWAP alongside ours
+                            old_whale = pos.get("whale_entry_price", pos["entry_price"])
+                            old_whale_cost = old_tokens * old_whale
+                            new_whale_cost = tokens * Decimal(str(price))
+                            whale_avg = (
+                                (old_whale_cost + new_whale_cost) / total_tokens
+                                if total_tokens > 0
+                                else Decimal(str(price))
+                            )
                             pos["tokens"] = total_tokens
                             pos["entry_price"] = avg_price
+                            pos["whale_entry_price"] = whale_avg
                             pos.update(redeem_params)
                         else:
                             self._positions[token_id] = {
                                 "tokens": tokens,
                                 "entry_price": Decimal(str(adjusted_price)),
+                                "whale_entry_price": Decimal(str(price)),
                                 "opened_at": datetime.now().isoformat(),
                                 **redeem_params,
                             }
@@ -4140,6 +4217,7 @@ class TradeExecutor:
                                     adjusted_price, sold_tokens,
                                     "copied_sell",
                                     market=pos.get("market_name"),
+                                    whale_entry_price=pos.get("whale_entry_price"),
                                 )
                                 del self._positions[token_id]
 
@@ -4189,6 +4267,8 @@ class TradeExecutor:
                         "amount_usdc": float(copy_amount),
                         "token_id": token_id,
                         "price": adjusted_price,
+                        "whale_price": float(price),
+                        "original_usdc": float(original_usdc),
                         "clob_response": result,
                     }
                 else:
@@ -4245,6 +4325,20 @@ class CopyTraderBot:
         """Send a webhook notification if configured."""
         url = self.cfg.get("webhook_url", "")
         send_webhook(url, message, logger=self.logger)
+
+    def _save_session_trades(self):
+        """Persist session trades to disk immediately (crash-safe).
+
+        Writes after every trade so data survives crashes, kills, or
+        unexpected shutdowns.  Uses atomic write (tmp + rename).
+        """
+        try:
+            tmp = SESSION_TRADES_FILE + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(self._trade_history, fh, indent=2, default=str)
+            os.replace(tmp, SESSION_TRADES_FILE)
+        except Exception as exc:
+            self.logger.debug("Could not save session trades: %s", exc)
 
     def _init_web3(self):
         """Initialize Web3 provider from config."""
@@ -4692,12 +4786,15 @@ class CopyTraderBot:
                             if result and isinstance(result, dict):
                                 result["timestamp"] = datetime.now().isoformat()
                                 self._trade_history.append(result)
+                                # Crash-safe: persist session trades immediately
+                                self._save_session_trades()
                                 if result.get("status") == "submitted":
                                     self._notify(
-                                        "TRADE %s $%.2f @ %.4f — %s" % (
+                                        "TRADE %s $%.2f @ %.4f (whale @ %.4f) — %s" % (
                                             result.get("side", "?"),
                                             result.get("amount_usdc", 0),
                                             result.get("price", 0),
+                                            result.get("whale_price", 0),
                                             result.get("token_id", "")[:16] + "...",
                                         )
                                     )
@@ -4790,6 +4887,18 @@ class CopyTraderBot:
         total_proceeds = sum(r.get("proceeds_usdc", 0) for r in closed_trades)
         realized_pnl = round(total_proceeds - total_cost_basis, 6)
 
+        # Whale comparison
+        total_whale_cost = sum(
+            r.get("whale_cost_basis_usdc", r.get("cost_basis_usdc", 0))
+            for r in closed_trades
+        )
+        whale_realized_pnl = round(total_proceeds - total_whale_cost, 6)
+        total_slippage = round(total_cost_basis - total_whale_cost, 6)
+        wins = sum(1 for r in closed_trades if r.get("outcome") == "won")
+        losses = sum(1 for r in closed_trades if r.get("outcome") == "lost")
+        total_resolved = wins + losses
+        win_rate = (wins / total_resolved * 100) if total_resolved > 0 else 0
+
         # Unrealized value of open positions (at entry price as conservative estimate)
         open_cost = sum(
             p.get("cost_basis_usdc", 0) for p in positions.values()
@@ -4808,6 +4917,11 @@ class CopyTraderBot:
             "lifetime_capital_deployed": round(total_cost_basis, 6),
             "lifetime_capital_returned": round(total_proceeds, 6),
             "lifetime_realized_pnl": realized_pnl,
+            "whale_realized_pnl": whale_realized_pnl,
+            "total_slippage_cost": total_slippage,
+            "wins": wins,
+            "losses": losses,
+            "win_rate_pct": round(win_rate, 1),
             "open_positions_cost_basis": round(open_cost, 6),
             "closed_trade_count": len(closed_trades),
             "trade_history": self._trade_history,
@@ -4843,6 +4957,13 @@ class CopyTraderBot:
             buy_total - sell_total, len(positions),
             realized_pnl, total_cost_basis, total_proceeds,
         )
+        if total_resolved > 0:
+            self.logger.info(
+                "BOT vs WHALE: Bot P&L $%+.2f | Whale P&L $%+.2f | "
+                "Slippage cost $%+.2f | W/L %d/%d (%.0f%%)",
+                realized_pnl, whale_realized_pnl, total_slippage,
+                wins, losses, win_rate,
+            )
         if positions:
             self.logger.info(
                 "Open positions with redemption params saved to %s",
