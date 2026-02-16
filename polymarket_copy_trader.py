@@ -5674,6 +5674,7 @@ class CopyTraderGUI:
         btn_frame.pack(fill=tk.X, pady=3)
         ttk.Button(btn_frame, text="Refresh", command=self._refresh_history).pack(side=tk.LEFT)
         ttk.Button(btn_frame, text="Export CSV", command=self._export_history_csv).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Clear History", command=self._clear_trade_history).pack(side=tk.LEFT, padx=5)
 
         # Load existing history on startup
         self._refresh_history()
@@ -5754,6 +5755,48 @@ class CopyTraderGUI:
 
         self.history_summary_var.set(
             self.history_summary_var.get() + f"  |  Exported to {csv_path}"
+        )
+
+    def _clear_trade_history(self):
+        """Reset all trade history, P&L tracking, and position data.
+
+        Prompts for confirmation, then clears trade_history.json,
+        whale_comparison.json, session_trades.json, and positions.json
+        so the user can start fresh on a new session.
+        """
+        import tkinter.messagebox as mbox
+        ok = mbox.askyesno(
+            "Clear Trade History",
+            "This will permanently delete:\n\n"
+            "  - All trade history and P&L records\n"
+            "  - Whale comparison data\n"
+            "  - Session trades\n"
+            "  - Open position tracking\n\n"
+            "Are you sure you want to reset everything?",
+        )
+        if not ok:
+            return
+
+        files_to_clear = [
+            TRADE_HISTORY_FILE,
+            WHALE_COMPARISON_FILE,
+            SESSION_TRADES_FILE,
+            POSITIONS_FILE,
+        ]
+        for fpath in files_to_clear:
+            try:
+                if os.path.exists(fpath):
+                    os.remove(fpath)
+            except Exception as exc:
+                self.logger.warning("Could not remove %s: %s", fpath, exc)
+
+        # Reset in-memory state if bot executor is running
+        if hasattr(self, '_trade_history'):
+            self._trade_history.clear()
+
+        self._refresh_history()
+        self.history_summary_var.set(
+            "History cleared — all P&L and position data reset."
         )
 
     # ---- Field load/save ----
