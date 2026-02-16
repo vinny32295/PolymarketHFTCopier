@@ -2300,6 +2300,7 @@ class TradeExecutor:
                         self._positions[token_id] = {
                             "tokens": tokens,
                             "entry_price": entry_price,
+                            "opened_at": datetime.now().isoformat(),
                             "neg_risk": neg_risk,
                             "condition_id": condition_id,
                             "collateral_token": USDC_ADDRESS,
@@ -4034,6 +4035,7 @@ class TradeExecutor:
                             self._positions[token_id] = {
                                 "tokens": tokens,
                                 "entry_price": Decimal(str(adjusted_price)),
+                                "opened_at": datetime.now().isoformat(),
                                 **redeem_params,
                             }
                     elif side == "SELL":
@@ -4815,22 +4817,27 @@ class CopyTraderGUI:
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
-        # Tab 1: Configuration
+        # Tab 1: Dashboard (live positions & balance)
+        dash_frame = ttk.Frame(notebook, padding=10)
+        notebook.add(dash_frame, text="Dashboard")
+        self._build_dashboard_tab(dash_frame)
+
+        # Tab 2: Configuration
         config_frame = ttk.Frame(notebook, padding=10)
         notebook.add(config_frame, text="Configuration")
         self._build_config_tab(config_frame)
 
-        # Tab 2: Watched Addresses
+        # Tab 3: Watched Addresses
         addr_frame = ttk.Frame(notebook, padding=10)
         notebook.add(addr_frame, text="Watched Addresses")
         self._build_address_tab(addr_frame)
 
-        # Tab 3: Trade History
+        # Tab 4: Trade History
         history_frame = ttk.Frame(notebook, padding=10)
         notebook.add(history_frame, text="Trade History")
         self._build_history_tab(history_frame)
 
-        # Tab 4: Log / Status
+        # Tab 5: Log / Status
         log_frame = ttk.Frame(notebook, padding=10)
         notebook.add(log_frame, text="Log")
         self._build_log_tab(log_frame)
@@ -4846,6 +4853,222 @@ class CopyTraderGUI:
         self.stop_btn.pack(side=tk.LEFT, padx=5)
         self.status_var = tk.StringVar(value="Status: Idle")
         ttk.Label(ctrl, textvariable=self.status_var).pack(side=tk.RIGHT, padx=10)
+
+    # ---- Dashboard tab ----
+
+    def _build_dashboard_tab(self, parent):
+        # Top info bar: balances & summary
+        info_frame = ttk.LabelFrame(parent, text="Account", padding=8)
+        info_frame.pack(fill=tk.X, pady=(0, 6))
+
+        self.dash_usdc_var = tk.StringVar(value="USDC Balance: --")
+        self.dash_matic_var = tk.StringVar(value="MATIC Balance: --")
+        self.dash_total_pnl_var = tk.StringVar(value="Floating P/L: --")
+        self.dash_positions_var = tk.StringVar(value="Open Positions: 0")
+
+        row_f = ttk.Frame(info_frame)
+        row_f.pack(fill=tk.X)
+        ttk.Label(row_f, textvariable=self.dash_usdc_var, font=("Courier", 11, "bold")).pack(side=tk.LEFT, padx=(0, 20))
+        ttk.Label(row_f, textvariable=self.dash_matic_var, font=("Courier", 11)).pack(side=tk.LEFT, padx=(0, 20))
+        ttk.Label(row_f, textvariable=self.dash_positions_var, font=("Courier", 11)).pack(side=tk.LEFT, padx=(0, 20))
+        ttk.Label(row_f, textvariable=self.dash_total_pnl_var, font=("Courier", 11, "bold")).pack(side=tk.LEFT)
+
+        # Positions treeview
+        columns = ("market", "shares", "avg_price", "cur_price", "cost_basis",
+                    "cur_value", "float_pnl", "pnl_pct", "time_held")
+        col_headings = {
+            "market": "Market",
+            "shares": "Shares",
+            "avg_price": "Avg Price",
+            "cur_price": "Cur Price",
+            "cost_basis": "Cost Basis",
+            "cur_value": "Cur Value",
+            "float_pnl": "Float P/L",
+            "pnl_pct": "P/L %",
+            "time_held": "Time Held",
+        }
+        col_widths = {
+            "market": 220, "shares": 75, "avg_price": 75, "cur_price": 75,
+            "cost_basis": 85, "cur_value": 85, "float_pnl": 85, "pnl_pct": 70,
+            "time_held": 90,
+        }
+
+        tree_frame = ttk.Frame(parent)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
+        self.dash_tree = ttk.Treeview(
+            tree_frame, columns=columns, show="headings",
+            yscrollcommand=scrollbar.set, height=18,
+        )
+        scrollbar.config(command=self.dash_tree.yview)
+
+        for col in columns:
+            self.dash_tree.heading(col, text=col_headings[col])
+            anchor = tk.E if col != "market" else tk.W
+            self.dash_tree.column(col, width=col_widths.get(col, 80), anchor=anchor)
+
+        self.dash_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Summary row
+        self.dash_summary_var = tk.StringVar(value="")
+        ttk.Label(parent, textvariable=self.dash_summary_var, font=("Courier", 10)).pack(
+            anchor=tk.W, pady=(5, 0),
+        )
+
+        # Buttons
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(fill=tk.X, pady=3)
+        ttk.Button(btn_frame, text="Refresh Now", command=self._refresh_dashboard).pack(side=tk.LEFT)
+
+        self._dash_refresh_id = None  # tkinter .after() handle
+        self._dash_price_cache = {}   # token_id -> (price, timestamp)
+
+    def _start_dashboard_refresh(self):
+        """Begin periodic dashboard updates (every 10 seconds)."""
+        self._refresh_dashboard()
+
+    def _stop_dashboard_refresh(self):
+        """Cancel the periodic dashboard refresh."""
+        if self._dash_refresh_id is not None:
+            self.root.after_cancel(self._dash_refresh_id)
+            self._dash_refresh_id = None
+
+    def _refresh_dashboard(self):
+        """Pull live data from the bot and update the dashboard table."""
+        # Schedule next refresh (10 seconds)
+        if self.bot and self.bot.running:
+            self._dash_refresh_id = self.root.after(10_000, self._refresh_dashboard)
+        else:
+            self._dash_refresh_id = None
+
+        # Clear existing rows
+        for row in self.dash_tree.get_children():
+            self.dash_tree.delete(row)
+
+        # No bot running — show idle state
+        if not self.bot or not self.bot.running or not getattr(self.bot, "executor", None):
+            self.dash_usdc_var.set("USDC Balance: --")
+            self.dash_matic_var.set("MATIC Balance: --")
+            self.dash_total_pnl_var.set("Floating P/L: --")
+            self.dash_positions_var.set("Open Positions: 0")
+            self.dash_summary_var.set("Bot not running")
+            return
+
+        executor = self.bot.executor
+
+        # Fetch balances (cached, thread-safe)
+        try:
+            usdc_bal = executor.get_usdc_balance(max_age_seconds=15)
+            self.dash_usdc_var.set(f"USDC Balance: ${usdc_bal:,.2f}")
+        except Exception:
+            self.dash_usdc_var.set("USDC Balance: error")
+
+        try:
+            matic_bal = executor.get_matic_balance()
+            self.dash_matic_var.set(f"MATIC Balance: {matic_bal:,.4f}")
+        except Exception:
+            self.dash_matic_var.set("MATIC Balance: error")
+
+        # Build positions table
+        positions = dict(executor._positions)  # snapshot
+        self.dash_positions_var.set(f"Open Positions: {len(positions)}")
+
+        total_cost = Decimal("0")
+        total_value = Decimal("0")
+        now = datetime.now()
+
+        for token_id, pos in positions.items():
+            tokens = pos.get("tokens", Decimal("0"))
+            entry_price = pos.get("entry_price", Decimal("0"))
+            market_name = pos.get("market_name") or (token_id[:20] + "...")
+
+            if tokens <= 0:
+                continue
+
+            cost_basis = tokens * entry_price
+            total_cost += cost_basis
+
+            # Fetch current price (use CLOB client if available)
+            cur_price = self._dash_get_price(token_id)
+            if cur_price is not None:
+                cur_price_d = Decimal(str(cur_price))
+                cur_value = tokens * cur_price_d
+                total_value += cur_value
+                float_pnl = cur_value - cost_basis
+                pnl_pct = ((cur_price_d - entry_price) / entry_price * 100) if entry_price > 0 else Decimal("0")
+                cur_price_str = f"${cur_price_d:.4f}"
+                cur_value_str = f"${cur_value:.2f}"
+                float_pnl_str = f"{'+'if float_pnl >= 0 else ''}${float_pnl:.2f}"
+                pnl_pct_str = f"{'+'if pnl_pct >= 0 else ''}{pnl_pct:.1f}%"
+            else:
+                cur_value = cost_basis  # fallback estimate
+                total_value += cur_value
+                cur_price_str = "--"
+                cur_value_str = "--"
+                float_pnl_str = "--"
+                pnl_pct_str = "--"
+
+            # Time held
+            opened_at = pos.get("opened_at")
+            if opened_at:
+                try:
+                    opened_dt = datetime.fromisoformat(opened_at)
+                    delta = now - opened_dt
+                    hours, remainder = divmod(int(delta.total_seconds()), 3600)
+                    minutes = remainder // 60
+                    if hours >= 24:
+                        days = hours // 24
+                        time_held = f"{days}d {hours % 24}h"
+                    else:
+                        time_held = f"{hours}h {minutes}m"
+                except Exception:
+                    time_held = "--"
+            else:
+                time_held = "--"
+
+            self.dash_tree.insert("", tk.END, values=(
+                market_name[:45],
+                f"{tokens:.2f}",
+                f"${entry_price:.4f}",
+                cur_price_str,
+                f"${cost_basis:.2f}",
+                cur_value_str,
+                float_pnl_str,
+                pnl_pct_str,
+                time_held,
+            ))
+
+        # Totals
+        total_float_pnl = total_value - total_cost
+        self.dash_total_pnl_var.set(
+            f"Floating P/L: {'+'if total_float_pnl >= 0 else ''}${total_float_pnl:.2f}"
+        )
+        self.dash_summary_var.set(
+            f"Total Cost Basis: ${total_cost:.2f}  |  "
+            f"Total Current Value: ${total_value:.2f}  |  "
+            f"Net: {'+'if total_float_pnl >= 0 else ''}${total_float_pnl:.2f}"
+        )
+
+    def _dash_get_price(self, token_id):
+        """Get current price for a token, with 15-second caching."""
+        now = datetime.now()
+        cached = self._dash_price_cache.get(token_id)
+        if cached:
+            price, ts = cached
+            if (now - ts).total_seconds() < 15:
+                return price
+
+        if not self.bot or not self.bot.clob_client:
+            return None
+        try:
+            price = self.bot.clob_client.get_last_trade_price(token_id)
+            if price is not None:
+                self._dash_price_cache[token_id] = (price, now)
+            return price
+        except Exception:
+            return cached[0] if cached else None
 
     def _build_config_tab(self, parent):
         # RPC URL
@@ -5377,8 +5600,10 @@ class CopyTraderGUI:
         self.start_btn.configure(state=tk.DISABLED)
         self.stop_btn.configure(state=tk.NORMAL)
         self.status_var.set("Status: Running")
+        self._start_dashboard_refresh()
 
     def _stop_bot(self):
+        self._stop_dashboard_refresh()
         if self.bot:
             self.bot.stop()
         self.start_btn.configure(state=tk.NORMAL)
@@ -5390,6 +5615,7 @@ class CopyTraderGUI:
         self.root.mainloop()
 
     def _on_close(self):
+        self._stop_dashboard_refresh()
         if self.bot and self.bot.running:
             self.bot.stop()
         self.root.destroy()
