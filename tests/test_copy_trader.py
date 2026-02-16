@@ -44,42 +44,16 @@ import polymarket_copy_trader as bot
 
 
 class TestConfigHelpers(unittest.TestCase):
-    """Test config load/save and private key management."""
+    """Test private key management."""
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
-        self.config_path = os.path.join(self.tmpdir, "test_config.json")
         self.pk_path = os.path.join(self.tmpdir, "test_pk")
 
     def tearDown(self):
-        for f in [self.config_path, self.pk_path]:
-            if os.path.exists(f):
-                os.remove(f)
+        if os.path.exists(self.pk_path):
+            os.remove(self.pk_path)
         os.rmdir(self.tmpdir)
-
-    def test_save_and_load_config(self):
-        cfg = dict(bot.DEFAULT_CONFIG)
-        cfg["copy_percentage"] = 75
-        cfg["watched_addresses"] = ["0x" + "a" * 40]
-        bot.save_config(cfg, self.config_path)
-
-        loaded = bot.load_config(self.config_path)
-        self.assertEqual(loaded["copy_percentage"], 75)
-        self.assertEqual(loaded["watched_addresses"], ["0x" + "a" * 40])
-
-    def test_load_config_creates_default(self):
-        cfg = bot.load_config(self.config_path)
-        self.assertTrue(os.path.exists(self.config_path))
-        self.assertEqual(cfg["copy_percentage"], 50)
-        self.assertEqual(cfg["watched_addresses"], [])
-
-    def test_load_config_merges_defaults(self):
-        """Config file with missing keys gets defaults merged in."""
-        with open(self.config_path, "w") as f:
-            json.dump({"rpc_url": "http://test"}, f)
-        cfg = bot.load_config(self.config_path)
-        self.assertEqual(cfg["rpc_url"], "http://test")
-        self.assertEqual(cfg["copy_percentage"], 50)  # default merged
 
     def test_save_and_load_private_key(self):
         cfg = {"private_key_file": self.pk_path}
@@ -844,7 +818,8 @@ class TestCLOBClientOrderMethods(unittest.TestCase):
 class TestAutoExitConditions(unittest.TestCase):
     """Test take-profit (>= .99) and stop-loss (<= 50% of entry) auto-exits."""
 
-    def _make_executor(self, dry_run=False):
+    def _make_executor(self, dry_run=False, stop_loss_pct=None,
+                       exit_mode=None):
         w3 = MagicMock()
         mock_account = MagicMock()
         mock_account.address = "0x" + "1" * 40
@@ -854,6 +829,10 @@ class TestAutoExitConditions(unittest.TestCase):
         cfg = dict(bot.DEFAULT_CONFIG)
         cfg["dry_run"] = dry_run
         cfg["slippage_tolerance_bps"] = 100
+        if stop_loss_pct is not None:
+            cfg["stop_loss_pct"] = stop_loss_pct
+        if exit_mode is not None:
+            cfg["exit_mode"] = exit_mode
 
         executor = bot.TradeExecutor(
             w3=w3,
@@ -909,8 +888,8 @@ class TestAutoExitConditions(unittest.TestCase):
         self.assertEqual(results[0]["reason"], "take-profit")
 
     def test_stop_loss_at_50_pct(self):
-        """Position should be sold when price drops to 50% of entry."""
-        executor = self._make_executor()
+        """Position should be sold when price drops to 50% of entry (auto mode)."""
+        executor = self._make_executor(stop_loss_pct=50, exit_mode="auto")
         # Entry at 0.60, stop-loss triggers at 0.30
         executor._positions["tok1"] = {"tokens": Decimal("10"), "entry_price": Decimal("0.60")}
         executor.clob_client.get_last_trade_price.return_value = 0.30
@@ -923,8 +902,8 @@ class TestAutoExitConditions(unittest.TestCase):
         self.assertNotIn("tok1", executor._positions)
 
     def test_stop_loss_below_50_pct(self):
-        """Position should be sold when price drops well below 50% of entry."""
-        executor = self._make_executor()
+        """Position should be sold when price drops well below 50% of entry (auto mode)."""
+        executor = self._make_executor(stop_loss_pct=50, exit_mode="auto")
         executor._positions["tok1"] = {"tokens": Decimal("10"), "entry_price": Decimal("0.80")}
         # 50% of 0.80 = 0.40; price is 0.10
         executor.clob_client.get_last_trade_price.return_value = 0.10
@@ -982,9 +961,21 @@ class TestAutoExitConditions(unittest.TestCase):
         # Position should still exist in dry run
         self.assertIn("tok1", executor._positions)
 
+    def test_whale_mode_ignores_stop_loss(self):
+        """In whale exit mode (default), stop-loss is disabled — hold through dips."""
+        executor = self._make_executor(stop_loss_pct=50)  # whale mode is default
+        # Entry at 0.60, price drops to 0.10 — would trigger stop-loss in auto mode
+        executor._positions["tok1"] = {"tokens": Decimal("10"), "entry_price": Decimal("0.60")}
+        executor.clob_client.get_last_trade_price.return_value = 0.10
+
+        results = executor.check_exit_conditions()
+        # Whale mode: stop-loss should NOT trigger
+        self.assertEqual(results, [])
+        self.assertIn("tok1", executor._positions)
+
     def test_multiple_positions_exits(self):
-        """Multiple positions can exit in the same check cycle."""
-        executor = self._make_executor()
+        """Multiple positions can exit in the same check cycle (auto mode)."""
+        executor = self._make_executor(stop_loss_pct=50, exit_mode="auto")
         # tok1: take-profit (price at 0.99)
         executor._positions["tok1"] = {"tokens": Decimal("5"), "entry_price": Decimal("0.50")}
         # tok2: stop-loss (entry 0.80, price at 0.30 — below 50%)
@@ -1033,7 +1024,7 @@ class TestAutoExitConditions(unittest.TestCase):
     def test_exit_thresholds_are_correct(self):
         """Verify the exit threshold constants have expected values."""
         self.assertEqual(bot.TAKE_PROFIT_PRICE, Decimal("0.99"))
-        self.assertEqual(bot.STOP_LOSS_PCT, Decimal("0.50"))
+        self.assertEqual(bot.STOP_LOSS_PCT, Decimal("0"))
 
 
 class TestLowBalancePauseResume(unittest.TestCase):

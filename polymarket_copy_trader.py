@@ -70,7 +70,7 @@ except ImportError:
 # Constants – Polymarket / Polygon addresses and ABIs
 # ---------------------------------------------------------------------------
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # Polymarket CTF Exchange (Conditional Token Framework) on Polygon
 # Reference: https://docs.polymarket.com/
@@ -102,8 +102,8 @@ MIN_ORDER_NOTIONAL_USDC = 1.05  # slightly above $1 to stay above min after fees
 LOW_BALANCE_PAUSE_THRESHOLD = Decimal("1.05")   # can't even fill the smallest order
 
 # Auto-exit thresholds for open positions
-TAKE_PROFIT_PRICE = Decimal("1.00")   # hold to full redemption ($1.00) by default
-STOP_LOSS_PCT = Decimal("0")          # disabled by default — whale doesn't use stop-loss
+TAKE_PROFIT_PRICE = Decimal("0.99")   # sell near top instead of waiting for resolution
+STOP_LOSS_PCT = Decimal("0")          # disabled — follow whale's hold-to-resolution strategy
 
 # Polymarket CLOB API base URL
 CLOB_API_BASE = "https://clob.polymarket.com"
@@ -118,6 +118,8 @@ DATA_API_BASE = "https://data-api.polymarket.com"
 # survive restarts and don't depend on the Gamma API at redeem time.
 POSITIONS_FILE = "positions.json"
 TRADE_HISTORY_FILE = "trade_history.json"
+SESSION_TRADES_FILE = "session_trades.json"
+WHALE_COMPARISON_FILE = "whale_comparison.json"
 
 # Polymarket Proxy Wallet Factory on Polygon
 # Deploys lightweight proxy wallets for Polymarket users; each EOA has
@@ -352,8 +354,6 @@ PAUSED_REDEEM_INTERVAL_SECONDS = 30  # every 30 s while paused
 # for the wallet's complete trade history).
 PORTFOLIO_SCAN_INTERVAL_SECONDS = 900  # 15 minutes
 
-# Default config file path
-CONFIG_FILE = "config.json"
 LOG_FILE = "bot.log"
 
 # Default configuration template
@@ -374,15 +374,19 @@ DEFAULT_CONFIG = {
     "dry_run": False,
     "order_ttl_seconds": 60,
     "resume_threshold_usdc": 5.0,
-    "take_profit_price": 1.00,
+    "take_profit_price": 0.99,
+    "take_profit_pct": 0,
     "stop_loss_pct": 0,
     "exit_check_seconds": 5,
+    "exit_mode": "whale",
     "auto_redeem_settled": True,
     "proxy_redeem": True,
     "proxy_withdraw": True,
     "proxy_address": "",
     "webhook_url": "",
-    "max_price_deviation_pct": 5,
+    "max_price_deviation_pct": 3,
+    "max_loss_usdc": 0,
+    "trade_max_age_seconds": 20,
 }
 
 
@@ -425,24 +429,6 @@ def setup_logging(gui_handler=None):
 # Configuration helpers
 # ---------------------------------------------------------------------------
 
-def load_config(path=CONFIG_FILE):
-    """Load configuration from JSON file, creating defaults if missing."""
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            cfg = json.load(f)
-        # Merge any missing defaults
-        for key, val in DEFAULT_CONFIG.items():
-            cfg.setdefault(key, val)
-        return cfg
-    else:
-        save_config(DEFAULT_CONFIG, path)
-        return dict(DEFAULT_CONFIG)
-
-
-def save_config(cfg, path=CONFIG_FILE):
-    """Persist configuration to JSON file."""
-    with open(path, "w") as f:
-        json.dump(cfg, f, indent=2)
 
 
 def load_private_key(cfg):
@@ -595,8 +581,7 @@ class PolymarketCLOBClient:
                 cfg["clob_api_key"] = creds.api_key
                 cfg["clob_api_secret"] = creds.api_secret
                 cfg["clob_api_passphrase"] = creds.api_passphrase
-                save_config(cfg)
-                self.logger.info("Saved CLOB API credentials to config")
+                self.logger.info("Derived CLOB API credentials (stored in memory)")
 
                 # Reinitialize with full credentials
                 self.clob_sdk = ClobClient(
@@ -940,12 +925,13 @@ class PolymarketCLOBClient:
             # --- FOK (Fill-or-Kill) attempt for instant fills ---
             if use_fok and MarketOrderArgs is not None:
                 try:
-                    fok_args = MarketOrderArgs(
-                        token_id=token_id,
-                        amount=round(actual_usdc, 2),
-                        price=rounded_price,
-                    )
                     if side.upper() == "BUY":
+                        fok_args = MarketOrderArgs(
+                            token_id=token_id,
+                            amount=round(actual_usdc, 2),
+                            price=rounded_price,
+                            side=side.upper(),
+                        )
                         signed_fok = self.clob_sdk.create_market_order(fok_args)
                     else:
                         # SELL FOK: amount is in shares, not USDC
@@ -953,6 +939,7 @@ class PolymarketCLOBClient:
                             token_id=token_id,
                             amount=round(size_tokens, 2),
                             price=rounded_price,
+                            side=side.upper(),
                         )
                         signed_fok = self.clob_sdk.create_market_order(fok_args)
                     resp = self.clob_sdk.post_order(
@@ -964,9 +951,60 @@ class PolymarketCLOBClient:
                     )
                     return resp
                 except Exception as fok_exc:
-                    self.logger.info(
-                        "FOK rejected (%s), falling back to GTC", fok_exc,
+                    # FOK failed — the market has moved away from our price.
+                    # Retry ONCE with a refreshed orderbook price before
+                    # giving up.  This catches cases where our smart price
+                    # was slightly stale by the time the order hit the book.
+                    self.logger.warning(
+                        "FOK rejected (%s) — retrying with refreshed price",
+                        fok_exc,
                     )
+                    try:
+                        retry_book = self.get_order_book(token_id)
+                        retry_bids = (retry_book or {}).get("bids") or []
+                        retry_asks = (retry_book or {}).get("asks") or []
+                        retry_bid = float(retry_bids[0].get("price", 0)) if retry_bids else 0
+                        retry_ask = float(retry_asks[0].get("price", 0)) if retry_asks else 0
+                        if side.upper() == "BUY" and retry_ask > 0:
+                            retry_price = round(min(retry_ask * 1.005, 0.99), 2)
+                        elif side.upper() == "SELL" and retry_bid > 0:
+                            retry_price = round(max(retry_bid * 0.995, 0.01), 2)
+                        else:
+                            self.logger.warning("FOK retry: no orderbook — aborting")
+                            return {"status": "fok_rejected", "reason": str(fok_exc)}
+
+                        retry_usdc = round(actual_usdc, 2)
+                        retry_tokens = round(actual_usdc / retry_price, 2) if retry_price > 0 else 0
+                        if side.upper() == "BUY":
+                            fok_args2 = MarketOrderArgs(
+                                token_id=token_id,
+                                amount=retry_usdc,
+                                price=retry_price,
+                                side=side.upper(),
+                            )
+                        else:
+                            fok_args2 = MarketOrderArgs(
+                                token_id=token_id,
+                                amount=round(retry_tokens, 2),
+                                price=retry_price,
+                                side=side.upper(),
+                            )
+                        signed_retry = self.clob_sdk.create_market_order(fok_args2)
+                        resp2 = self.clob_sdk.post_order(
+                            signed_retry, orderType=OrderType.FOK,
+                        )
+                        self.logger.info(
+                            "FOK retry filled: %s $%.2f @ %.4f (was %.4f) — %s",
+                            side, actual_usdc, retry_price, price,
+                            token_id[:16] + "...", resp2,
+                        )
+                        return resp2
+                    except Exception as retry_exc:
+                        self.logger.warning(
+                            "FOK retry also rejected (%s) — aborting",
+                            retry_exc,
+                        )
+                        return {"status": "fok_rejected", "reason": str(retry_exc)}
 
             # --- GTC (Good-Till-Cancelled) limit order ---
             limit_args = OrderArgs(
@@ -1063,10 +1101,16 @@ class PolymarketCLOBClient:
             return None
 
     def get_new_trades(self, address):
-        """Return only trades we have not seen before for *address*."""
+        """Return only trades we have not seen before for *address*.
+
+        Trades older than ``trade_max_age_seconds`` (default 30) are
+        automatically discarded so the bot never executes at a stale price.
+        """
         address = address.lower()
         all_trades = self.get_trades_for_address(address)
         seen = self._last_trade_ids.get(address, set())
+        max_age = self.cfg.get("trade_max_age_seconds", 30)
+        now = time.time()
         new_trades = []
         for trade in all_trades:
             tid = (
@@ -1076,8 +1120,37 @@ class PolymarketCLOBClient:
                 or trade.get("transactionHash", "")
             )
             if tid and tid not in seen:
-                new_trades.append(trade)
                 seen.add(tid)
+
+                # --- Staleness filter ---
+                # Try to extract the trade timestamp so we can skip trades
+                # that are too old by the time we detect them.
+                trade_ts = (
+                    trade.get("matchTime")          # CLOB API epoch-second
+                    or trade.get("timestamp")
+                    or trade.get("createdAt")
+                    or trade.get("blockTimestamp")
+                )
+                if trade_ts is not None:
+                    try:
+                        ts_val = float(trade_ts)
+                        # If value looks like epoch-millis, convert
+                        if ts_val > 1e12:
+                            ts_val = ts_val / 1000.0
+                        age = now - ts_val
+                        if age > max_age:
+                            self.logger.info(
+                                "STALE TRADE: skipping trade %s (age=%.1fs > "
+                                "max=%ds) for %s",
+                                str(tid)[:16], age, max_age, address[:10],
+                            )
+                            continue
+                        # Annotate trade with detection latency for logging
+                        trade["_detection_latency_s"] = round(age, 2)
+                    except (ValueError, TypeError):
+                        pass  # unparseable timestamp — proceed anyway
+
+                new_trades.append(trade)
         self._last_trade_ids[address] = seen
         return new_trades
 
@@ -1294,7 +1367,7 @@ class TradeExecutor:
         self.copy_pct = Decimal(str(cfg.get("copy_percentage", 50))) / Decimal("100")
         self.max_trade = Decimal(str(cfg.get("max_trade_usdc", 100)))
         self.gas_multiplier = cfg.get("gas_multiplier", 1.2)
-        self.slippage_bps = cfg.get("slippage_tolerance_bps", 100)
+        self.slippage_bps = cfg.get("slippage_tolerance_bps", 50)
         self._nonce_lock = threading.Lock()
         self._nonce = None
 
@@ -1308,6 +1381,10 @@ class TradeExecutor:
 
         # Optional webhook callback (set by CopyTraderBot after init)
         self.notify_callback = None
+
+        # Kill switch: stop the bot when session losses exceed threshold
+        self.kill_switch_triggered = False
+        self._session_pnl = 0.0
 
         # Cached proxy wallet address (discovered once, reused)
         self._proxy_address = None
@@ -1364,9 +1441,13 @@ class TradeExecutor:
                 raw = json.load(fh)
             positions = {}
             for tid, entry in raw.items():
+                ep = Decimal(str(entry.get("entry_price", 0)))
                 positions[tid] = {
                     "tokens": Decimal(str(entry.get("tokens", 0))),
-                    "entry_price": Decimal(str(entry.get("entry_price", 0))),
+                    "entry_price": ep,
+                    "whale_entry_price": Decimal(
+                        str(entry.get("whale_entry_price", ep))
+                    ),
                     "neg_risk": entry.get("neg_risk", False),
                     "condition_id": entry.get("condition_id"),
                     "collateral_token": entry.get("collateral_token", USDC_ADDRESS),
@@ -1375,6 +1456,7 @@ class TradeExecutor:
                     ),
                     "index_sets": entry.get("index_sets", [1, 2]),
                     "market_name": entry.get("market_name"),
+                    "outcome_side": entry.get("outcome_side"),
                 }
             self.logger.info(
                 "Loaded %d position(s) from %s", len(positions), self._positions_file,
@@ -1391,9 +1473,11 @@ class TradeExecutor:
         try:
             serialisable = {}
             for tid, pos in self._positions.items():
+                whale_ep = pos.get("whale_entry_price", pos["entry_price"])
                 serialisable[tid] = {
                     "tokens": str(pos["tokens"]),
                     "entry_price": str(pos["entry_price"]),
+                    "whale_entry_price": str(whale_ep),
                     "neg_risk": pos.get("neg_risk", False),
                     "condition_id": pos.get("condition_id"),
                     "collateral_token": pos.get("collateral_token", USDC_ADDRESS),
@@ -1402,6 +1486,7 @@ class TradeExecutor:
                     ),
                     "index_sets": pos.get("index_sets", [1, 2]),
                     "market_name": pos.get("market_name"),
+                    "outcome_side": pos.get("outcome_side"),
                 }
             pf = self._positions_file
             tmp = pf + ".tmp"
@@ -1412,31 +1497,41 @@ class TradeExecutor:
             self.logger.warning("Could not save positions: %s", exc)
 
     def backfill_market_names(self):
-        """Enrich existing positions that lack a market_name.
+        """Enrich existing positions that lack a market_name or outcome_side.
 
         Called once at startup after the CLOB client is available.
         Looks up the market question via the API for any position where
-        market_name is missing and persists the result.
+        market_name or outcome_side is missing and persists the result.
         """
         if not self.clob_client:
             return
         updated = 0
         for tid, pos in self._positions.items():
-            if pos.get("market_name"):
+            needs_name = not pos.get("market_name")
+            needs_side = not pos.get("outcome_side")
+            if not needs_name and not needs_side:
                 continue
             try:
                 market = self.clob_client.get_market_by_token(tid)
                 if market:
-                    name = market.get("question") or market.get("slug")
-                    if name:
-                        pos["market_name"] = name
-                        updated += 1
+                    if needs_name:
+                        name = market.get("question") or market.get("slug")
+                        if name:
+                            pos["market_name"] = name
+                            updated += 1
+                    if needs_side:
+                        for tok in (market.get("tokens") or []):
+                            tok_id = tok.get("token_id") or tok.get("tokenId") or ""
+                            if tok_id == tid:
+                                pos["outcome_side"] = tok.get("outcome", "").capitalize()
+                                updated += 1
+                                break
             except Exception:
                 pass  # non-critical; will retry next restart
         if updated:
             self._save_positions()
             self.logger.info(
-                "Backfilled market_name for %d position(s)", updated,
+                "Backfilled market data for %d position field(s)", updated,
             )
 
     # ------------------------------------------------------------------
@@ -1456,12 +1551,16 @@ class TradeExecutor:
             return []
 
     def _log_closed_trade(self, token_id, entry_price, exit_price,
-                          shares, reason, market=None):
+                          shares, reason, market=None,
+                          whale_entry_price=None):
         """Append a closed trade record to the persistent history file.
 
         Tracks *cost_basis* (capital deployed) and *proceeds* (capital
         returned) separately so lifetime P/L can be computed accurately
         as ``sum(proceeds) - sum(cost_basis)`` across all records.
+
+        Also tracks the whale's entry price for comparison so we can
+        compute the whale's hypothetical P/L vs our actual P/L.
 
         The *outcome* field categorises the result:
         - ``"won"``  — redeemed at $1.00 (full payout)
@@ -1472,10 +1571,17 @@ class TradeExecutor:
         entry_p = float(entry_price) if entry_price else 0.0
         exit_p = float(exit_price) if exit_price else 0.0
         num_shares = float(shares) if shares else 0.0
+        whale_p = float(whale_entry_price) if whale_entry_price else entry_p
 
         cost_basis = entry_p * num_shares
         proceeds = exit_p * num_shares
         pnl = round(proceeds - cost_basis, 6)
+
+        # Whale hypothetical P/L (same exit, but at whale's entry)
+        whale_cost_basis = whale_p * num_shares
+        whale_proceeds = exit_p * num_shares
+        whale_pnl = round(whale_proceeds - whale_cost_basis, 6)
+        slippage_cost = round(cost_basis - whale_cost_basis, 6)
 
         # Classify the outcome for reporting
         if reason == "redeemed":
@@ -1496,6 +1602,10 @@ class TradeExecutor:
             "cost_basis_usdc": round(cost_basis, 6),
             "proceeds_usdc": round(proceeds, 6),
             "pnl_usdc": pnl,
+            "whale_entry_price": whale_p,
+            "whale_cost_basis_usdc": round(whale_cost_basis, 6),
+            "whale_pnl_usdc": whale_pnl,
+            "slippage_cost_usdc": slippage_cost,
             "outcome": outcome,
             "reason": reason,
         }
@@ -1503,10 +1613,19 @@ class TradeExecutor:
         history = self._load_trade_history()
         history.append(record)
 
-        # Compute running totals
+        # Compute running totals (bot and whale)
         total_cost = sum(r.get("cost_basis_usdc", 0) for r in history)
         total_proceeds = sum(r.get("proceeds_usdc", 0) for r in history)
         total_pnl = round(total_proceeds - total_cost, 6)
+        total_whale_cost = sum(r.get("whale_cost_basis_usdc", r.get("cost_basis_usdc", 0)) for r in history)
+        total_whale_pnl = round(total_proceeds - total_whale_cost, 6)
+        total_slippage = round(total_cost - total_whale_cost, 6)
+
+        # Win/loss counts
+        wins = sum(1 for r in history if r.get("outcome") == "won")
+        losses = sum(1 for r in history if r.get("outcome") == "lost")
+        total_trades = wins + losses
+        win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
 
         try:
             tmp = self._trade_history_file + ".tmp"
@@ -1516,12 +1635,53 @@ class TradeExecutor:
         except Exception as exc:
             self.logger.warning("Could not save trade history: %s", exc)
 
+        # --- Also persist whale comparison summary ---
+        try:
+            comparison = {
+                "updated_at": datetime.now().isoformat(),
+                "total_trades": len(history),
+                "wins": wins,
+                "losses": losses,
+                "win_rate_pct": round(win_rate, 1),
+                "bot_pnl_usdc": total_pnl,
+                "bot_cost_basis_usdc": round(total_cost, 6),
+                "whale_pnl_usdc": total_whale_pnl,
+                "whale_cost_basis_usdc": round(total_whale_cost, 6),
+                "total_slippage_cost_usdc": total_slippage,
+                "capital_returned_usdc": round(total_proceeds, 6),
+            }
+            tmp_wc = WHALE_COMPARISON_FILE + ".tmp"
+            with open(tmp_wc, "w") as fh:
+                json.dump(comparison, fh, indent=2)
+            os.replace(tmp_wc, WHALE_COMPARISON_FILE)
+        except Exception as exc:
+            self.logger.debug("Could not save whale comparison: %s", exc)
+
         self.logger.info(
             "CLOSED TRADE [%s]: %s | %.4f shares @ entry $%.4f -> exit $%.4f | "
-            "P&L $%+.4f | lifetime P&L $%+.4f (deployed $%.2f, returned $%.2f)",
+            "Bot P&L $%+.4f | Whale P&L $%+.4f (slippage $%+.4f) | "
+            "W/L %d/%d (%.0f%%) | lifetime Bot $%+.4f vs Whale $%+.4f",
             outcome.upper(), record["market"], num_shares, entry_p, exit_p,
-            pnl, total_pnl, total_cost, total_proceeds,
+            pnl, whale_pnl, slippage_cost,
+            wins, losses, win_rate,
+            total_pnl, total_whale_pnl,
         )
+
+        # Kill switch: stop the bot if session losses exceed threshold
+        self._session_pnl += pnl
+        max_loss = float(self.cfg.get("max_loss_usdc", 0))
+        if max_loss > 0 and self._session_pnl <= -max_loss:
+            self.kill_switch_triggered = True
+            self.logger.critical(
+                "KILL SWITCH: session P&L $%+.2f hit max loss limit "
+                "of -$%.2f — stopping bot",
+                self._session_pnl, max_loss,
+            )
+            if self.notify_callback:
+                self.notify_callback(
+                    "KILL SWITCH: session P&L $%+.2f hit -$%.2f limit — bot stopped"
+                    % (self._session_pnl, max_loss)
+                )
 
         return record
 
@@ -1737,8 +1897,17 @@ class TradeExecutor:
     def check_exit_conditions(self):
         """Scan all open positions and sell any that hit exit thresholds.
 
-        - **Take-profit**: current price >= take_profit_price (default 1.00)
-        - **Stop-loss**:   current price <= stop_loss_pct% of entry (0 = disabled)
+        In **whale** exit_mode (default), the bot only exits when:
+        - The whale sells (copied_sell, handled elsewhere)
+        - The market resolves (redeemed)
+        - Take-profit catches an extraordinary price run (safety catch)
+
+        Stop-loss is DISABLED in whale mode to avoid selling into temporary
+        dips that the whale holds through.  Polymarket is binary — a dip
+        to $0.10 can still resolve at $1.00.
+
+        In **auto** exit_mode, the legacy behaviour is preserved: both
+        take-profit and stop-loss are active.
 
         Requires a CLOB client to fetch live prices and place sell orders.
         Returns a list of sell results (one per exited position), or an
@@ -1749,8 +1918,11 @@ class TradeExecutor:
         if not self._positions:
             return []
 
+        exit_mode = self.cfg.get("exit_mode", "whale")
+
         # Read thresholds from config (fall back to module-level defaults)
         tp_price = Decimal(str(self.cfg.get("take_profit_price", TAKE_PROFIT_PRICE)))
+        tp_pct = Decimal(str(self.cfg.get("take_profit_pct", 0)))
         sl_raw = Decimal(str(self.cfg.get("stop_loss_pct", STOP_LOSS_PCT * 100)))
         sl_pct = sl_raw / Decimal("100") if sl_raw > 0 else Decimal("0")
 
@@ -1764,13 +1936,31 @@ class TradeExecutor:
 
             current_price = self.clob_client.get_last_trade_price(token_id)
             if current_price is None:
+                self.logger.warning(
+                    "Could not fetch price for %s — skipping exit check",
+                    token_id[:16] + "...",
+                )
                 continue
             current_price_d = Decimal(str(current_price))
 
             reason = None
-            if current_price_d >= tp_price:
+            # Percentage-based take-profit (e.g. 500 = sell at +500% gain)
+            if tp_pct > 0 and entry_price > 0:
+                gain_pct = ((current_price_d - entry_price) / entry_price) * Decimal("100")
+                self.logger.debug(
+                    "Exit check %s: entry=%.4f current=%.4f gain=%.1f%% (tp_pct=%.0f%%)",
+                    token_id[:16] + "...", entry_price, current_price_d,
+                    gain_pct, tp_pct,
+                )
+                if gain_pct >= tp_pct:
+                    reason = "take-profit"
+            # Absolute price take-profit (safety catch for extraordinary runs)
+            if reason is None and current_price_d >= tp_price:
                 reason = "take-profit"
-            elif sl_pct > 0 and entry_price > 0 and current_price_d <= entry_price * sl_pct:
+            # Stop-loss: only active in "auto" mode — whale mode holds through dips
+            elif (reason is None and exit_mode != "whale"
+                  and sl_pct > 0 and entry_price > 0
+                  and current_price_d <= entry_price * sl_pct):
                 reason = "stop-loss"
 
             if reason is None:
@@ -1844,6 +2034,7 @@ class TradeExecutor:
                     token_id, entry_price, current_price_d,
                     tokens, reason,
                     market=pos.get("market_name"),
+                    whale_entry_price=pos.get("whale_entry_price"),
                 )
                 # Clear the position
                 del self._positions[token_id]
@@ -1889,6 +2080,7 @@ class TradeExecutor:
                         token_id, entry_price, current_price_d,
                         tokens, "dust",
                         market=pos.get("market_name"),
+                        whale_entry_price=pos.get("whale_entry_price"),
                     )
                     del self._positions[token_id]
                     self._save_positions()
@@ -1948,6 +2140,7 @@ class TradeExecutor:
                     token_id, pos.get("entry_price", 0), 0,
                     pos.get("tokens", 0), "stale",
                     market=pos.get("market_name"),
+                    whale_entry_price=pos.get("whale_entry_price"),
                 )
                 self._positions.pop(token_id, None)
                 self._save_positions()
@@ -1979,6 +2172,7 @@ class TradeExecutor:
                     token_id, pos.get("entry_price", 0), 0,
                     pos.get("tokens", 0), "resolution_error",
                     market=pos.get("market_name"),
+                    whale_entry_price=pos.get("whale_entry_price"),
                 )
                 self._positions.pop(token_id, None)
                 self._save_positions()
@@ -2040,6 +2234,7 @@ class TradeExecutor:
                     token_id, pos.get("entry_price", 0), exit_price,
                     pos.get("tokens", 0), "redeemed",
                     market=pos.get("market_name"),
+                    whale_entry_price=pos.get("whale_entry_price"),
                 )
                 self._positions.pop(token_id, None)
                 self._save_positions()
@@ -2063,6 +2258,7 @@ class TradeExecutor:
                         token_id, pos.get("entry_price", 0), 0,
                         pos.get("tokens", 0), "failed_redeem",
                         market=pos.get("market_name"),
+                        whale_entry_price=pos.get("whale_entry_price"),
                     )
                     self._positions.pop(token_id, None)
                 else:
@@ -2085,6 +2281,7 @@ class TradeExecutor:
                 self._log_closed_trade(
                     token_id, pos.get("entry_price", 0), 0,
                     pos.get("tokens", 0), "failed_redeem",
+                    whale_entry_price=pos.get("whale_entry_price"),
                 )
                 self._positions.pop(token_id, None)
             else:
@@ -2249,6 +2446,7 @@ class TradeExecutor:
                         self._positions[token_id] = {
                             "tokens": tokens,
                             "entry_price": entry_price,
+                            "opened_at": datetime.now().isoformat(),
                             "neg_risk": neg_risk,
                             "condition_id": condition_id,
                             "collateral_token": USDC_ADDRESS,
@@ -2326,6 +2524,7 @@ class TradeExecutor:
                             token_id, pos.get("entry_price", 0), exit_price,
                             pos.get("tokens", 0), "redeemed",
                             market=pos.get("market_name"),
+                            whale_entry_price=pos.get("whale_entry_price"),
                         )
                     else:
                         # Position wasn't tracked yet (discovered already
@@ -2736,6 +2935,7 @@ class TradeExecutor:
                         token_id, pos.get("entry_price", 0), exit_price,
                         pos.get("tokens", 0), "redeemed",
                         market=pos.get("market_name"),
+                        whale_entry_price=pos.get("whale_entry_price"),
                     )
                     del self._positions[token_id]
                     self._save_positions()
@@ -3186,7 +3386,7 @@ class TradeExecutor:
 
         self.logger.warning(
             "Could not discover proxy wallet for EOA %s. "
-            "Set PROXY_ADDRESS env var or proxy_address in config.json "
+            "Set PROXY_ADDRESS env var or proxy_address in the GUI "
             "to provide it manually.",
             self.address,
         )
@@ -3764,18 +3964,11 @@ class TradeExecutor:
             # allowance approval use the real order size (not the pre-bump
             # amount that place_order would silently inflate).
             #
-            # Use the slippage-adjusted, rounded price so the minimum here
-            # matches what place_order() will actually submit.  Previously
-            # this used the raw market price, which was too low once
-            # slippage bumped the effective price up.
+            # Use the whale's price directly — no adverse slippage applied.
             price_f = float(price) if not isinstance(price, float) else price
             if price_f > 0:
-                slippage_mult_f = float(self.slippage_bps) / 10000.0
-                if side == "BUY":
-                    effective_price = min(price_f * (1 + slippage_mult_f), 0.99)
-                else:
-                    effective_price = max(price_f * (1 - slippage_mult_f), 0.01)
-                effective_price = round(effective_price, 2)
+                effective_price = round(price_f, 2)
+                effective_price = max(min(effective_price, 0.99), 0.01)
                 min_viable_usdc = max(
                     MIN_ORDER_SIZE_TOKENS * effective_price,
                     MIN_ORDER_NOTIONAL_USDC,
@@ -3821,10 +4014,13 @@ class TradeExecutor:
                         )
                         copy_amount = held_usdc
 
+            # Log latency info if the trade was annotated by get_new_trades()
+            detection_latency = trade_info.get("_detection_latency_s")
+            latency_str = " [latency=%.1fs]" % detection_latency if detection_latency else ""
             self.logger.info(
-                "COPY TRADE: %s %.2f USDC of token %s (original: %.2f USDC, price: %s)",
+                "COPY TRADE: %s %.2f USDC of token %s (original: %.2f USDC, price: %s)%s",
                 side, copy_amount, token_id[:16] + "..." if len(token_id) > 16 else token_id,
-                original_usdc, price,
+                original_usdc, price, latency_str,
             )
 
             # --- DRY RUN: log but do not execute ---
@@ -3855,68 +4051,93 @@ class TradeExecutor:
 
             # Place order via the CLOB API (requires py-clob-client + API creds)
             if self.clob_client and self.clob_client.clob_sdk:
-                # Apply slippage to price
+                # --- Smart price selection ---
+                # The whale's trade price is STALE by the time we detect it
+                # (5-30s later).  Using whale_price + slippage guarantees we
+                # overpay on buys and undersell on sells.
+                #
+                # Instead, fetch the CURRENT orderbook and use the live
+                # best_ask (for buys) or best_bid (for sells) as our limit.
+                # This ensures we fill at the actual market price, not a
+                # worse price derived from stale data.
+                #
+                # We still apply max_price_deviation_pct as a safety cap to
+                # avoid filling when the market has moved too far from the
+                # whale's entry (suggesting the opportunity is gone).
                 slippage_mult = Decimal(str(self.slippage_bps)) / Decimal("10000")
+                whale_price = float(price)
+
+                # --- FOK at whale price (buys) / whale price - slippage (sells) ---
+                # For BUYS: use the whale's exact price as our FOK limit.
+                # If the market has moved above whale price, our FOK won't fill
+                # and we skip the trade.  Better to miss than overpay — paying
+                # more than the whale guarantees we underperform them.
+                #
+                # For SELLS (copied_sell): apply slippage tolerance since we
+                # need to exit and a small concession is acceptable.
                 if side == "BUY":
-                    adjusted_price = float(Decimal(str(price)) * (Decimal("1") + slippage_mult))
+                    adjusted_price = float(price)
                     adjusted_price = min(adjusted_price, 0.99)
                 else:
-                    adjusted_price = float(Decimal(str(price)) * (Decimal("1") - slippage_mult))
+                    adjusted_price = float(
+                        Decimal(str(price)) * (Decimal("1") - slippage_mult)
+                    )
                     adjusted_price = max(adjusted_price, 0.01)
 
-                # --- Stale price protection ---
-                # Fetch the current mid-price from the orderbook and compare
-                # to the whale's trade price.  If the market has moved more
-                # than max_price_deviation_pct, skip the trade.  When within
-                # tolerance we keep the whale's price (not mid) so our entry
-                # is as close to the whale's as possible.
+                # --- Fetch live orderbook for stale-price safety check ---
                 max_dev_pct = self.cfg.get("max_price_deviation_pct", 5)
-                if max_dev_pct > 0:
-                    try:
-                        book = self.clob_client.get_order_book(token_id)
-                        if book:
-                            bids = book.get("bids") or []
-                            asks = book.get("asks") or []
-                            best_bid = float(bids[0].get("price", 0)) if bids else 0
-                            best_ask = float(asks[0].get("price", 0)) if asks else 0
-                            if best_bid > 0 and best_ask > 0:
-                                mid_price = (best_bid + best_ask) / 2.0
-                                whale_price = float(price)
-                                if whale_price > 0:
-                                    deviation = abs(mid_price - whale_price) / whale_price * 100
-                                    if deviation > max_dev_pct:
-                                        self.logger.warning(
-                                            "STALE PRICE: whale traded at %.4f but "
-                                            "current mid=%.4f (%.1f%% deviation > %d%% "
-                                            "max) — skipping %s",
-                                            whale_price, mid_price, deviation,
-                                            max_dev_pct, token_id[:16] + "...",
-                                        )
-                                        return {
-                                            "status": "skipped_stale_price",
-                                            "side": side,
-                                            "amount_usdc": float(copy_amount),
-                                            "token_id": token_id,
-                                            "price": float(price),
-                                            "mid_price": mid_price,
-                                            "deviation_pct": round(deviation, 2),
-                                        }
-                                    # Within tolerance — keep whale's price
-                                    # (already applied via adjusted_price above)
-                                    # so our entry matches the whale as closely
-                                    # as possible.
-                                    if deviation > 1:
-                                        self.logger.info(
-                                            "Price check OK: whale=%.4f, mid=%.4f "
-                                            "(deviation=%.1f%%, within %d%% limit)",
-                                            whale_price, mid_price, deviation,
-                                            max_dev_pct,
-                                        )
-                    except Exception as book_exc:
-                        self.logger.debug(
-                            "Orderbook fetch failed (proceeding with whale price): %s",
-                            book_exc,
+                best_bid = 0
+                best_ask = 0
+                try:
+                    book = self.clob_client.get_order_book(token_id)
+                    if book:
+                        bids = book.get("bids") or []
+                        asks = book.get("asks") or []
+                        best_bid = float(bids[0].get("price", 0)) if bids else 0
+                        best_ask = float(asks[0].get("price", 0)) if asks else 0
+                except Exception as book_exc:
+                    self.logger.debug(
+                        "Orderbook fetch failed (using whale price): %s",
+                        book_exc,
+                    )
+
+                if best_bid > 0 and best_ask > 0:
+                    mid_price = (best_bid + best_ask) / 2.0
+
+                    # --- Stale price protection ---
+                    if whale_price > 0 and max_dev_pct > 0:
+                        deviation = abs(mid_price - whale_price) / whale_price * 100
+                        if deviation > max_dev_pct:
+                            self.logger.warning(
+                                "STALE PRICE: whale traded at %.4f but "
+                                "current mid=%.4f (%.1f%% deviation > %d%% "
+                                "max) — skipping %s",
+                                whale_price, mid_price, deviation,
+                                max_dev_pct, token_id[:16] + "...",
+                            )
+                            return {
+                                "status": "skipped_stale_price",
+                                "side": side,
+                                "amount_usdc": float(copy_amount),
+                                "token_id": token_id,
+                                "price": float(price),
+                                "mid_price": mid_price,
+                                "deviation_pct": round(deviation, 2),
+                            }
+
+                    # For SELLS only: use best_bid for better fill if available
+                    if side == "SELL":
+                        market_price = float(
+                            Decimal(str(best_bid)) * (Decimal("1") - slippage_mult)
                         )
+                        market_price = max(market_price, 0.01)
+                        adjusted_price = max(market_price, adjusted_price)
+
+                self.logger.info(
+                    "WHALE PRICE FOK: whale=%.4f, bid=%.4f, ask=%.4f, "
+                    "limit=%.4f (%s)",
+                    whale_price, best_bid, best_ask, adjusted_price, side,
+                )
 
                 result = self.clob_client.place_order(
                     token_id=token_id,
@@ -3927,6 +4148,12 @@ class TradeExecutor:
                 )
                 if result:
                     self.logger.info("Order submitted to CLOB: %s", result)
+
+                    # If the order was rejected, do NOT update positions
+                    order_status = result.get("status", "") if isinstance(result, dict) else ""
+                    if order_status in ("fok_rejected", "error"):
+                        return result
+
                     self.invalidate_balance_cache()
 
                     # Update position tracker — include all redemption params
@@ -3939,6 +4166,14 @@ class TradeExecutor:
                         market.get("question") or market.get("slug")
                         if market else None
                     )
+                    # Determine outcome side (Yes/No) from market tokens
+                    outcome_side = None
+                    if market:
+                        for tok in (market.get("tokens") or []):
+                            tid = tok.get("token_id") or tok.get("tokenId") or ""
+                            if tid == token_id:
+                                outcome_side = tok.get("outcome", "").capitalize()
+                                break
                     redeem_params = {
                         "neg_risk": neg_risk,
                         "condition_id": condition_id,
@@ -3946,11 +4181,12 @@ class TradeExecutor:
                         "parent_collection_id": "0x" + "00" * 32,
                         "index_sets": [1, 2],
                         "market_name": market_name,
+                        "outcome_side": outcome_side,
                     }
                     if side == "BUY":
                         pos = self._positions.get(token_id)
                         if pos:
-                            # Weighted-average entry price
+                            # Weighted-average entry price (both bot and whale)
                             old_tokens = pos["tokens"]
                             old_cost = old_tokens * pos["entry_price"]
                             new_cost = tokens * Decimal(str(adjusted_price))
@@ -3960,13 +4196,25 @@ class TradeExecutor:
                                 if total_tokens > 0
                                 else Decimal(str(adjusted_price))
                             )
+                            # Track whale's VWAP alongside ours
+                            old_whale = pos.get("whale_entry_price", pos["entry_price"])
+                            old_whale_cost = old_tokens * old_whale
+                            new_whale_cost = tokens * Decimal(str(price))
+                            whale_avg = (
+                                (old_whale_cost + new_whale_cost) / total_tokens
+                                if total_tokens > 0
+                                else Decimal(str(price))
+                            )
                             pos["tokens"] = total_tokens
                             pos["entry_price"] = avg_price
+                            pos["whale_entry_price"] = whale_avg
                             pos.update(redeem_params)
                         else:
                             self._positions[token_id] = {
                                 "tokens": tokens,
                                 "entry_price": Decimal(str(adjusted_price)),
+                                "whale_entry_price": Decimal(str(price)),
+                                "opened_at": datetime.now().isoformat(),
                                 **redeem_params,
                             }
                     elif side == "SELL":
@@ -3981,6 +4229,7 @@ class TradeExecutor:
                                     adjusted_price, sold_tokens,
                                     "copied_sell",
                                     market=pos.get("market_name"),
+                                    whale_entry_price=pos.get("whale_entry_price"),
                                 )
                                 del self._positions[token_id]
 
@@ -4030,6 +4279,8 @@ class TradeExecutor:
                         "amount_usdc": float(copy_amount),
                         "token_id": token_id,
                         "price": adjusted_price,
+                        "whale_price": float(price),
+                        "original_usdc": float(original_usdc),
                         "clob_response": result,
                     }
                 else:
@@ -4086,6 +4337,20 @@ class CopyTraderBot:
         """Send a webhook notification if configured."""
         url = self.cfg.get("webhook_url", "")
         send_webhook(url, message, logger=self.logger)
+
+    def _save_session_trades(self):
+        """Persist session trades to disk immediately (crash-safe).
+
+        Writes after every trade so data survives crashes, kills, or
+        unexpected shutdowns.  Uses atomic write (tmp + rename).
+        """
+        try:
+            tmp = SESSION_TRADES_FILE + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(self._trade_history, fh, indent=2, default=str)
+            os.replace(tmp, SESSION_TRADES_FILE)
+        except Exception as exc:
+            self.logger.debug("Could not save session trades: %s", exc)
 
     def _init_web3(self):
         """Initialize Web3 provider from config."""
@@ -4184,11 +4449,41 @@ class CopyTraderBot:
         self.running = True
         self._session_start = datetime.now()
         self._trade_history = []
+
+        # --- Display active configuration at startup ---
+        watched = self.cfg.get("watched_addresses", [])
+        self.logger.info("=" * 60)
+        self.logger.info("COPY TRADER CONFIGURATION")
+        self.logger.info("=" * 60)
+        self.logger.info("  Watched addresses:      %d", len(watched))
+        for i, addr in enumerate(watched):
+            self.logger.info("    [%d] %s", i + 1, addr)
+        self.logger.info("  Copy percentage:        %s%%",
+                         self.cfg.get("copy_percentage", 50))
+        self.logger.info("  Max trade size:         $%s",
+                         self.cfg.get("max_trade_usdc", 100))
+        self.logger.info("  Slippage tolerance:     %s bps",
+                         self.cfg.get("slippage_tolerance_bps", 0))
+        self.logger.info("  Poll interval:          %ss",
+                         self.cfg.get("poll_interval_seconds", 2))
+        self.logger.info("  Order TTL:              %ss",
+                         self.cfg.get("order_ttl_seconds", 10))
+        self.logger.info("  Max price deviation:    %s%%",
+                         self.cfg.get("max_price_deviation_pct", 2))
+        self.logger.info("  Trade max age:          %ss",
+                         self.cfg.get("trade_max_age_seconds", 30))
+        self.logger.info("  Resume threshold:       $%s",
+                         self.cfg.get("resume_threshold_usdc", 5))
+        self.logger.info("  Dry run:                %s",
+                         self.cfg.get("dry_run", False))
+        self.logger.info("  Auto redeem settled:    %s",
+                         self.cfg.get("auto_redeem_settled", True))
+        self.logger.info("=" * 60)
+
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         self.logger.info("Bot started")
-        self._notify("Bot started — monitoring %d address(es)" % len(
-            self.cfg.get("watched_addresses", [])))
+        self._notify("Bot started — monitoring %d address(es)" % len(watched))
 
     def stop(self):
         self.running = False
@@ -4247,7 +4542,7 @@ class CopyTraderBot:
                 except Exception:
                     pass
 
-        poll_interval = self.cfg.get("poll_interval_seconds", 15)
+        poll_interval = self.cfg.get("poll_interval_seconds", 5)
         self.logger.info(
             "Monitoring %d address(es), poll interval %ds",
             len(self.cfg.get("watched_addresses", [])),
@@ -4341,8 +4636,9 @@ class CopyTraderBot:
                     try:
                         self.executor.check_exit_conditions()
                     except Exception as exit_exc:
-                        self.logger.debug(
+                        self.logger.warning(
                             "Exit condition check error: %s", exit_exc,
+                            exc_info=True,
                         )
 
                 # --- Auto-redeem settled positions back to USDC ---
@@ -4463,9 +4759,22 @@ class CopyTraderBot:
                         for addr in self.cfg.get("watched_addresses", []):
                             api_trades = self.clob_client.get_new_trades(addr)
                             if api_trades:
+                                latencies = [
+                                    t.get("_detection_latency_s")
+                                    for t in api_trades
+                                    if t.get("_detection_latency_s") is not None
+                                ]
+                                latency_info = ""
+                                if latencies:
+                                    latency_info = (
+                                        " (avg latency=%.1fs, max=%.1fs)"
+                                        % (sum(latencies) / len(latencies),
+                                           max(latencies))
+                                    )
                                 self.logger.info(
-                                    "CLOB API: %d new trade(s) from %s",
+                                    "CLOB API: %d new trade(s) from %s%s",
                                     len(api_trades), addr[:10] + "...",
+                                    latency_info,
                                 )
                                 new_trades.extend(api_trades)
 
@@ -4489,12 +4798,15 @@ class CopyTraderBot:
                             if result and isinstance(result, dict):
                                 result["timestamp"] = datetime.now().isoformat()
                                 self._trade_history.append(result)
+                                # Crash-safe: persist session trades immediately
+                                self._save_session_trades()
                                 if result.get("status") == "submitted":
                                     self._notify(
-                                        "TRADE %s $%.2f @ %.4f — %s" % (
+                                        "TRADE %s $%.2f @ %.4f (whale @ %.4f) — %s" % (
                                             result.get("side", "?"),
                                             result.get("amount_usdc", 0),
                                             result.get("price", 0),
+                                            result.get("whale_price", 0),
                                             result.get("token_id", "")[:16] + "...",
                                         )
                                     )
@@ -4508,11 +4820,18 @@ class CopyTraderBot:
                 self.logger.error("Error in monitoring loop: %s", exc, exc_info=True)
                 self._notify("ERROR in monitoring loop: %s" % exc)
 
-            # Sleep with early-exit check
-            for _ in range(int(poll_interval)):
-                if not self.running:
-                    break
-                time.sleep(1)
+            # Kill switch: stop if cumulative losses exceeded threshold
+            if self.executor and self.executor.kill_switch_triggered:
+                self.logger.critical("Kill switch activated — stopping bot")
+                self.running = False
+                break
+
+            # Sleep with early-exit check (supports sub-second poll intervals)
+            sleep_remaining = float(poll_interval)
+            sleep_step = min(0.5, sleep_remaining)
+            while sleep_remaining > 0 and self.running:
+                time.sleep(sleep_step)
+                sleep_remaining -= sleep_step
 
         self._generate_stop_report()
         self.logger.info("Bot stopped")
@@ -4580,6 +4899,18 @@ class CopyTraderBot:
         total_proceeds = sum(r.get("proceeds_usdc", 0) for r in closed_trades)
         realized_pnl = round(total_proceeds - total_cost_basis, 6)
 
+        # Whale comparison
+        total_whale_cost = sum(
+            r.get("whale_cost_basis_usdc", r.get("cost_basis_usdc", 0))
+            for r in closed_trades
+        )
+        whale_realized_pnl = round(total_proceeds - total_whale_cost, 6)
+        total_slippage = round(total_cost_basis - total_whale_cost, 6)
+        wins = sum(1 for r in closed_trades if r.get("outcome") == "won")
+        losses = sum(1 for r in closed_trades if r.get("outcome") == "lost")
+        total_resolved = wins + losses
+        win_rate = (wins / total_resolved * 100) if total_resolved > 0 else 0
+
         # Unrealized value of open positions (at entry price as conservative estimate)
         open_cost = sum(
             p.get("cost_basis_usdc", 0) for p in positions.values()
@@ -4598,6 +4929,11 @@ class CopyTraderBot:
             "lifetime_capital_deployed": round(total_cost_basis, 6),
             "lifetime_capital_returned": round(total_proceeds, 6),
             "lifetime_realized_pnl": realized_pnl,
+            "whale_realized_pnl": whale_realized_pnl,
+            "total_slippage_cost": total_slippage,
+            "wins": wins,
+            "losses": losses,
+            "win_rate_pct": round(win_rate, 1),
             "open_positions_cost_basis": round(open_cost, 6),
             "closed_trade_count": len(closed_trades),
             "trade_history": self._trade_history,
@@ -4633,6 +4969,13 @@ class CopyTraderBot:
             buy_total - sell_total, len(positions),
             realized_pnl, total_cost_basis, total_proceeds,
         )
+        if total_resolved > 0:
+            self.logger.info(
+                "BOT vs WHALE: Bot P&L $%+.2f | Whale P&L $%+.2f | "
+                "Slippage cost $%+.2f | W/L %d/%d (%.0f%%)",
+                realized_pnl, whale_realized_pnl, total_slippage,
+                wins, losses, win_rate,
+            )
         if positions:
             self.logger.info(
                 "Open positions with redemption params saved to %s",
@@ -4673,7 +5016,9 @@ class CopyTraderGUI:
     def __init__(self):
         _import_tkinter()
 
-        self.cfg = load_config()
+        # Start from built-in defaults — all settings come from the GUI.
+        self.cfg = dict(DEFAULT_CONFIG)
+
         self.bot = None
         self.logger = None
 
@@ -4696,22 +5041,27 @@ class CopyTraderGUI:
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
-        # Tab 1: Configuration
+        # Tab 1: Dashboard (live positions & balance)
+        dash_frame = ttk.Frame(notebook, padding=10)
+        notebook.add(dash_frame, text="Dashboard")
+        self._build_dashboard_tab(dash_frame)
+
+        # Tab 2: Configuration
         config_frame = ttk.Frame(notebook, padding=10)
         notebook.add(config_frame, text="Configuration")
         self._build_config_tab(config_frame)
 
-        # Tab 2: Watched Addresses
+        # Tab 3: Watched Addresses
         addr_frame = ttk.Frame(notebook, padding=10)
         notebook.add(addr_frame, text="Watched Addresses")
         self._build_address_tab(addr_frame)
 
-        # Tab 3: Trade History
+        # Tab 4: Trade History
         history_frame = ttk.Frame(notebook, padding=10)
         notebook.add(history_frame, text="Trade History")
         self._build_history_tab(history_frame)
 
-        # Tab 4: Log / Status
+        # Tab 5: Log / Status
         log_frame = ttk.Frame(notebook, padding=10)
         notebook.add(log_frame, text="Log")
         self._build_log_tab(log_frame)
@@ -4725,10 +5075,295 @@ class CopyTraderGUI:
             ctrl, text="Stop Bot", command=self._stop_bot, state=tk.DISABLED
         )
         self.stop_btn.pack(side=tk.LEFT, padx=5)
-        self.save_btn = ttk.Button(ctrl, text="Save Config", command=self._save_config)
-        self.save_btn.pack(side=tk.RIGHT, padx=5)
         self.status_var = tk.StringVar(value="Status: Idle")
         ttk.Label(ctrl, textvariable=self.status_var).pack(side=tk.RIGHT, padx=10)
+
+    # ---- Dashboard tab ----
+
+    def _build_dashboard_tab(self, parent):
+        # Top info bar: balances & summary
+        info_frame = ttk.LabelFrame(parent, text="Account", padding=8)
+        info_frame.pack(fill=tk.X, pady=(0, 6))
+
+        self.dash_usdc_var = tk.StringVar(value="USDC Balance: --")
+        self.dash_matic_var = tk.StringVar(value="MATIC Balance: --")
+        self.dash_total_pnl_var = tk.StringVar(value="Floating P/L: --")
+        self.dash_positions_var = tk.StringVar(value="Open Positions: 0")
+
+        row_f = ttk.Frame(info_frame)
+        row_f.pack(fill=tk.X)
+        ttk.Label(row_f, textvariable=self.dash_usdc_var, font=("Courier", 11, "bold")).pack(side=tk.LEFT, padx=(0, 20))
+        ttk.Label(row_f, textvariable=self.dash_matic_var, font=("Courier", 11)).pack(side=tk.LEFT, padx=(0, 20))
+        ttk.Label(row_f, textvariable=self.dash_positions_var, font=("Courier", 11)).pack(side=tk.LEFT, padx=(0, 20))
+        ttk.Label(row_f, textvariable=self.dash_total_pnl_var, font=("Courier", 11, "bold")).pack(side=tk.LEFT)
+
+        # Whale comparison bar
+        whale_frame = ttk.LabelFrame(parent, text="Bot vs Whale Comparison", padding=8)
+        whale_frame.pack(fill=tk.X, pady=(0, 6))
+
+        self.dash_whale_bot_pnl_var = tk.StringVar(value="Bot P/L: --")
+        self.dash_whale_whale_pnl_var = tk.StringVar(value="Whale P/L: --")
+        self.dash_whale_slippage_var = tk.StringVar(value="Slippage Cost: --")
+        self.dash_whale_winrate_var = tk.StringVar(value="W/L: --")
+
+        whale_row = ttk.Frame(whale_frame)
+        whale_row.pack(fill=tk.X)
+        ttk.Label(whale_row, textvariable=self.dash_whale_bot_pnl_var, font=("Courier", 10, "bold")).pack(side=tk.LEFT, padx=(0, 20))
+        ttk.Label(whale_row, textvariable=self.dash_whale_whale_pnl_var, font=("Courier", 10, "bold")).pack(side=tk.LEFT, padx=(0, 20))
+        ttk.Label(whale_row, textvariable=self.dash_whale_slippage_var, font=("Courier", 10)).pack(side=tk.LEFT, padx=(0, 20))
+        ttk.Label(whale_row, textvariable=self.dash_whale_winrate_var, font=("Courier", 10)).pack(side=tk.LEFT)
+
+        # Positions treeview
+        columns = ("direction", "market", "shares", "avg_price", "cur_price",
+                    "cost_basis", "cur_value", "float_pnl", "pnl_pct", "time_held")
+        col_headings = {
+            "direction": "",
+            "market": "Market",
+            "shares": "Shares",
+            "avg_price": "Avg Price",
+            "cur_price": "Cur Price",
+            "cost_basis": "Cost Basis",
+            "cur_value": "Cur Value",
+            "float_pnl": "Float P/L",
+            "pnl_pct": "P/L %",
+            "time_held": "Time Held",
+        }
+        col_widths = {
+            "direction": 30, "market": 210, "shares": 75, "avg_price": 75,
+            "cur_price": 75, "cost_basis": 85, "cur_value": 85,
+            "float_pnl": 85, "pnl_pct": 70, "time_held": 90,
+        }
+
+        tree_frame = ttk.Frame(parent)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
+        self.dash_tree = ttk.Treeview(
+            tree_frame, columns=columns, show="headings",
+            yscrollcommand=scrollbar.set, height=18,
+        )
+        scrollbar.config(command=self.dash_tree.yview)
+
+        for col in columns:
+            self.dash_tree.heading(col, text=col_headings[col])
+            anchor = tk.CENTER if col == "direction" else (tk.W if col == "market" else tk.E)
+            self.dash_tree.column(col, width=col_widths.get(col, 80), anchor=anchor)
+
+        self.dash_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Summary row
+        self.dash_summary_var = tk.StringVar(value="")
+        ttk.Label(parent, textvariable=self.dash_summary_var, font=("Courier", 10)).pack(
+            anchor=tk.W, pady=(5, 0),
+        )
+
+        # Buttons
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(fill=tk.X, pady=3)
+        ttk.Button(btn_frame, text="Refresh Now", command=self._refresh_dashboard).pack(side=tk.LEFT)
+
+        self._dash_refresh_id = None  # tkinter .after() handle
+        self._dash_price_cache = {}   # token_id -> (price, timestamp)
+
+    def _start_dashboard_refresh(self):
+        """Begin periodic dashboard updates (every 10 seconds)."""
+        self._refresh_dashboard()
+
+    def _stop_dashboard_refresh(self):
+        """Cancel the periodic dashboard refresh."""
+        if self._dash_refresh_id is not None:
+            self.root.after_cancel(self._dash_refresh_id)
+            self._dash_refresh_id = None
+
+    def _refresh_dashboard(self):
+        """Pull live data from the bot and update the dashboard table."""
+        # Schedule next refresh (10 seconds)
+        if self.bot and self.bot.running:
+            self._dash_refresh_id = self.root.after(10_000, self._refresh_dashboard)
+        else:
+            self._dash_refresh_id = None
+
+        # Clear existing rows
+        for row in self.dash_tree.get_children():
+            self.dash_tree.delete(row)
+
+        # No bot running — show idle state
+        if not self.bot or not self.bot.running or not getattr(self.bot, "executor", None):
+            self.dash_usdc_var.set("USDC Balance: --")
+            self.dash_matic_var.set("MATIC Balance: --")
+            self.dash_total_pnl_var.set("Floating P/L: --")
+            self.dash_positions_var.set("Open Positions: 0")
+            self.dash_summary_var.set("Bot not running")
+            self.dash_whale_bot_pnl_var.set("Bot P/L: --")
+            self.dash_whale_whale_pnl_var.set("Whale P/L: --")
+            self.dash_whale_slippage_var.set("Slippage Cost: --")
+            self.dash_whale_winrate_var.set("W/L: --")
+            return
+
+        executor = self.bot.executor
+
+        # Fetch balances (cached, thread-safe)
+        try:
+            usdc_bal = executor.get_usdc_balance(max_age_seconds=15)
+            self.dash_usdc_var.set(f"USDC Balance: ${usdc_bal:,.2f}")
+        except Exception:
+            self.dash_usdc_var.set("USDC Balance: error")
+
+        try:
+            matic_bal = executor.get_matic_balance()
+            self.dash_matic_var.set(f"MATIC Balance: {matic_bal:,.4f}")
+        except Exception:
+            self.dash_matic_var.set("MATIC Balance: error")
+
+        # Build positions table
+        positions = dict(executor._positions)  # snapshot
+        self.dash_positions_var.set(f"Open Positions: {len(positions)}")
+
+        total_cost = Decimal("0")
+        total_value = Decimal("0")
+        now = datetime.now()
+
+        for token_id, pos in positions.items():
+            tokens = pos.get("tokens", Decimal("0"))
+            entry_price = pos.get("entry_price", Decimal("0"))
+            market_name = pos.get("market_name") or (token_id[:20] + "...")
+
+            if tokens <= 0:
+                continue
+
+            cost_basis = tokens * entry_price
+            total_cost += cost_basis
+
+            # Fetch current price (use CLOB client if available)
+            cur_price = self._dash_get_price(token_id)
+            if cur_price is not None:
+                cur_price_d = Decimal(str(cur_price))
+                cur_value = tokens * cur_price_d
+                total_value += cur_value
+                float_pnl = cur_value - cost_basis
+                pnl_pct = ((cur_price_d - entry_price) / entry_price * 100) if entry_price > 0 else Decimal("0")
+                cur_price_str = f"${cur_price_d:.4f}"
+                cur_value_str = f"${cur_value:.2f}"
+                float_pnl_str = f"{'+'if float_pnl >= 0 else ''}${float_pnl:.2f}"
+                pnl_pct_str = f"{'+'if pnl_pct >= 0 else ''}{pnl_pct:.1f}%"
+            else:
+                cur_value = cost_basis  # fallback estimate
+                total_value += cur_value
+                cur_price_str = "--"
+                cur_value_str = "--"
+                float_pnl_str = "--"
+                pnl_pct_str = "--"
+
+            # Time held
+            opened_at = pos.get("opened_at")
+            if opened_at:
+                try:
+                    opened_dt = datetime.fromisoformat(opened_at)
+                    delta = now - opened_dt
+                    hours, remainder = divmod(int(delta.total_seconds()), 3600)
+                    minutes = remainder // 60
+                    if hours >= 24:
+                        days = hours // 24
+                        time_held = f"{days}d {hours % 24}h"
+                    else:
+                        time_held = f"{hours}h {minutes}m"
+                except Exception:
+                    time_held = "--"
+            else:
+                time_held = "--"
+
+            # Direction indicator: UP = bought Yes, DOWN = bought No
+            outcome_side = pos.get("outcome_side", "")
+            if outcome_side == "Yes":
+                direction = "UP"
+            elif outcome_side == "No":
+                direction = "DOWN"
+            else:
+                direction = "--"
+
+            self.dash_tree.insert("", tk.END, values=(
+                direction,
+                market_name[:45],
+                f"{tokens:.2f}",
+                f"${entry_price:.4f}",
+                cur_price_str,
+                f"${cost_basis:.2f}",
+                cur_value_str,
+                float_pnl_str,
+                pnl_pct_str,
+                time_held,
+            ))
+
+        # Totals
+        total_float_pnl = total_value - total_cost
+        self.dash_total_pnl_var.set(
+            f"Floating P/L: {'+'if total_float_pnl >= 0 else ''}${total_float_pnl:.2f}"
+        )
+        self.dash_summary_var.set(
+            f"Total Cost Basis: ${total_cost:.2f}  |  "
+            f"Total Current Value: ${total_value:.2f}  |  "
+            f"Net: {'+'if total_float_pnl >= 0 else ''}${total_float_pnl:.2f}"
+        )
+
+        # Whale comparison panel (read from whale_comparison.json)
+        self._refresh_whale_comparison()
+
+    def _refresh_whale_comparison(self):
+        """Load whale_comparison.json and update the comparison labels."""
+        try:
+            with open(WHALE_COMPARISON_FILE, "r") as fh:
+                wc = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.dash_whale_bot_pnl_var.set("Bot P/L: $0.00 (no closed trades)")
+            self.dash_whale_whale_pnl_var.set("Whale P/L: $0.00")
+            self.dash_whale_slippage_var.set("Slippage Cost: $0.00")
+            self.dash_whale_winrate_var.set("W/L: 0/0 (0%)")
+            return
+
+        bot_pnl = wc.get("bot_pnl_usdc", 0)
+        whale_pnl = wc.get("whale_pnl_usdc", 0)
+        slippage = wc.get("total_slippage_cost_usdc", 0)
+        wins = wc.get("wins", 0)
+        losses = wc.get("losses", 0)
+        win_rate = wc.get("win_rate_pct", 0)
+        total_trades = wc.get("total_trades", 0)
+
+        # Bot P/L with direction
+        bot_dir = "UP" if bot_pnl > 0 else ("DOWN" if bot_pnl < 0 else "--")
+        self.dash_whale_bot_pnl_var.set(
+            f"Bot P/L: {bot_dir} ${bot_pnl:+,.2f} ({total_trades} trades)"
+        )
+
+        # Whale P/L with direction
+        whale_dir = "UP" if whale_pnl > 0 else ("DOWN" if whale_pnl < 0 else "--")
+        self.dash_whale_whale_pnl_var.set(
+            f"Whale P/L: {whale_dir} ${whale_pnl:+,.2f}"
+        )
+
+        self.dash_whale_slippage_var.set(f"Slippage Cost: ${slippage:+,.2f}")
+        self.dash_whale_winrate_var.set(
+            f"W/L: {wins}/{losses} ({win_rate:.0f}%)"
+        )
+
+    def _dash_get_price(self, token_id):
+        """Get current price for a token, with 15-second caching."""
+        now = datetime.now()
+        cached = self._dash_price_cache.get(token_id)
+        if cached:
+            price, ts = cached
+            if (now - ts).total_seconds() < 15:
+                return price
+
+        if not self.bot or not self.bot.clob_client:
+            return None
+        try:
+            price = self.bot.clob_client.get_last_trade_price(token_id)
+            if price is not None:
+                self._dash_price_cache[token_id] = (price, now)
+            return price
+        except Exception:
+            return cached[0] if cached else None
 
     def _build_config_tab(self, parent):
         # RPC URL
@@ -4806,6 +5441,15 @@ class CopyTraderGUI:
         self.take_profit_entry.pack(side=tk.LEFT)
         ttk.Label(tp_frame, text="(sell when price >= this, e.g. 0.90)").pack(side=tk.LEFT, padx=5)
 
+        # Take-profit percentage gain
+        row += 1
+        ttk.Label(parent, text="Take-Profit Gain (%):").grid(row=row, column=0, sticky=tk.W, pady=3)
+        tp_pct_frame = ttk.Frame(parent)
+        tp_pct_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
+        self.take_profit_pct_entry = ttk.Entry(tp_pct_frame, width=10)
+        self.take_profit_pct_entry.pack(side=tk.LEFT)
+        ttk.Label(tp_pct_frame, text="(sell at +N% gain from entry, 0=off)").pack(side=tk.LEFT, padx=5)
+
         # Stop-loss percentage
         row += 1
         ttk.Label(parent, text="Stop-Loss (%):").grid(row=row, column=0, sticky=tk.W, pady=3)
@@ -4814,6 +5458,15 @@ class CopyTraderGUI:
         self.stop_loss_entry = ttk.Entry(sl_frame, width=10)
         self.stop_loss_entry.pack(side=tk.LEFT)
         ttk.Label(sl_frame, text="(sell when price drops to this % of entry)").pack(side=tk.LEFT, padx=5)
+
+        # Kill switch — max loss
+        row += 1
+        ttk.Label(parent, text="Max Loss Kill Switch (USDC):").grid(row=row, column=0, sticky=tk.W, pady=3)
+        kill_frame = ttk.Frame(parent)
+        kill_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
+        self.max_loss_entry = ttk.Entry(kill_frame, width=10)
+        self.max_loss_entry.pack(side=tk.LEFT)
+        ttk.Label(kill_frame, text="(stop bot after losing this much, 0=off)").pack(side=tk.LEFT, padx=5)
 
         # Poll interval
         row += 1
@@ -5072,11 +5725,13 @@ class CopyTraderGUI:
         self.ws_rpc_entry.insert(0, self.cfg.get("ws_rpc_url", ""))
         self.copy_pct_var.set(self.cfg.get("copy_percentage", 50))
         self.max_trade_entry.insert(0, str(self.cfg.get("max_trade_usdc", 100)))
-        self.slippage_entry.insert(0, str(self.cfg.get("slippage_tolerance_bps", 100)))
+        self.slippage_entry.insert(0, str(self.cfg.get("slippage_tolerance_bps", 50)))
         self.resume_threshold_entry.insert(0, str(self.cfg.get("resume_threshold_usdc", 5)))
         self.take_profit_entry.insert(0, str(self.cfg.get("take_profit_price", 0.99)))
+        self.take_profit_pct_entry.insert(0, str(self.cfg.get("take_profit_pct", 0)))
         self.stop_loss_entry.insert(0, str(self.cfg.get("stop_loss_pct", 50)))
-        self.poll_entry.insert(0, str(self.cfg.get("poll_interval_seconds", 15)))
+        self.max_loss_entry.insert(0, str(self.cfg.get("max_loss_usdc", 0)))
+        self.poll_entry.insert(0, str(self.cfg.get("poll_interval_seconds", 5)))
         self.exit_check_entry.insert(0, str(self.cfg.get("exit_check_seconds", 5)))
         self.use_clob_var.set(self.cfg.get("use_clob_api", True))
         self.dry_run_var.set(self.cfg.get("dry_run", False))
@@ -5121,9 +5776,21 @@ class CopyTraderGUI:
         except ValueError:
             pass
         try:
+            val = float(self.take_profit_pct_entry.get().strip())
+            if val >= 0:
+                self.cfg["take_profit_pct"] = val
+        except ValueError:
+            pass
+        try:
             val = float(self.stop_loss_entry.get().strip())
             if 0 < val <= 100:
                 self.cfg["stop_loss_pct"] = val
+        except ValueError:
+            pass
+        try:
+            val = float(self.max_loss_entry.get().strip())
+            if val >= 0:
+                self.cfg["max_loss_usdc"] = val
         except ValueError:
             pass
         try:
@@ -5202,16 +5869,17 @@ class CopyTraderGUI:
         self.log_area.delete("1.0", tk.END)
         self.log_area.configure(state="disabled")
 
-    def _save_config(self):
+    def _start_bot(self):
+        # Pull the latest values from the GUI fields into self.cfg.
+        # No config file write is needed — the bot runs from memory.
         self._read_fields_to_config()
+
+        # Persist the private key to its own file (needed by the bot at
+        # runtime).
         pk = self.pk_entry.get().strip()
         if pk:
             save_private_key(pk, self.cfg)
-        save_config(self.cfg)
-        self.logger.info("Configuration saved")
 
-    def _start_bot(self):
-        self._save_config()
         if not self.cfg.get("watched_addresses"):
             messagebox.showwarning("No Addresses", "Add at least one trader address to watch.")
             return
@@ -5227,8 +5895,10 @@ class CopyTraderGUI:
         self.start_btn.configure(state=tk.DISABLED)
         self.stop_btn.configure(state=tk.NORMAL)
         self.status_var.set("Status: Running")
+        self._start_dashboard_refresh()
 
     def _stop_bot(self):
+        self._stop_dashboard_refresh()
         if self.bot:
             self.bot.stop()
         self.start_btn.configure(state=tk.NORMAL)
@@ -5240,6 +5910,7 @@ class CopyTraderGUI:
         self.root.mainloop()
 
     def _on_close(self):
+        self._stop_dashboard_refresh()
         if self.bot and self.bot.running:
             self.bot.stop()
         self.root.destroy()
@@ -5291,11 +5962,16 @@ class HealthCheckServer:
 # ---------------------------------------------------------------------------
 
 def run_headless():
-    """Run the bot in headless mode using config.json + env vars."""
-    logger = setup_logging()
-    cfg = load_config()
+    """Run the bot in headless mode using defaults + env vars.
 
-    # Allow env-var overrides so secrets stay out of config.json on the server
+    All settings come from environment variables or built-in defaults.
+    """
+    logger = setup_logging()
+
+    # Start from built-in defaults.
+    cfg = dict(DEFAULT_CONFIG)
+
+    # Allow env-var overrides for headless operation
     if os.environ.get("RPC_URL"):
         cfg["rpc_url"] = os.environ["RPC_URL"]
     if os.environ.get("WS_RPC_URL"):
@@ -5322,8 +5998,12 @@ def run_headless():
         cfg["clob_api_passphrase"] = os.environ["CLOB_API_PASSPHRASE"]
     if os.environ.get("TAKE_PROFIT_PRICE"):
         cfg["take_profit_price"] = float(os.environ["TAKE_PROFIT_PRICE"])
+    if os.environ.get("TAKE_PROFIT_PCT"):
+        cfg["take_profit_pct"] = float(os.environ["TAKE_PROFIT_PCT"])
     if os.environ.get("STOP_LOSS_PCT"):
         cfg["stop_loss_pct"] = float(os.environ["STOP_LOSS_PCT"])
+    if os.environ.get("MAX_LOSS_USDC"):
+        cfg["max_loss_usdc"] = float(os.environ["MAX_LOSS_USDC"])
     if os.environ.get("EXIT_CHECK_SECONDS"):
         cfg["exit_check_seconds"] = int(os.environ["EXIT_CHECK_SECONDS"])
     if os.environ.get("AUTO_REDEEM_SETTLED"):
@@ -5336,7 +6016,7 @@ def run_headless():
         cfg["proxy_address"] = os.environ["PROXY_ADDRESS"].strip()
 
     if not cfg.get("watched_addresses"):
-        logger.error("No watched addresses configured. Set WATCHED_ADDRESSES env var or edit config.json.")
+        logger.error("No watched addresses configured. Set the WATCHED_ADDRESSES env var (comma-separated).")
         sys.exit(1)
 
     logger.info("=== Polymarket Copy Trader — Headless Mode ===")
@@ -5345,8 +6025,9 @@ def run_headless():
                 cfg.get("copy_percentage"), cfg.get("max_trade_usdc"),
                 cfg.get("resume_threshold_usdc", 5), cfg.get("dry_run", False),
                 cfg.get("auto_redeem_settled", True))
-    logger.info("Take-profit: %s | Stop-loss: %s%%",
-                cfg.get("take_profit_price", 0.99), cfg.get("stop_loss_pct", 50))
+    logger.info("Take-profit price: %s | Take-profit gain: %s%% | Stop-loss: %s%%",
+                cfg.get("take_profit_price", 0.99), cfg.get("take_profit_pct", 0),
+                cfg.get("stop_loss_pct", 50))
     logger.info("Proxy redeem: %s | Proxy withdraw: %s",
                 cfg.get("proxy_redeem", True), cfg.get("proxy_withdraw", True))
 
@@ -5415,26 +6096,8 @@ POLYMARKET COPY TRADER BOT — USAGE INSTRUCTIONS
 
 2. CONFIGURATION
    -------------
-   On first run the bot creates a config.json with default values.
-   You can also edit it manually:
-
-   {
-     "rpc_url": "https://polygon-rpc.com",
-     "ws_rpc_url": "wss://polygon-bor-rpc.publicnode.com",
-     "private_key_file": ".private_key",
-     "watched_addresses": [
-       "0xABC...123"
-     ],
-     "copy_percentage": 50,
-     "max_trade_usdc": 100.0,
-     "slippage_tolerance_bps": 100,
-     "gas_multiplier": 1.2,
-     "poll_interval_seconds": 15,
-     "use_clob_api": true,
-     "clob_api_key": "",
-     "clob_api_secret": "",
-     "clob_api_passphrase": ""
-   }
+   All settings are entered through the GUI. In headless mode, use
+   environment variables (see section 5).
 
    Recommended Polygon RPC providers:
    - Alchemy:  https://alchemy.com  (free tier available)
@@ -5452,7 +6115,7 @@ POLYMARKET COPY TRADER BOT — USAGE INSTRUCTIONS
    Option A – Automatic (recommended):
      Enter your private key in the GUI, then click
      "Derive Credentials from Private Key". The API key, secret, and
-     passphrase will be generated and saved to config.json.
+     passphrase will be generated and stored in memory.
 
    Option B – Automatic on first start:
      If no credentials are saved but a private key is present, the bot
@@ -5464,7 +6127,7 @@ POLYMARKET COPY TRADER BOT — USAGE INSTRUCTIONS
        client = ClobClient("https://clob.polymarket.com", 137, key="0x...")
        creds = client.create_or_derive_api_creds()
        print(creds)
-     Then paste apiKey, secret, passphrase into the GUI or config.json.
+     Then paste apiKey, secret, passphrase into the GUI.
 
    IMPORTANT: Each wallet can only have ONE active API key at a time.
    Calling create_or_derive_api_creds() is safe to repeat — it returns
@@ -5472,14 +6135,13 @@ POLYMARKET COPY TRADER BOT — USAGE INSTRUCTIONS
 
 4. PRIVATE KEY SETUP
    -----------------
-   Enter your private key in the GUI or save it to the file specified
-   by "private_key_file" in config.json (default: .private_key).
+   Enter your private key in the GUI. It will be saved to .private_key.
 
    The file is created with 0600 permissions (owner-only read/write).
 
    ⚠  SECURITY WARNINGS:
    • NEVER share your private key with anyone.
-   • NEVER commit .private_key or config.json with keys to version control.
+   • NEVER commit .private_key to version control.
    • Consider using a dedicated hot wallet with limited funds.
    • This bot has FULL control over the wallet whose key you provide.
    • Run on a secure, trusted machine only.
