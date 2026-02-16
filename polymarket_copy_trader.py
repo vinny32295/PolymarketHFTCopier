@@ -74,6 +74,90 @@ except ImportError:
     _ws_lib = None
     HAS_WS_CLIENT = False
 
+
+# ---------------------------------------------------------------------------
+# _SyncWebSocketProvider – synchronous WebSocket JSON-RPC for web3.py 7.x
+# ---------------------------------------------------------------------------
+# web3.py 7.x removed synchronous WebSocket support; the built-in
+# WebSocketProvider only works with AsyncWeb3.  This thin provider uses the
+# ``websocket-client`` library to keep a persistent WebSocket connection open
+# and exposes the synchronous ``make_request`` / ``is_connected`` interface
+# that the regular (sync) ``Web3`` class requires.  All RPC traffic goes over
+# the WebSocket instead of HTTP, giving lower latency for high-frequency
+# polling and transaction submission.
+# ---------------------------------------------------------------------------
+
+_SyncWebSocketProvider = None  # populated below if deps are available
+
+if _ws_lib is not None and Web3 is not None:
+    try:
+        from web3.providers.base import BaseProvider as _WsBaseProvider
+
+        class _SyncWebSocketProvider(_WsBaseProvider):  # type: ignore[no-redef]
+            """Synchronous WebSocket JSON-RPC provider (websocket-client)."""
+
+            def __init__(self, ws_url, timeout=30):
+                super().__init__()
+                self._ws_url = ws_url
+                self._timeout = timeout
+                self._ws = None
+                self._lock = threading.Lock()
+                self._rid = 0
+                self._connect()
+
+            # -- connection management ----------------------------------
+
+            def _connect(self):
+                if self._ws is not None:
+                    try:
+                        self._ws.close()
+                    except Exception:
+                        pass
+                ws = _ws_lib.WebSocket()
+                ws.settimeout(self._timeout)
+                ws.connect(self._ws_url)
+                self._ws = ws
+
+            # -- BaseProvider interface ---------------------------------
+
+            def make_request(self, method, params):
+                with self._lock:
+                    self._rid += 1
+                    request = {
+                        "jsonrpc": "2.0",
+                        "method": str(method),
+                        "params": params if params is not None else [],
+                        "id": self._rid,
+                    }
+                    last_exc = None
+                    for attempt in range(3):
+                        try:
+                            self._ws.send(json.dumps(request))
+                            return json.loads(self._ws.recv())
+                        except (
+                            _ws_lib.WebSocketConnectionClosedException,
+                            ConnectionError,
+                            BrokenPipeError,
+                            OSError,
+                        ) as exc:
+                            last_exc = exc
+                            if attempt < 2:
+                                try:
+                                    self._connect()
+                                except Exception:
+                                    pass
+                    raise last_exc  # type: ignore[misc]
+
+            def is_connected(self, show_traceback=False):
+                try:
+                    return self._ws is not None and self._ws.connected
+                except Exception:
+                    return False
+
+    except ImportError:
+        pass  # web3 installed without expected base class – leave as None
+
+
 # ---------------------------------------------------------------------------
 # Constants – Polymarket / Polygon addresses and ABIs
 # ---------------------------------------------------------------------------
@@ -4670,19 +4754,21 @@ class CopyTraderBot:
         ws_url = self.cfg.get("ws_rpc_url", "")
 
         if ws_url:
-            try:
-                from web3 import Web3 as W3
-                # web3.py 6.x+: WebsocketProvider was removed; try WebSocketProvider
-                _WsProvider = getattr(W3, "WebSocketProvider", None) or getattr(W3, "WebsocketProvider", None)
-                if _WsProvider is None:
-                    from web3.providers import WebSocketProvider as _WsProvider
-                self.w3 = W3(_WsProvider(ws_url))
-                self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
-                if self.w3.is_connected():
-                    self.logger.info("Connected via WebSocket: %s", ws_url[:40] + "...")
-                    return True
-            except Exception as exc:
-                self.logger.warning("WebSocket connection failed: %s", exc)
+            if _SyncWebSocketProvider is None:
+                self.logger.warning(
+                    "ws_rpc_url configured but websocket-client or web3 base "
+                    "provider not available — will try HTTP RPC instead"
+                )
+            else:
+                try:
+                    provider = _SyncWebSocketProvider(ws_url)
+                    self.w3 = Web3(provider)
+                    self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+                    if self.w3.is_connected():
+                        self.logger.info("Connected via WebSocket: %s", ws_url[:40] + "...")
+                        return True
+                except Exception as exc:
+                    self.logger.warning("WebSocket connection failed: %s", exc)
 
         if rpc_url:
             try:
