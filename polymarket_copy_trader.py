@@ -1455,6 +1455,7 @@ class TradeExecutor:
                     ),
                     "index_sets": entry.get("index_sets", [1, 2]),
                     "market_name": entry.get("market_name"),
+                    "outcome_side": entry.get("outcome_side"),
                 }
             self.logger.info(
                 "Loaded %d position(s) from %s", len(positions), self._positions_file,
@@ -1484,6 +1485,7 @@ class TradeExecutor:
                     ),
                     "index_sets": pos.get("index_sets", [1, 2]),
                     "market_name": pos.get("market_name"),
+                    "outcome_side": pos.get("outcome_side"),
                 }
             pf = self._positions_file
             tmp = pf + ".tmp"
@@ -1494,31 +1496,41 @@ class TradeExecutor:
             self.logger.warning("Could not save positions: %s", exc)
 
     def backfill_market_names(self):
-        """Enrich existing positions that lack a market_name.
+        """Enrich existing positions that lack a market_name or outcome_side.
 
         Called once at startup after the CLOB client is available.
         Looks up the market question via the API for any position where
-        market_name is missing and persists the result.
+        market_name or outcome_side is missing and persists the result.
         """
         if not self.clob_client:
             return
         updated = 0
         for tid, pos in self._positions.items():
-            if pos.get("market_name"):
+            needs_name = not pos.get("market_name")
+            needs_side = not pos.get("outcome_side")
+            if not needs_name and not needs_side:
                 continue
             try:
                 market = self.clob_client.get_market_by_token(tid)
                 if market:
-                    name = market.get("question") or market.get("slug")
-                    if name:
-                        pos["market_name"] = name
-                        updated += 1
+                    if needs_name:
+                        name = market.get("question") or market.get("slug")
+                        if name:
+                            pos["market_name"] = name
+                            updated += 1
+                    if needs_side:
+                        for tok in (market.get("tokens") or []):
+                            tok_id = tok.get("token_id") or tok.get("tokenId") or ""
+                            if tok_id == tid:
+                                pos["outcome_side"] = tok.get("outcome", "").capitalize()
+                                updated += 1
+                                break
             except Exception:
                 pass  # non-critical; will retry next restart
         if updated:
             self._save_positions()
             self.logger.info(
-                "Backfilled market_name for %d position(s)", updated,
+                "Backfilled market data for %d position field(s)", updated,
             )
 
     # ------------------------------------------------------------------
@@ -4163,6 +4175,14 @@ class TradeExecutor:
                         market.get("question") or market.get("slug")
                         if market else None
                     )
+                    # Determine outcome side (Yes/No) from market tokens
+                    outcome_side = None
+                    if market:
+                        for tok in (market.get("tokens") or []):
+                            tid = tok.get("token_id") or tok.get("tokenId") or ""
+                            if tid == token_id:
+                                outcome_side = tok.get("outcome", "").capitalize()
+                                break
                     redeem_params = {
                         "neg_risk": neg_risk,
                         "condition_id": condition_id,
@@ -4170,6 +4190,7 @@ class TradeExecutor:
                         "parent_collection_id": "0x" + "00" * 32,
                         "index_sets": [1, 2],
                         "market_name": market_name,
+                        "outcome_side": outcome_side,
                     }
                     if side == "BUY":
                         pos = self._positions.get(token_id)
@@ -5261,14 +5282,12 @@ class CopyTraderGUI:
             else:
                 time_held = "--"
 
-            # Direction indicator: up/down/flat
-            if cur_price is not None:
-                if cur_price_d > entry_price:
-                    direction = "UP"
-                elif cur_price_d < entry_price:
-                    direction = "DOWN"
-                else:
-                    direction = "--"
+            # Direction indicator: UP = bought Yes, DOWN = bought No
+            outcome_side = pos.get("outcome_side", "")
+            if outcome_side == "Yes":
+                direction = "UP"
+            elif outcome_side == "No":
+                direction = "DOWN"
             else:
                 direction = "--"
 
