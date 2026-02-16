@@ -482,6 +482,8 @@ DEFAULT_CONFIG = {
     # --- Arbitrage mode (binary market spread capture) ---
     "arb_enabled": False,
     "arb_condition_ids": [],          # condition IDs of binary markets to monitor
+    "arb_dynamic_slug": "",           # e.g. "btc-updown-5m" — auto-discovers rotating markets
+    "arb_dynamic_window": 300,        # window duration in seconds (300 = 5 minutes)
     "arb_min_edge_pct": 1.0,         # minimum spread % to trigger (e.g. 1.0 = 1%)
     "arb_size_usdc": 10.0,           # USDC to spend per side of each arb trade
     "arb_max_positions": 5,           # max simultaneous arb positions
@@ -1754,6 +1756,10 @@ class ArbitrageMonitor(threading.Thread):
         self._active_positions = {}
         self._load_positions()
 
+        # Dynamic slug state: tracks the current window timestamp so we
+        # know when to re-resolve to the next rotating market.
+        self._current_window_ts = 0
+
     # -- persistence --------------------------------------------------------
 
     def _load_positions(self):
@@ -1823,15 +1829,133 @@ class ArbitrageMonitor(threading.Thread):
             except Exception as exc:
                 self.logger.warning("Arb: failed to resolve condition %s: %s", cid[:20], exc)
 
+    # -- dynamic slug discovery ---------------------------------------------
+
+    def _get_dynamic_window_ts(self):
+        """Return the current window start timestamp for the dynamic slug."""
+        window = max(int(self.cfg.get("arb_dynamic_window", 300)), 30)
+        now = int(time.time())
+        return now - (now % window)
+
+    def _resolve_dynamic_slug(self):
+        """Discover the current rotating market via the Gamma events API.
+
+        For markets like ``btc-updown-5m`` that rotate every 5 minutes,
+        the slug follows a deterministic pattern:
+            ``{base_slug}-{window_start_timestamp}``
+
+        This method computes the current slug, fetches it from the Gamma
+        API ``/events`` endpoint, extracts the first market's condition_id
+        and tokens, and populates ``self._markets``.
+
+        Returns True if a new market was resolved, False otherwise.
+        """
+        base_slug = self.cfg.get("arb_dynamic_slug", "").strip()
+        if not base_slug:
+            return False
+
+        window_ts = self._get_dynamic_window_ts()
+        if window_ts == self._current_window_ts and self._markets:
+            return False  # same window, already resolved
+
+        slug = f"{base_slug}-{window_ts}"
+        self.logger.info("Arb dynamic: discovering market for slug '%s'", slug)
+
+        try:
+            url = f"{GAMMA_API_BASE}/events"
+            data = self.clob_client._get_public(url, params={"slug": slug})
+
+            # The events endpoint returns a list; we want the first event
+            event = None
+            if isinstance(data, list) and data:
+                event = data[0]
+            elif isinstance(data, dict):
+                event = data
+
+            if not event:
+                self.logger.warning(
+                    "Arb dynamic: no event found for slug '%s' — "
+                    "market may not be open yet", slug,
+                )
+                return False
+
+            # An event contains a list of markets; grab the first binary one
+            markets = event.get("markets") or []
+            if not markets:
+                self.logger.warning(
+                    "Arb dynamic: event '%s' has no markets", slug,
+                )
+                return False
+
+            market = markets[0]
+            cid = market.get("condition_id") or market.get("conditionId") or ""
+            tokens = market.get("tokens") or []
+
+            if not cid:
+                self.logger.warning(
+                    "Arb dynamic: market in event '%s' has no condition_id", slug,
+                )
+                return False
+
+            if len(tokens) < 2:
+                self.logger.warning(
+                    "Arb dynamic: market %s has %d tokens (need 2) — skipping",
+                    cid[:20], len(tokens),
+                )
+                return False
+
+            t0 = tokens[0]
+            t1 = tokens[1]
+            tid0 = t0.get("token_id") or t0.get("tokenId") or ""
+            tid1 = t1.get("token_id") or t1.get("tokenId") or ""
+            label0 = t0.get("outcome", "A")
+            label1 = t1.get("outcome", "B")
+            question = market.get("question") or event.get("title") or slug
+
+            # Clear previous window's market(s) so we only track the current one
+            old_keys = [k for k in self._markets if k != cid]
+            for k in old_keys:
+                del self._markets[k]
+
+            self._markets[cid] = {
+                "yes_token": tid0,
+                "no_token": tid1,
+                "yes_label": label0,
+                "no_label": label1,
+                "question": question,
+            }
+            self._current_window_ts = window_ts
+            self.logger.info(
+                "Arb dynamic: resolved '%s' — %s=%s... / %s=%s... (window %d)",
+                question[:50], label0, tid0[:12], label1, tid1[:12], window_ts,
+            )
+            return True
+
+        except Exception as exc:
+            self.logger.warning("Arb dynamic: failed to resolve slug '%s': %s", slug, exc)
+            return False
+
     # -- core loop ----------------------------------------------------------
 
     def run(self):
-        self.logger.info("Arbitrage monitor starting — %d market(s) configured",
-                         len(self.cfg.get("arb_condition_ids", [])))
+        dynamic_slug = self.cfg.get("arb_dynamic_slug", "").strip()
+        static_cids = self.cfg.get("arb_condition_ids", [])
 
-        self._resolve_markets()
+        if dynamic_slug:
+            self.logger.info(
+                "Arbitrage monitor starting — dynamic slug '%s' "
+                "(window %ds)", dynamic_slug,
+                self.cfg.get("arb_dynamic_window", 300),
+            )
+            self._resolve_dynamic_slug()
+        else:
+            self.logger.info(
+                "Arbitrage monitor starting — %d market(s) configured",
+                len(static_cids),
+            )
+            self._resolve_markets()
 
-        if not self._markets:
+        if not self._markets and not dynamic_slug:
             self.logger.error("Arb: no markets could be resolved — monitor stopping")
             return
 
@@ -1839,7 +1963,12 @@ class ArbitrageMonitor(threading.Thread):
 
         while not self._stop_event.is_set():
             try:
-                self._scan_cycle()
+                # For dynamic slugs, re-resolve when the window rotates
+                if dynamic_slug:
+                    self._resolve_dynamic_slug()
+
+                if self._markets:
+                    self._scan_cycle()
             except Exception as exc:
                 self.logger.error("Arb scan error: %s", exc, exc_info=True)
             self._stop_event.wait(timeout=poll_interval)
@@ -5173,8 +5302,16 @@ class CopyTraderBot:
         self.logger.info("  WebSocket detection:    %s", ws_status)
         arb_status = "disabled"
         if self.cfg.get("arb_enabled"):
-            n_arb = len(self.cfg.get("arb_condition_ids", []))
-            arb_status = f"enabled ({n_arb} market(s), min edge {self.cfg.get('arb_min_edge_pct', 1.0)}%)"
+            dynamic_slug = self.cfg.get("arb_dynamic_slug", "").strip()
+            if dynamic_slug:
+                arb_status = (
+                    f"enabled (dynamic '{dynamic_slug}' every "
+                    f"{self.cfg.get('arb_dynamic_window', 300)}s, "
+                    f"min edge {self.cfg.get('arb_min_edge_pct', 1.0)}%)"
+                )
+            else:
+                n_arb = len(self.cfg.get("arb_condition_ids", []))
+                arb_status = f"enabled ({n_arb} market(s), min edge {self.cfg.get('arb_min_edge_pct', 1.0)}%)"
         self.logger.info("  Arbitrage mode:         %s", arb_status)
         self.logger.info("=" * 60)
 
@@ -5236,22 +5373,36 @@ class CopyTraderBot:
         # ---- Start Arbitrage Monitor (independent of copy trading) ----
         if self.cfg.get("arb_enabled") and self.clob_client:
             arb_cids = self.cfg.get("arb_condition_ids", [])
-            if arb_cids:
+            dynamic_slug = self.cfg.get("arb_dynamic_slug", "").strip()
+            if arb_cids or dynamic_slug:
                 self._arb_monitor = ArbitrageMonitor(
                     self.clob_client, self.cfg, self.logger,
                 )
                 self._arb_monitor.start()
-                self.logger.info(
-                    "Arbitrage monitor enabled — scanning %d market(s), "
-                    "min edge %.1f%%, $%.0f/side, poll every %ds",
-                    len(arb_cids),
-                    self.cfg.get("arb_min_edge_pct", 1.0),
-                    self.cfg.get("arb_size_usdc", 10.0),
-                    self.cfg.get("arb_poll_seconds", 2),
-                )
+                if dynamic_slug:
+                    self.logger.info(
+                        "Arbitrage monitor enabled — dynamic slug '%s' "
+                        "(window %ds), min edge %.1f%%, $%.0f/side, "
+                        "poll every %ds",
+                        dynamic_slug,
+                        self.cfg.get("arb_dynamic_window", 300),
+                        self.cfg.get("arb_min_edge_pct", 1.0),
+                        self.cfg.get("arb_size_usdc", 10.0),
+                        self.cfg.get("arb_poll_seconds", 2),
+                    )
+                else:
+                    self.logger.info(
+                        "Arbitrage monitor enabled — scanning %d market(s), "
+                        "min edge %.1f%%, $%.0f/side, poll every %ds",
+                        len(arb_cids),
+                        self.cfg.get("arb_min_edge_pct", 1.0),
+                        self.cfg.get("arb_size_usdc", 10.0),
+                        self.cfg.get("arb_poll_seconds", 2),
+                    )
             else:
                 self.logger.warning(
-                    "arb_enabled=True but no arb_condition_ids configured"
+                    "arb_enabled=True but no arb_condition_ids or "
+                    "arb_dynamic_slug configured"
                 )
 
         if web3_ok:
@@ -6356,6 +6507,37 @@ class CopyTraderGUI:
             wraplength=600,
         ).pack(anchor=tk.W, pady=(0, 8))
 
+        # Dynamic slug section
+        dyn_frame = ttk.LabelFrame(
+            parent, text="Dynamic Market (Rotating Slug)", padding=8,
+        )
+        dyn_frame.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(
+            dyn_frame,
+            text="For rotating markets like BTC 5-min up/down, enter the "
+                 "base slug (e.g. 'btc-updown-5m'). The bot will auto-discover "
+                 "the current market every window. Leave blank to use static "
+                 "condition IDs instead.",
+            wraplength=600,
+        ).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 5))
+
+        ttk.Label(dyn_frame, text="Dynamic Slug:").grid(
+            row=1, column=0, sticky=tk.W, pady=3,
+        )
+        self.arb_dynamic_slug_entry = ttk.Entry(dyn_frame, width=30)
+        self.arb_dynamic_slug_entry.grid(row=1, column=1, sticky=tk.W, pady=3)
+
+        ttk.Label(dyn_frame, text="Window (seconds):").grid(
+            row=2, column=0, sticky=tk.W, pady=3,
+        )
+        win_frame = ttk.Frame(dyn_frame)
+        win_frame.grid(row=2, column=1, sticky=tk.W, pady=3)
+        self.arb_dynamic_window_entry = ttk.Entry(win_frame, width=8)
+        self.arb_dynamic_window_entry.pack(side=tk.LEFT)
+        ttk.Label(
+            win_frame, text="(300 = 5 min, 60 = 1 min)",
+        ).pack(side=tk.LEFT, padx=5)
+
         # Settings row
         settings_frame = ttk.LabelFrame(parent, text="Arbitrage Settings", padding=8)
         settings_frame.pack(fill=tk.X, pady=(0, 8))
@@ -6674,6 +6856,8 @@ class CopyTraderGUI:
             self.addr_listbox.insert(tk.END, addr)
         # Arbitrage fields
         self.arb_enabled_var.set(self.cfg.get("arb_enabled", False))
+        self.arb_dynamic_slug_entry.insert(0, self.cfg.get("arb_dynamic_slug", ""))
+        self.arb_dynamic_window_entry.insert(0, str(self.cfg.get("arb_dynamic_window", 300)))
         self.arb_min_edge_entry.insert(0, str(self.cfg.get("arb_min_edge_pct", 1.0)))
         self.arb_size_entry.insert(0, str(self.cfg.get("arb_size_usdc", 10.0)))
         self.arb_max_pos_entry.insert(0, str(self.cfg.get("arb_max_positions", 5)))
@@ -6741,6 +6925,13 @@ class CopyTraderGUI:
         self.cfg["watched_addresses"] = list(self.addr_listbox.get(0, tk.END))
         # Arbitrage fields
         self.cfg["arb_enabled"] = self.arb_enabled_var.get()
+        self.cfg["arb_dynamic_slug"] = self.arb_dynamic_slug_entry.get().strip()
+        try:
+            val = int(self.arb_dynamic_window_entry.get().strip())
+            if val >= 30:
+                self.cfg["arb_dynamic_window"] = val
+        except ValueError:
+            pass
         self.cfg["arb_condition_ids"] = list(self.arb_market_listbox.get(0, tk.END))
         try:
             val = float(self.arb_min_edge_entry.get().strip())
@@ -6842,12 +7033,15 @@ class CopyTraderGUI:
         if pk:
             save_private_key(pk, self.cfg)
 
-        arb_mode = self.cfg.get("arb_enabled") and self.cfg.get("arb_condition_ids")
+        arb_mode = self.cfg.get("arb_enabled") and (
+            self.cfg.get("arb_condition_ids") or self.cfg.get("arb_dynamic_slug")
+        )
         if not self.cfg.get("watched_addresses") and not arb_mode:
             messagebox.showwarning(
                 "No Addresses",
                 "Add at least one trader address to watch, "
-                "or enable arbitrage mode with market condition IDs.",
+                "or enable arbitrage mode with market condition IDs "
+                "or a dynamic slug.",
             )
             return
         if not self.cfg.get("rpc_url") and not self.cfg.get("ws_rpc_url"):
@@ -6988,6 +7182,10 @@ def run_headless():
         cfg["arb_condition_ids"] = [
             c.strip() for c in os.environ["ARB_CONDITION_IDS"].split(",") if c.strip()
         ]
+    if os.environ.get("ARB_DYNAMIC_SLUG"):
+        cfg["arb_dynamic_slug"] = os.environ["ARB_DYNAMIC_SLUG"].strip()
+    if os.environ.get("ARB_DYNAMIC_WINDOW"):
+        cfg["arb_dynamic_window"] = int(os.environ["ARB_DYNAMIC_WINDOW"])
     if os.environ.get("ARB_MIN_EDGE_PCT"):
         cfg["arb_min_edge_pct"] = float(os.environ["ARB_MIN_EDGE_PCT"])
     if os.environ.get("ARB_SIZE_USDC"):
@@ -6997,12 +7195,14 @@ def run_headless():
     if os.environ.get("ARB_POLL_SECONDS"):
         cfg["arb_poll_seconds"] = int(os.environ["ARB_POLL_SECONDS"])
 
-    arb_mode = cfg.get("arb_enabled") and cfg.get("arb_condition_ids")
+    arb_mode = cfg.get("arb_enabled") and (
+        cfg.get("arb_condition_ids") or cfg.get("arb_dynamic_slug")
+    )
     if not cfg.get("watched_addresses") and not arb_mode:
         logger.error(
             "No watched addresses or arb markets configured. "
             "Set WATCHED_ADDRESSES (comma-separated) or "
-            "ARB_ENABLED=1 + ARB_CONDITION_IDS."
+            "ARB_ENABLED=1 + ARB_CONDITION_IDS or ARB_DYNAMIC_SLUG."
         )
         sys.exit(1)
 
@@ -7018,10 +7218,18 @@ def run_headless():
     logger.info("Proxy redeem: %s | Proxy withdraw: %s",
                 cfg.get("proxy_redeem", True), cfg.get("proxy_withdraw", True))
     if cfg.get("arb_enabled"):
-        logger.info("Arbitrage: ENABLED | Markets: %d | Min edge: %s%% | Size: $%s/side",
-                    len(cfg.get("arb_condition_ids", [])),
-                    cfg.get("arb_min_edge_pct", 1.0),
-                    cfg.get("arb_size_usdc", 10.0))
+        dyn = cfg.get("arb_dynamic_slug", "").strip()
+        if dyn:
+            logger.info("Arbitrage: ENABLED | Dynamic slug: '%s' (window %ds) | "
+                        "Min edge: %s%% | Size: $%s/side",
+                        dyn, cfg.get("arb_dynamic_window", 300),
+                        cfg.get("arb_min_edge_pct", 1.0),
+                        cfg.get("arb_size_usdc", 10.0))
+        else:
+            logger.info("Arbitrage: ENABLED | Markets: %d | Min edge: %s%% | Size: $%s/side",
+                        len(cfg.get("arb_condition_ids", [])),
+                        cfg.get("arb_min_edge_pct", 1.0),
+                        cfg.get("arb_size_usdc", 10.0))
 
     bot = CopyTraderBot(cfg, logger)
 
