@@ -381,8 +381,9 @@ DEFAULT_CONFIG = {
     "proxy_withdraw": True,
     "proxy_address": "",
     "webhook_url": "",
-    "max_price_deviation_pct": 5,
+    "max_price_deviation_pct": 3,
     "max_loss_usdc": 0,
+    "trade_max_age_seconds": 20,
 }
 
 
@@ -948,14 +949,59 @@ class PolymarketCLOBClient:
                     return resp
                 except Exception as fok_exc:
                     # FOK failed — the market has moved away from our price.
-                    # Do NOT fall through to a GTC limit order at a stale
-                    # price.  A GTC at the whale's old price will almost
-                    # never fill and just locks up balance.  Abort instead.
+                    # Retry ONCE with a refreshed orderbook price before
+                    # giving up.  This catches cases where our smart price
+                    # was slightly stale by the time the order hit the book.
                     self.logger.warning(
-                        "FOK rejected (%s) — aborting (no stale GTC fallback)",
+                        "FOK rejected (%s) — retrying with refreshed price",
                         fok_exc,
                     )
-                    return {"status": "fok_rejected", "reason": str(fok_exc)}
+                    try:
+                        retry_book = self.get_order_book(token_id)
+                        retry_bids = (retry_book or {}).get("bids") or []
+                        retry_asks = (retry_book or {}).get("asks") or []
+                        retry_bid = float(retry_bids[0].get("price", 0)) if retry_bids else 0
+                        retry_ask = float(retry_asks[0].get("price", 0)) if retry_asks else 0
+                        if side.upper() == "BUY" and retry_ask > 0:
+                            retry_price = round(min(retry_ask * 1.005, 0.99), 2)
+                        elif side.upper() == "SELL" and retry_bid > 0:
+                            retry_price = round(max(retry_bid * 0.995, 0.01), 2)
+                        else:
+                            self.logger.warning("FOK retry: no orderbook — aborting")
+                            return {"status": "fok_rejected", "reason": str(fok_exc)}
+
+                        retry_usdc = round(actual_usdc, 2)
+                        retry_tokens = round(actual_usdc / retry_price, 2) if retry_price > 0 else 0
+                        if side.upper() == "BUY":
+                            fok_args2 = MarketOrderArgs(
+                                token_id=token_id,
+                                amount=retry_usdc,
+                                price=retry_price,
+                                side=side.upper(),
+                            )
+                        else:
+                            fok_args2 = MarketOrderArgs(
+                                token_id=token_id,
+                                amount=round(retry_tokens, 2),
+                                price=retry_price,
+                                side=side.upper(),
+                            )
+                        signed_retry = self.clob_sdk.create_market_order(fok_args2)
+                        resp2 = self.clob_sdk.post_order(
+                            signed_retry, orderType=OrderType.FOK,
+                        )
+                        self.logger.info(
+                            "FOK retry filled: %s $%.2f @ %.4f (was %.4f) — %s",
+                            side, actual_usdc, retry_price, price,
+                            token_id[:16] + "...", resp2,
+                        )
+                        return resp2
+                    except Exception as retry_exc:
+                        self.logger.warning(
+                            "FOK retry also rejected (%s) — aborting",
+                            retry_exc,
+                        )
+                        return {"status": "fok_rejected", "reason": str(retry_exc)}
 
             # --- GTC (Good-Till-Cancelled) limit order ---
             limit_args = OrderArgs(
@@ -1318,7 +1364,7 @@ class TradeExecutor:
         self.copy_pct = Decimal(str(cfg.get("copy_percentage", 50))) / Decimal("100")
         self.max_trade = Decimal(str(cfg.get("max_trade_usdc", 100)))
         self.gas_multiplier = cfg.get("gas_multiplier", 1.2)
-        self.slippage_bps = cfg.get("slippage_tolerance_bps", 100)
+        self.slippage_bps = cfg.get("slippage_tolerance_bps", 50)
         self._nonce_lock = threading.Lock()
         self._nonce = None
 
@@ -3912,18 +3958,23 @@ class TradeExecutor:
 
             # Place order via the CLOB API (requires py-clob-client + API creds)
             if self.clob_client and self.clob_client.clob_sdk:
-                # Use the current mid-price (fetched during stale-price check)
-                # as our limit price instead of blindly applying slippage to
-                # the whale's historical price.  The whale's price is stale by
-                # the time we execute — using it (+ adverse slippage) guaranteed
-                # we'd pay MORE on buys and receive LESS on sells.
+                # --- Smart price selection ---
+                # The whale's trade price is STALE by the time we detect it
+                # (5-30s later).  Using whale_price + slippage guarantees we
+                # overpay on buys and undersell on sells.
                 #
-                # Use whale's price + slippage tolerance as our limit.
-                # For BUYs we accept paying up to slippage_bps above whale.
-                # For SELLs we accept receiving slippage_bps below whale.
-                # The FOK order type ensures instant fill or no fill — no
-                # stale GTC orders sitting on the book.
+                # Instead, fetch the CURRENT orderbook and use the live
+                # best_ask (for buys) or best_bid (for sells) as our limit.
+                # This ensures we fill at the actual market price, not a
+                # worse price derived from stale data.
+                #
+                # We still apply max_price_deviation_pct as a safety cap to
+                # avoid filling when the market has moved too far from the
+                # whale's entry (suggesting the opportunity is gone).
                 slippage_mult = Decimal(str(self.slippage_bps)) / Decimal("10000")
+                whale_price = float(price)
+
+                # Fallback: whale price + slippage (used if orderbook unavailable)
                 if side == "BUY":
                     adjusted_price = float(
                         Decimal(str(price)) * (Decimal("1") + slippage_mult)
@@ -3935,59 +3986,89 @@ class TradeExecutor:
                     )
                     adjusted_price = max(adjusted_price, 0.01)
 
-                # --- Stale price protection ---
-                # Fetch the current mid-price from the orderbook and compare
-                # to the whale's trade price.  If the market has moved more
-                # than max_price_deviation_pct, skip the trade.  When within
-                # tolerance we keep the whale's price (not mid) so our entry
-                # is as close to the whale's as possible.
+                # --- Fetch live orderbook for smart pricing ---
                 max_dev_pct = self.cfg.get("max_price_deviation_pct", 5)
-                if max_dev_pct > 0:
-                    try:
-                        book = self.clob_client.get_order_book(token_id)
-                        if book:
-                            bids = book.get("bids") or []
-                            asks = book.get("asks") or []
-                            best_bid = float(bids[0].get("price", 0)) if bids else 0
-                            best_ask = float(asks[0].get("price", 0)) if asks else 0
-                            if best_bid > 0 and best_ask > 0:
-                                mid_price = (best_bid + best_ask) / 2.0
-                                whale_price = float(price)
-                                if whale_price > 0:
-                                    deviation = abs(mid_price - whale_price) / whale_price * 100
-                                    if deviation > max_dev_pct:
-                                        self.logger.warning(
-                                            "STALE PRICE: whale traded at %.4f but "
-                                            "current mid=%.4f (%.1f%% deviation > %d%% "
-                                            "max) — skipping %s",
-                                            whale_price, mid_price, deviation,
-                                            max_dev_pct, token_id[:16] + "...",
-                                        )
-                                        return {
-                                            "status": "skipped_stale_price",
-                                            "side": side,
-                                            "amount_usdc": float(copy_amount),
-                                            "token_id": token_id,
-                                            "price": float(price),
-                                            "mid_price": mid_price,
-                                            "deviation_pct": round(deviation, 2),
-                                        }
-                                    # Within tolerance — keep whale's price
-                                    # (already applied via adjusted_price above)
-                                    # so our entry matches the whale as closely
-                                    # as possible.
-                                    if deviation > 1:
-                                        self.logger.info(
-                                            "Price check OK: whale=%.4f, mid=%.4f "
-                                            "(deviation=%.1f%%, within %d%% limit)",
-                                            whale_price, mid_price, deviation,
-                                            max_dev_pct,
-                                        )
-                    except Exception as book_exc:
-                        self.logger.debug(
-                            "Orderbook fetch failed (proceeding with whale price): %s",
-                            book_exc,
+                best_bid = 0
+                best_ask = 0
+                try:
+                    book = self.clob_client.get_order_book(token_id)
+                    if book:
+                        bids = book.get("bids") or []
+                        asks = book.get("asks") or []
+                        best_bid = float(bids[0].get("price", 0)) if bids else 0
+                        best_ask = float(asks[0].get("price", 0)) if asks else 0
+                except Exception as book_exc:
+                    self.logger.debug(
+                        "Orderbook fetch failed (using whale price + slippage): %s",
+                        book_exc,
+                    )
+
+                if best_bid > 0 and best_ask > 0:
+                    mid_price = (best_bid + best_ask) / 2.0
+
+                    # --- Stale price protection ---
+                    if whale_price > 0 and max_dev_pct > 0:
+                        deviation = abs(mid_price - whale_price) / whale_price * 100
+                        if deviation > max_dev_pct:
+                            self.logger.warning(
+                                "STALE PRICE: whale traded at %.4f but "
+                                "current mid=%.4f (%.1f%% deviation > %d%% "
+                                "max) — skipping %s",
+                                whale_price, mid_price, deviation,
+                                max_dev_pct, token_id[:16] + "...",
+                            )
+                            return {
+                                "status": "skipped_stale_price",
+                                "side": side,
+                                "amount_usdc": float(copy_amount),
+                                "token_id": token_id,
+                                "price": float(price),
+                                "mid_price": mid_price,
+                                "deviation_pct": round(deviation, 2),
+                            }
+
+                    # --- Use current market price instead of stale whale price ---
+                    # For BUY: use the best_ask (what we'd actually pay) + small
+                    #   slippage buffer so our FOK has room to fill.
+                    # For SELL: use the best_bid (what we'd actually receive) -
+                    #   small slippage buffer.
+                    # This is strictly better than whale_price + slippage because
+                    # it reflects where the market IS, not where it WAS.
+                    if side == "BUY":
+                        market_price = float(
+                            Decimal(str(best_ask)) * (Decimal("1") + slippage_mult)
                         )
+                        market_price = min(market_price, 0.99)
+                        # Use the BETTER price (lower for buys) between market
+                        # and whale-based, but prefer market when it would
+                        # actually fill (whale price may be too low to fill now)
+                        if best_ask > whale_price:
+                            # Market moved up since whale bought — use market
+                            # price so our FOK actually fills
+                            adjusted_price = market_price
+                        else:
+                            # Market is at or below whale price — we get an
+                            # even better entry than the whale
+                            adjusted_price = min(market_price, adjusted_price)
+                    else:
+                        market_price = float(
+                            Decimal(str(best_bid)) * (Decimal("1") - slippage_mult)
+                        )
+                        market_price = max(market_price, 0.01)
+                        if best_bid < whale_price:
+                            # Market moved down since whale sold — use market
+                            # price so our FOK actually fills
+                            adjusted_price = market_price
+                        else:
+                            # Market is at or above whale price — we get an
+                            # even better exit than the whale
+                            adjusted_price = max(market_price, adjusted_price)
+
+                    self.logger.info(
+                        "SMART PRICE: whale=%.4f, bid=%.4f, ask=%.4f, "
+                        "using=%.4f (%s)",
+                        whale_price, best_bid, best_ask, adjusted_price, side,
+                    )
 
                 result = self.clob_client.place_order(
                     token_id=token_id,
@@ -4355,7 +4436,7 @@ class CopyTraderBot:
                 except Exception:
                     pass
 
-        poll_interval = self.cfg.get("poll_interval_seconds", 15)
+        poll_interval = self.cfg.get("poll_interval_seconds", 5)
         self.logger.info(
             "Monitoring %d address(es), poll interval %ds",
             len(self.cfg.get("watched_addresses", [])),
@@ -5440,13 +5521,13 @@ class CopyTraderGUI:
         self.ws_rpc_entry.insert(0, self.cfg.get("ws_rpc_url", ""))
         self.copy_pct_var.set(self.cfg.get("copy_percentage", 50))
         self.max_trade_entry.insert(0, str(self.cfg.get("max_trade_usdc", 100)))
-        self.slippage_entry.insert(0, str(self.cfg.get("slippage_tolerance_bps", 100)))
+        self.slippage_entry.insert(0, str(self.cfg.get("slippage_tolerance_bps", 50)))
         self.resume_threshold_entry.insert(0, str(self.cfg.get("resume_threshold_usdc", 5)))
         self.take_profit_entry.insert(0, str(self.cfg.get("take_profit_price", 0.99)))
         self.take_profit_pct_entry.insert(0, str(self.cfg.get("take_profit_pct", 0)))
         self.stop_loss_entry.insert(0, str(self.cfg.get("stop_loss_pct", 50)))
         self.max_loss_entry.insert(0, str(self.cfg.get("max_loss_usdc", 0)))
-        self.poll_entry.insert(0, str(self.cfg.get("poll_interval_seconds", 15)))
+        self.poll_entry.insert(0, str(self.cfg.get("poll_interval_seconds", 5)))
         self.exit_check_entry.insert(0, str(self.cfg.get("exit_check_seconds", 5)))
         self.use_clob_var.set(self.cfg.get("use_clob_api", True))
         self.dry_run_var.set(self.cfg.get("dry_run", False))
