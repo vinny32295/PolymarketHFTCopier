@@ -66,6 +66,14 @@ except ImportError:
     OpenOrderParams = None
     HAS_CLOB_SDK = False
 
+# websocket-client for real-time eth_subscribe monitoring
+try:
+    import websocket as _ws_lib
+    HAS_WS_CLIENT = True
+except ImportError:
+    _ws_lib = None
+    HAS_WS_CLIENT = False
+
 # ---------------------------------------------------------------------------
 # Constants – Polymarket / Polygon addresses and ABIs
 # ---------------------------------------------------------------------------
@@ -1355,6 +1363,266 @@ class OnChainMonitor:
             except Exception as exc:
                 self.logger.debug("Event log query failed for %s: %s", addr, exc)
         return trades
+
+
+# ---------------------------------------------------------------------------
+# WebSocket Monitor – real-time whale trade detection via eth_subscribe
+# ---------------------------------------------------------------------------
+
+class WebSocketMonitor(threading.Thread):
+    """Real-time whale trade detection via Polygon WebSocket eth_subscribe.
+
+    Subscribes to OrderFilled and OrdersMatched events on the CTF Exchange
+    contracts, filtered by watched whale addresses (as both maker and taker).
+    When a matching event arrives, signals the main loop to immediately poll
+    the CLOB API for structured trade details instead of waiting for the next
+    poll interval.
+
+    Requires:
+      - A Polygon WebSocket RPC URL (e.g. Alchemy, Infura, QuickNode)
+      - The ``websocket-client`` package (``pip install websocket-client``)
+
+    Falls back gracefully if websocket-client is not installed.
+    """
+
+    RECONNECT_DELAYS = [1, 2, 4, 8, 16, 30]  # seconds, capped at 30
+    PING_INTERVAL = 30  # seconds between keepalive pings
+    DATA_TIMEOUT = 300  # seconds without any message before reconnecting
+
+    def __init__(self, ws_url, watched_addresses, wake_event, logger=None):
+        super().__init__(daemon=True, name="WebSocketMonitor")
+        self.ws_url = ws_url
+        self.watched = {a.lower().replace("0x", "") for a in watched_addresses}
+        self.wake_event = wake_event  # threading.Event to wake main loop
+        self.logger = logger or logging.getLogger("CopyTrader")
+        self.running = True
+        self._ws = None
+        self._reconnect_count = 0
+        self.last_event_time = 0.0
+        self.connected = False
+
+        # Compute event topic hashes (keccak256 of canonical signatures)
+        if Web3 is not None:
+            self._order_filled_topic = Web3.keccak(
+                text="OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)"
+            ).hex()
+            self._orders_matched_topic = Web3.keccak(
+                text="OrdersMatched(bytes32,address,address,uint256,uint256,uint256,uint256)"
+            ).hex()
+        else:
+            # Precomputed fallbacks (Polygon mainnet)
+            self._order_filled_topic = (
+                "0x4b9f2d36e1b4c93de62cc077b00b1a91d84b6c31b4a14e012718571f"
+                "3100b2257"
+            )
+            self._orders_matched_topic = (
+                "0x1234567890abcdef"  # placeholder, Web3 should always be available
+            )
+
+    def update_watched(self, addresses):
+        """Update the set of whale addresses to monitor (thread-safe)."""
+        self.watched = {a.lower().replace("0x", "") for a in addresses}
+
+    def stop(self):
+        """Signal the monitor to shut down."""
+        self.running = False
+        ws = self._ws
+        if ws:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def run(self):
+        """Main thread loop — connect, subscribe, listen, reconnect."""
+        if not HAS_WS_CLIENT:
+            self.logger.warning(
+                "websocket-client not installed — WebSocket monitoring disabled. "
+                "Install with: pip install websocket-client"
+            )
+            return
+
+        if Web3 is None:
+            self.logger.warning(
+                "web3 not installed — WebSocket monitoring disabled."
+            )
+            return
+
+        self.logger.info(
+            "WebSocket monitor starting — %s (watching %d address(es))",
+            self.ws_url[:50] + "...", len(self.watched),
+        )
+
+        while self.running:
+            try:
+                self._connect_and_listen()
+            except Exception as exc:
+                self.connected = False
+                if not self.running:
+                    break
+                idx = min(self._reconnect_count, len(self.RECONNECT_DELAYS) - 1)
+                delay = self.RECONNECT_DELAYS[idx]
+                self.logger.warning(
+                    "WebSocket disconnected: %s — reconnecting in %ds (attempt %d)",
+                    exc, delay, self._reconnect_count + 1,
+                )
+                self._reconnect_count += 1
+                # Sleep in small steps so we can exit quickly on stop()
+                elapsed = 0.0
+                while elapsed < delay and self.running:
+                    time.sleep(min(0.5, delay - elapsed))
+                    elapsed += 0.5
+
+        self.connected = False
+        self.logger.info("WebSocket monitor stopped")
+
+    def _connect_and_listen(self):
+        """Connect to the Polygon WebSocket RPC, subscribe, and listen."""
+        ws = _ws_lib.WebSocket()
+        ws.settimeout(self.PING_INTERVAL + 10)
+        ws.connect(self.ws_url)
+        self._ws = ws
+        self.connected = True
+        self._reconnect_count = 0
+        self.logger.info("WebSocket connected to %s", self.ws_url[:50] + "...")
+
+        # Subscribe to CTF Exchange events for whale addresses
+        self._subscribe(ws)
+
+        # Listen for incoming events
+        last_ping = time.monotonic()
+        last_data = time.monotonic()
+
+        while self.running:
+            try:
+                raw = ws.recv()
+                if not raw:
+                    continue
+                last_data = time.monotonic()
+
+                msg = json.loads(raw)
+
+                # Subscription confirmation
+                if "result" in msg and "id" in msg:
+                    self.logger.debug(
+                        "WebSocket subscription confirmed: id=%s sub=%s",
+                        msg["id"], msg["result"],
+                    )
+                    continue
+
+                # Subscription event
+                if msg.get("method") == "eth_subscription":
+                    self._handle_event(msg["params"]["result"])
+
+            except _ws_lib.WebSocketTimeoutException:
+                pass  # normal timeout, send ping below
+            except _ws_lib.WebSocketConnectionClosedException:
+                raise ConnectionError("WebSocket connection closed by server")
+
+            # Keepalive ping
+            now = time.monotonic()
+            if now - last_ping >= self.PING_INTERVAL:
+                try:
+                    ws.ping()
+                except Exception:
+                    raise ConnectionError("WebSocket ping failed")
+                last_ping = now
+
+            # Reconnect if no data for too long (server went silent)
+            if now - last_data > self.DATA_TIMEOUT:
+                raise ConnectionError(
+                    "No data received for %ds — reconnecting" % self.DATA_TIMEOUT
+                )
+
+    def _subscribe(self, ws):
+        """Send eth_subscribe requests for OrderFilled/OrdersMatched events."""
+        whale_topics = ["0x" + addr.zfill(64) for addr in self.watched]
+
+        if not whale_topics:
+            self.logger.warning("No whale addresses configured for WebSocket monitoring")
+            return
+
+        exchanges = [
+            CTF_EXCHANGE_ADDRESS,
+            NEG_RISK_CTF_EXCHANGE_ADDRESS,
+        ]
+        event_topics = [
+            self._order_filled_topic,
+            self._orders_matched_topic,
+        ]
+
+        # Subscription 1: whale as MAKER (topic index 2)
+        ws.send(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "eth_subscribe",
+            "params": ["logs", {
+                "address": exchanges,
+                "topics": [
+                    event_topics,   # topic0: either event type
+                    None,           # topic1: any orderHash
+                    whale_topics,   # topic2: maker is a watched whale
+                ],
+            }],
+            "id": 1,
+        }))
+
+        # Subscription 2: whale as TAKER (topic index 3)
+        ws.send(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "eth_subscribe",
+            "params": ["logs", {
+                "address": exchanges,
+                "topics": [
+                    event_topics,   # topic0: either event type
+                    None,           # topic1: any orderHash
+                    None,           # topic2: any maker
+                    whale_topics,   # topic3: taker is a watched whale
+                ],
+            }],
+            "id": 2,
+        }))
+
+        self.logger.info(
+            "WebSocket subscribed: %d event type(s) × %d exchange(s) × %d whale(s) "
+            "(maker + taker)",
+            len(event_topics), len(exchanges), len(whale_topics),
+        )
+
+    def _handle_event(self, log_entry):
+        """Process an incoming OrderFilled/OrdersMatched log event."""
+        topics = log_entry.get("topics", [])
+        tx_hash = log_entry.get("transactionHash", "")
+        block_hex = log_entry.get("blockNumber", "0x0")
+        block_num = int(block_hex, 16) if isinstance(block_hex, str) else block_hex
+
+        # Identify which whale address matched (topic2=maker, topic3=taker)
+        whale_addr = None
+        whale_role = None
+        for idx, label in [(2, "maker"), (3, "taker")]:
+            if idx < len(topics) and topics[idx]:
+                addr_hex = topics[idx][-40:].lower()
+                if addr_hex in self.watched:
+                    whale_addr = "0x" + addr_hex
+                    whale_role = label
+                    break
+
+        event_name = "OrderFilled"
+        if len(topics) > 0 and topics[0] == self._orders_matched_topic:
+            event_name = "OrdersMatched"
+
+        self.logger.info(
+            "WS EVENT: %s — whale %s (%s) — block %d — tx %s",
+            event_name,
+            whale_addr[:12] + "..." if whale_addr else "unknown",
+            whale_role or "?",
+            block_num,
+            tx_hash[:18] + "..." if tx_hash else "?",
+        )
+
+        self.last_event_time = time.time()
+
+        # Wake the main loop to immediately poll CLOB API for full trade details
+        self.wake_event.set()
 
 
 # ---------------------------------------------------------------------------
@@ -4368,6 +4636,8 @@ class CopyTraderBot:
         # Web3 connection (lazy init)
         self.w3 = None
         self.on_chain_monitor = None
+        self._ws_monitor = None
+        self._ws_wake = threading.Event()
         self.executor = None
         self.clob_client = None
 
@@ -4516,6 +4786,10 @@ class CopyTraderBot:
                          self.cfg.get("dry_run", False))
         self.logger.info("  Auto redeem settled:    %s",
                          self.cfg.get("auto_redeem_settled", True))
+        ws_status = "disabled"
+        if self.cfg.get("ws_rpc_url"):
+            ws_status = "enabled" if HAS_WS_CLIENT else "no websocket-client"
+        self.logger.info("  WebSocket detection:    %s", ws_status)
         self.logger.info("=" * 60)
 
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
@@ -4525,6 +4799,12 @@ class CopyTraderBot:
 
     def stop(self):
         self.running = False
+        # Stop WebSocket monitor if running
+        if self._ws_monitor:
+            self._ws_monitor.stop()
+        # Wake the main loop so it exits the Event.wait() immediately
+        if hasattr(self, '_ws_wake'):
+            self._ws_wake.set()
         self.logger.info("Bot stop requested")
         self._notify("Bot stopped")
         # Report is generated at the end of _run_loop after the while
@@ -4535,11 +4815,34 @@ class CopyTraderBot:
         # Initialise connections – CLOB first so executor can use it
         self._init_clob()
 
+        # Event used by WebSocketMonitor to wake the main loop instantly
+        # when a whale trade is detected on-chain.
+        self._ws_wake = threading.Event()
+        self._ws_monitor = None
+
         web3_ok = self._init_web3()
         if web3_ok:
             self._init_executor()
             watched = self.cfg.get("watched_addresses", [])
             self.on_chain_monitor = OnChainMonitor(self.w3, watched, self.logger)
+
+            # Start WebSocket monitor for real-time detection if ws_rpc_url
+            # is configured and websocket-client is installed.
+            ws_url = self.cfg.get("ws_rpc_url", "")
+            if ws_url and HAS_WS_CLIENT and watched:
+                self._ws_monitor = WebSocketMonitor(
+                    ws_url, watched, self._ws_wake, self.logger,
+                )
+                self._ws_monitor.start()
+                self.logger.info(
+                    "Real-time WebSocket detection enabled — "
+                    "poll interval serves as fallback only"
+                )
+            elif ws_url and not HAS_WS_CLIENT:
+                self.logger.warning(
+                    "ws_rpc_url configured but websocket-client not installed. "
+                    "Install with: pip install websocket-client"
+                )
 
             # ---- Backfill market names for legacy positions ----
             if self.executor:
@@ -4818,9 +5121,10 @@ class CopyTraderBot:
 
                     # --- On-chain polling (fallback) ---
                     if self.on_chain_monitor and web3_ok:
-                        self.on_chain_monitor.update_watched(
-                            self.cfg.get("watched_addresses", [])
-                        )
+                        current_watched = self.cfg.get("watched_addresses", [])
+                        self.on_chain_monitor.update_watched(current_watched)
+                        if self._ws_monitor:
+                            self._ws_monitor.update_watched(current_watched)
                         chain_trades = self.on_chain_monitor.poll_new_blocks()
                         if chain_trades:
                             self.logger.info(
@@ -4864,12 +5168,14 @@ class CopyTraderBot:
                 self.running = False
                 break
 
-            # Sleep with early-exit check (supports sub-second poll intervals)
-            sleep_remaining = float(poll_interval)
-            sleep_step = min(0.5, sleep_remaining)
-            while sleep_remaining > 0 and self.running:
-                time.sleep(sleep_step)
-                sleep_remaining -= sleep_step
+            # Wait for next cycle.  If the WebSocket monitor detects a whale
+            # trade it sets _ws_wake, waking us instantly instead of waiting
+            # the full poll_interval.  Without WebSocket this behaves like a
+            # normal sleep with early-exit support.
+            woke_by_ws = self._ws_wake.wait(timeout=float(poll_interval))
+            self._ws_wake.clear()
+            if woke_by_ws:
+                self.logger.debug("Main loop woken by WebSocket event")
 
         self._generate_stop_report()
         self.logger.info("Bot stopped")
