@@ -1809,6 +1809,10 @@ class TradeExecutor:
 
             current_price = self.clob_client.get_last_trade_price(token_id)
             if current_price is None:
+                self.logger.warning(
+                    "Could not fetch price for %s — skipping exit check",
+                    token_id[:16] + "...",
+                )
                 continue
             current_price_d = Decimal(str(current_price))
 
@@ -1816,6 +1820,11 @@ class TradeExecutor:
             # Percentage-based take-profit (e.g. 500 = sell at +500% gain)
             if tp_pct > 0 and entry_price > 0:
                 gain_pct = ((current_price_d - entry_price) / entry_price) * Decimal("100")
+                self.logger.debug(
+                    "Exit check %s: entry=%.4f current=%.4f gain=%.1f%% (tp_pct=%.0f%%)",
+                    token_id[:16] + "...", entry_price, current_price_d,
+                    gain_pct, tp_pct,
+                )
                 if gain_pct >= tp_pct:
                     reason = "take-profit"
             # Absolute price take-profit (original behaviour)
@@ -4440,8 +4449,9 @@ class CopyTraderBot:
                     try:
                         self.executor.check_exit_conditions()
                     except Exception as exit_exc:
-                        self.logger.debug(
+                        self.logger.warning(
                             "Exit condition check error: %s", exit_exc,
+                            exc_info=True,
                         )
 
                 # --- Auto-redeem settled positions back to USDC ---
