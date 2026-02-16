@@ -373,6 +373,7 @@ DEFAULT_CONFIG = {
     "order_ttl_seconds": 60,
     "resume_threshold_usdc": 5.0,
     "take_profit_price": 0.99,
+    "take_profit_pct": 0,
     "stop_loss_pct": 0,
     "exit_check_seconds": 5,
     "auto_redeem_settled": True,
@@ -1794,6 +1795,7 @@ class TradeExecutor:
 
         # Read thresholds from config (fall back to module-level defaults)
         tp_price = Decimal(str(self.cfg.get("take_profit_price", TAKE_PROFIT_PRICE)))
+        tp_pct = Decimal(str(self.cfg.get("take_profit_pct", 0)))
         sl_raw = Decimal(str(self.cfg.get("stop_loss_pct", STOP_LOSS_PCT * 100)))
         sl_pct = sl_raw / Decimal("100") if sl_raw > 0 else Decimal("0")
 
@@ -1811,9 +1813,15 @@ class TradeExecutor:
             current_price_d = Decimal(str(current_price))
 
             reason = None
-            if current_price_d >= tp_price:
+            # Percentage-based take-profit (e.g. 500 = sell at +500% gain)
+            if tp_pct > 0 and entry_price > 0:
+                gain_pct = ((current_price_d - entry_price) / entry_price) * Decimal("100")
+                if gain_pct >= tp_pct:
+                    reason = "take-profit"
+            # Absolute price take-profit (original behaviour)
+            if reason is None and current_price_d >= tp_price:
                 reason = "take-profit"
-            elif sl_pct > 0 and entry_price > 0 and current_price_d <= entry_price * sl_pct:
+            elif reason is None and sl_pct > 0 and entry_price > 0 and current_price_d <= entry_price * sl_pct:
                 reason = "stop-loss"
 
             if reason is None:
@@ -4915,6 +4923,15 @@ class CopyTraderGUI:
         self.take_profit_entry.pack(side=tk.LEFT)
         ttk.Label(tp_frame, text="(sell when price >= this, e.g. 0.90)").pack(side=tk.LEFT, padx=5)
 
+        # Take-profit percentage gain
+        row += 1
+        ttk.Label(parent, text="Take-Profit Gain (%):").grid(row=row, column=0, sticky=tk.W, pady=3)
+        tp_pct_frame = ttk.Frame(parent)
+        tp_pct_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
+        self.take_profit_pct_entry = ttk.Entry(tp_pct_frame, width=10)
+        self.take_profit_pct_entry.pack(side=tk.LEFT)
+        ttk.Label(tp_pct_frame, text="(sell at +N% gain from entry, 0=off)").pack(side=tk.LEFT, padx=5)
+
         # Stop-loss percentage
         row += 1
         ttk.Label(parent, text="Stop-Loss (%):").grid(row=row, column=0, sticky=tk.W, pady=3)
@@ -5193,6 +5210,7 @@ class CopyTraderGUI:
         self.slippage_entry.insert(0, str(self.cfg.get("slippage_tolerance_bps", 100)))
         self.resume_threshold_entry.insert(0, str(self.cfg.get("resume_threshold_usdc", 5)))
         self.take_profit_entry.insert(0, str(self.cfg.get("take_profit_price", 0.99)))
+        self.take_profit_pct_entry.insert(0, str(self.cfg.get("take_profit_pct", 0)))
         self.stop_loss_entry.insert(0, str(self.cfg.get("stop_loss_pct", 50)))
         self.max_loss_entry.insert(0, str(self.cfg.get("max_loss_usdc", 0)))
         self.poll_entry.insert(0, str(self.cfg.get("poll_interval_seconds", 15)))
@@ -5237,6 +5255,12 @@ class CopyTraderGUI:
             val = float(self.take_profit_entry.get().strip())
             if 0 < val <= 1:
                 self.cfg["take_profit_price"] = val
+        except ValueError:
+            pass
+        try:
+            val = float(self.take_profit_pct_entry.get().strip())
+            if val >= 0:
+                self.cfg["take_profit_pct"] = val
         except ValueError:
             pass
         try:
@@ -5453,6 +5477,8 @@ def run_headless():
         cfg["clob_api_passphrase"] = os.environ["CLOB_API_PASSPHRASE"]
     if os.environ.get("TAKE_PROFIT_PRICE"):
         cfg["take_profit_price"] = float(os.environ["TAKE_PROFIT_PRICE"])
+    if os.environ.get("TAKE_PROFIT_PCT"):
+        cfg["take_profit_pct"] = float(os.environ["TAKE_PROFIT_PCT"])
     if os.environ.get("STOP_LOSS_PCT"):
         cfg["stop_loss_pct"] = float(os.environ["STOP_LOSS_PCT"])
     if os.environ.get("MAX_LOSS_USDC"):
@@ -5478,8 +5504,9 @@ def run_headless():
                 cfg.get("copy_percentage"), cfg.get("max_trade_usdc"),
                 cfg.get("resume_threshold_usdc", 5), cfg.get("dry_run", False),
                 cfg.get("auto_redeem_settled", True))
-    logger.info("Take-profit: %s | Stop-loss: %s%%",
-                cfg.get("take_profit_price", 0.99), cfg.get("stop_loss_pct", 50))
+    logger.info("Take-profit price: %s | Take-profit gain: %s%% | Stop-loss: %s%%",
+                cfg.get("take_profit_price", 0.99), cfg.get("take_profit_pct", 0),
+                cfg.get("stop_loss_pct", 50))
     logger.info("Proxy redeem: %s | Proxy withdraw: %s",
                 cfg.get("proxy_redeem", True), cfg.get("proxy_withdraw", True))
 
