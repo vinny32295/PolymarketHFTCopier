@@ -479,6 +479,13 @@ DEFAULT_CONFIG = {
     "max_price_deviation_pct": 3,
     "max_loss_usdc": 0,
     "trade_max_age_seconds": 20,
+    # --- Arbitrage mode (binary market spread capture) ---
+    "arb_enabled": False,
+    "arb_condition_ids": [],          # condition IDs of binary markets to monitor
+    "arb_min_edge_pct": 1.0,         # minimum spread % to trigger (e.g. 1.0 = 1%)
+    "arb_size_usdc": 10.0,           # USDC to spend per side of each arb trade
+    "arb_max_positions": 5,           # max simultaneous arb positions
+    "arb_poll_seconds": 2,            # how often to scan orderbooks
 }
 
 
@@ -1707,6 +1714,293 @@ class WebSocketMonitor(threading.Thread):
 
         # Wake the main loop to immediately poll CLOB API for full trade details
         self.wake_event.set()
+
+
+# ---------------------------------------------------------------------------
+# Arbitrage Monitor – binary market spread capture
+# ---------------------------------------------------------------------------
+
+class ArbitrageMonitor(threading.Thread):
+    """Scans binary Polymarket markets for risk-free spread opportunities.
+
+    A binary market has exactly two outcome tokens whose payouts sum to $1.
+    When the combined best-ask price of both outcomes drops below $1, buying
+    both sides locks in a guaranteed profit equal to ($1 - total_cost) per
+    share once the market resolves.
+
+    Example:  Up = $0.48, Down = $0.50  ->  cost = $0.98, profit = $0.02/share (2%).
+
+    The monitor:
+      1. Resolves each configured ``condition_id`` to its pair of token IDs
+         via the Gamma API.
+      2. Polls orderbooks for both tokens on a fast interval.
+      3. When the combined best-ask drops below the configured edge threshold,
+         places simultaneous FOK BUY orders for both sides.
+      4. Tracks active arb positions to avoid exceeding ``arb_max_positions``.
+    """
+
+    ARB_POSITIONS_FILE = "arb_positions.json"
+
+    def __init__(self, clob_client, cfg, logger=None):
+        super().__init__(daemon=True, name="ArbitrageMonitor")
+        self.clob_client = clob_client
+        self.cfg = cfg
+        self.logger = logger or logging.getLogger("CopyTrader")
+        self._stop_event = threading.Event()
+
+        # condition_id -> {"yes_token": str, "no_token": str, "question": str}
+        self._markets = {}
+        # condition_id -> {"yes_fill": {...}, "no_fill": {...}, "cost": float, "ts": str}
+        self._active_positions = {}
+        self._load_positions()
+
+    # -- persistence --------------------------------------------------------
+
+    def _load_positions(self):
+        try:
+            with open(self.ARB_POSITIONS_FILE, "r") as fh:
+                self._active_positions = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            self._active_positions = {}
+
+    def _save_positions(self):
+        try:
+            tmp = self.ARB_POSITIONS_FILE + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(self._active_positions, fh, indent=2, default=str)
+            os.replace(tmp, self.ARB_POSITIONS_FILE)
+        except Exception as exc:
+            self.logger.debug("Could not save arb positions: %s", exc)
+
+    # -- market resolution --------------------------------------------------
+
+    def _resolve_markets(self):
+        """Resolve each condition_id to its pair of outcome token IDs."""
+        condition_ids = self.cfg.get("arb_condition_ids", [])
+        if not condition_ids:
+            self.logger.warning("Arbitrage enabled but no condition IDs configured")
+            return
+
+        for cid in condition_ids:
+            if cid in self._markets:
+                continue  # already resolved
+            try:
+                market = self.clob_client.get_market_info(condition_id=cid)
+                if not market:
+                    self.logger.warning("Arb: could not fetch market for condition %s", cid[:20])
+                    continue
+
+                tokens = market.get("tokens") or []
+                if len(tokens) < 2:
+                    self.logger.warning(
+                        "Arb: market %s has %d tokens (need 2) — skipping",
+                        cid[:20], len(tokens),
+                    )
+                    continue
+
+                # Map outcomes.  Polymarket uses "Yes"/"No" or custom labels.
+                # We just need the two token IDs — call them "yes" and "no"
+                # regardless of the actual outcome name.
+                t0 = tokens[0]
+                t1 = tokens[1]
+                tid0 = t0.get("token_id") or t0.get("tokenId") or ""
+                tid1 = t1.get("token_id") or t1.get("tokenId") or ""
+                label0 = t0.get("outcome", "A")
+                label1 = t1.get("outcome", "B")
+                question = market.get("question", cid[:30])
+
+                self._markets[cid] = {
+                    "yes_token": tid0,
+                    "no_token": tid1,
+                    "yes_label": label0,
+                    "no_label": label1,
+                    "question": question,
+                }
+                self.logger.info(
+                    "Arb: resolved market '%s' — %s=%s... / %s=%s...",
+                    question[:50], label0, tid0[:12], label1, tid1[:12],
+                )
+            except Exception as exc:
+                self.logger.warning("Arb: failed to resolve condition %s: %s", cid[:20], exc)
+
+    # -- core loop ----------------------------------------------------------
+
+    def run(self):
+        self.logger.info("Arbitrage monitor starting — %d market(s) configured",
+                         len(self.cfg.get("arb_condition_ids", [])))
+
+        self._resolve_markets()
+
+        if not self._markets:
+            self.logger.error("Arb: no markets could be resolved — monitor stopping")
+            return
+
+        poll_interval = max(self.cfg.get("arb_poll_seconds", 2), 0.5)
+
+        while not self._stop_event.is_set():
+            try:
+                self._scan_cycle()
+            except Exception as exc:
+                self.logger.error("Arb scan error: %s", exc, exc_info=True)
+            self._stop_event.wait(timeout=poll_interval)
+
+        self.logger.info("Arbitrage monitor stopped")
+
+    def stop(self):
+        self._stop_event.set()
+
+    # -- scan & execute -----------------------------------------------------
+
+    def _scan_cycle(self):
+        """One pass: check every tracked market for an arb opportunity."""
+        min_edge_pct = self.cfg.get("arb_min_edge_pct", 1.0)
+        arb_size = self.cfg.get("arb_size_usdc", 10.0)
+        max_positions = self.cfg.get("arb_max_positions", 5)
+        dry_run = self.cfg.get("dry_run", False)
+
+        for cid, mkt in self._markets.items():
+            # Respect max positions
+            if len(self._active_positions) >= max_positions:
+                break
+
+            # Skip if we already have an active arb on this market
+            if cid in self._active_positions:
+                continue
+
+            yes_token = mkt["yes_token"]
+            no_token = mkt["no_token"]
+
+            # Fetch orderbooks for both sides
+            try:
+                book_yes = self.clob_client.get_order_book(yes_token)
+                book_no = self.clob_client.get_order_book(no_token)
+            except Exception as exc:
+                self.logger.debug("Arb: orderbook fetch failed for %s: %s", cid[:16], exc)
+                continue
+
+            if not book_yes or not book_no:
+                continue
+
+            asks_yes = book_yes.get("asks") or []
+            asks_no = book_no.get("asks") or []
+
+            if not asks_yes or not asks_no:
+                continue
+
+            best_ask_yes = float(asks_yes[0].get("price", 0))
+            best_ask_no = float(asks_no[0].get("price", 0))
+            avail_yes = float(asks_yes[0].get("size", 0))
+            avail_no = float(asks_no[0].get("size", 0))
+
+            if best_ask_yes <= 0 or best_ask_no <= 0:
+                continue
+
+            combined = best_ask_yes + best_ask_no
+            edge = 1.0 - combined  # positive = profitable
+            edge_pct = edge * 100.0
+
+            if edge_pct < min_edge_pct:
+                # Log occasionally for visibility (every ~30 seconds at 2s poll)
+                self.logger.debug(
+                    "Arb: %s — %s=$%.3f + %s=$%.3f = $%.4f (edge %.2f%% < %.2f%%)",
+                    mkt["question"][:40],
+                    mkt["yes_label"], best_ask_yes,
+                    mkt["no_label"], best_ask_no,
+                    combined, edge_pct, min_edge_pct,
+                )
+                continue
+
+            # --- OPPORTUNITY FOUND ---
+            # Calculate how many shares we can buy (limited by available
+            # liquidity on both sides and our configured size).
+            max_shares_by_budget = arb_size / max(best_ask_yes, best_ask_no)
+            max_shares = min(max_shares_by_budget, avail_yes, avail_no)
+            usdc_yes = round(max_shares * best_ask_yes, 2)
+            usdc_no = round(max_shares * best_ask_no, 2)
+            total_cost = usdc_yes + usdc_no
+            locked_profit = round(max_shares - total_cost, 4)
+
+            self.logger.info(
+                "ARB OPPORTUNITY: %s — %s=$%.3f + %s=$%.3f = $%.4f "
+                "(edge %.2f%%, ~%.0f shares, cost $%.2f, locked profit $%.4f)",
+                mkt["question"][:50],
+                mkt["yes_label"], best_ask_yes,
+                mkt["no_label"], best_ask_no,
+                combined, edge_pct, max_shares, total_cost, locked_profit,
+            )
+
+            if dry_run:
+                self.logger.info("ARB DRY RUN — would buy both sides (skipping)")
+                continue
+
+            # Execute both legs
+            yes_result = self._place_arb_leg(
+                yes_token, best_ask_yes, usdc_yes, mkt["yes_label"],
+            )
+            no_result = self._place_arb_leg(
+                no_token, best_ask_no, usdc_no, mkt["no_label"],
+            )
+
+            if yes_result and no_result:
+                self._active_positions[cid] = {
+                    "question": mkt["question"],
+                    "yes_fill": yes_result,
+                    "no_fill": no_result,
+                    "total_cost": total_cost,
+                    "locked_profit": locked_profit,
+                    "edge_pct": round(edge_pct, 4),
+                    "ts": datetime.now().isoformat(),
+                }
+                self._save_positions()
+                self.logger.info(
+                    "ARB EXECUTED: %s — cost $%.2f, locked profit $%.4f (%.2f%%)",
+                    mkt["question"][:50], total_cost, locked_profit, edge_pct,
+                )
+            else:
+                self.logger.warning(
+                    "ARB PARTIAL FILL: %s — yes=%s, no=%s (one side may have failed)",
+                    mkt["question"][:40],
+                    "OK" if yes_result else "FAILED",
+                    "OK" if no_result else "FAILED",
+                )
+
+    def _place_arb_leg(self, token_id, price, size_usdc, label):
+        """Place a single FOK buy order for one side of the arb."""
+        try:
+            result = self.clob_client.place_order(
+                token_id=token_id,
+                side="BUY",
+                size_usdc=size_usdc,
+                price=price,
+                use_fok=True,
+            )
+            if result:
+                self.logger.info(
+                    "Arb leg filled: %s @ $%.3f for $%.2f — %s",
+                    label, price, size_usdc, str(result)[:100],
+                )
+            return result
+        except Exception as exc:
+            self.logger.error("Arb leg FAILED (%s): %s", label, exc)
+            return None
+
+    # -- public helpers (used by GUI / dashboard) ---------------------------
+
+    @property
+    def active_position_count(self):
+        return len(self._active_positions)
+
+    def get_status_summary(self):
+        """Return a one-line status string for the dashboard."""
+        n_markets = len(self._markets)
+        n_pos = len(self._active_positions)
+        total_locked = sum(
+            p.get("locked_profit", 0) for p in self._active_positions.values()
+        )
+        return (
+            f"Markets: {n_markets} | Active arbs: {n_pos} | "
+            f"Locked profit: ${total_locked:,.4f}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -4722,6 +5016,7 @@ class CopyTraderBot:
         self.on_chain_monitor = None
         self._ws_monitor = None
         self._ws_wake = threading.Event()
+        self._arb_monitor = None
         self.executor = None
         self.clob_client = None
 
@@ -4876,6 +5171,11 @@ class CopyTraderBot:
         if self.cfg.get("ws_rpc_url"):
             ws_status = "enabled" if HAS_WS_CLIENT else "no websocket-client"
         self.logger.info("  WebSocket detection:    %s", ws_status)
+        arb_status = "disabled"
+        if self.cfg.get("arb_enabled"):
+            n_arb = len(self.cfg.get("arb_condition_ids", []))
+            arb_status = f"enabled ({n_arb} market(s), min edge {self.cfg.get('arb_min_edge_pct', 1.0)}%)"
+        self.logger.info("  Arbitrage mode:         %s", arb_status)
         self.logger.info("=" * 60)
 
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
@@ -4888,6 +5188,9 @@ class CopyTraderBot:
         # Stop WebSocket monitor if running
         if self._ws_monitor:
             self._ws_monitor.stop()
+        # Stop Arbitrage monitor if running
+        if self._arb_monitor:
+            self._arb_monitor.stop()
         # Wake the main loop so it exits the Event.wait() immediately
         if hasattr(self, '_ws_wake'):
             self._ws_wake.set()
@@ -4930,6 +5233,28 @@ class CopyTraderBot:
                     "Install with: pip install websocket-client"
                 )
 
+        # ---- Start Arbitrage Monitor (independent of copy trading) ----
+        if self.cfg.get("arb_enabled") and self.clob_client:
+            arb_cids = self.cfg.get("arb_condition_ids", [])
+            if arb_cids:
+                self._arb_monitor = ArbitrageMonitor(
+                    self.clob_client, self.cfg, self.logger,
+                )
+                self._arb_monitor.start()
+                self.logger.info(
+                    "Arbitrage monitor enabled — scanning %d market(s), "
+                    "min edge %.1f%%, $%.0f/side, poll every %ds",
+                    len(arb_cids),
+                    self.cfg.get("arb_min_edge_pct", 1.0),
+                    self.cfg.get("arb_size_usdc", 10.0),
+                    self.cfg.get("arb_poll_seconds", 2),
+                )
+            else:
+                self.logger.warning(
+                    "arb_enabled=True but no arb_condition_ids configured"
+                )
+
+        if web3_ok:
             # ---- Backfill market names for legacy positions ----
             if self.executor:
                 try:
@@ -5486,12 +5811,17 @@ class CopyTraderGUI:
         notebook.add(addr_frame, text="Watched Addresses")
         self._build_address_tab(addr_frame)
 
-        # Tab 4: Trade History
+        # Tab 4: Arbitrage
+        arb_frame = ttk.Frame(notebook, padding=10)
+        notebook.add(arb_frame, text="Arbitrage")
+        self._build_arb_tab(arb_frame)
+
+        # Tab 5: Trade History
         history_frame = ttk.Frame(notebook, padding=10)
         notebook.add(history_frame, text="Trade History")
         self._build_history_tab(history_frame)
 
-        # Tab 5: Log / Status
+        # Tab 6: Log / Status
         log_frame = ttk.Frame(notebook, padding=10)
         notebook.add(log_frame, text="Log")
         self._build_log_tab(log_frame)
@@ -6010,6 +6340,130 @@ class CopyTraderGUI:
             side=tk.LEFT, padx=3
         )
 
+    # ---- Arbitrage tab ----
+
+    def _build_arb_tab(self, parent):
+        # Enable checkbox
+        self.arb_enabled_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            parent, text="Enable Arbitrage Mode", variable=self.arb_enabled_var,
+        ).pack(anchor=tk.W, pady=(0, 5))
+
+        ttk.Label(
+            parent,
+            text="Buy both sides of a binary market when the combined ask "
+                 "price drops below $1, locking in guaranteed profit.",
+            wraplength=600,
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        # Settings row
+        settings_frame = ttk.LabelFrame(parent, text="Arbitrage Settings", padding=8)
+        settings_frame.pack(fill=tk.X, pady=(0, 8))
+
+        row = 0
+        ttk.Label(settings_frame, text="Min Edge (%):").grid(
+            row=row, column=0, sticky=tk.W, pady=3,
+        )
+        edge_frame = ttk.Frame(settings_frame)
+        edge_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
+        self.arb_min_edge_entry = ttk.Entry(edge_frame, width=8)
+        self.arb_min_edge_entry.pack(side=tk.LEFT)
+        ttk.Label(
+            edge_frame,
+            text="(e.g. 1.0 = only trade when spread >= 1%)",
+        ).pack(side=tk.LEFT, padx=5)
+
+        row += 1
+        ttk.Label(settings_frame, text="Size per Side (USDC):").grid(
+            row=row, column=0, sticky=tk.W, pady=3,
+        )
+        size_frame = ttk.Frame(settings_frame)
+        size_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
+        self.arb_size_entry = ttk.Entry(size_frame, width=8)
+        self.arb_size_entry.pack(side=tk.LEFT)
+        ttk.Label(
+            size_frame, text="(USDC to spend on each side)",
+        ).pack(side=tk.LEFT, padx=5)
+
+        row += 1
+        ttk.Label(settings_frame, text="Max Positions:").grid(
+            row=row, column=0, sticky=tk.W, pady=3,
+        )
+        self.arb_max_pos_entry = ttk.Entry(settings_frame, width=8)
+        self.arb_max_pos_entry.grid(row=row, column=1, sticky=tk.W, pady=3)
+
+        row += 1
+        ttk.Label(settings_frame, text="Poll Interval (seconds):").grid(
+            row=row, column=0, sticky=tk.W, pady=3,
+        )
+        self.arb_poll_entry = ttk.Entry(settings_frame, width=8)
+        self.arb_poll_entry.grid(row=row, column=1, sticky=tk.W, pady=3)
+
+        # Market condition IDs list
+        markets_frame = ttk.LabelFrame(parent, text="Markets to Monitor (Condition IDs)", padding=8)
+        markets_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
+
+        ttk.Label(
+            markets_frame,
+            text="Add the condition_id of each binary market to scan. "
+                 "Find this on the Polymarket market page URL or API.",
+            wraplength=600,
+        ).pack(anchor=tk.W, pady=(0, 5))
+
+        list_frame = ttk.Frame(markets_frame)
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=3)
+
+        self.arb_market_listbox = tk.Listbox(
+            list_frame, height=6, font=("Courier", 9),
+        )
+        arb_scroll = ttk.Scrollbar(
+            list_frame, orient=tk.VERTICAL, command=self.arb_market_listbox.yview,
+        )
+        self.arb_market_listbox.configure(yscrollcommand=arb_scroll.set)
+        self.arb_market_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        arb_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        entry_frame = ttk.Frame(markets_frame)
+        entry_frame.pack(fill=tk.X, pady=3)
+        ttk.Label(entry_frame, text="Condition ID:").pack(side=tk.LEFT)
+        self.arb_new_cid_entry = ttk.Entry(
+            entry_frame, width=50, font=("Courier", 9),
+        )
+        self.arb_new_cid_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+
+        btn_frame = ttk.Frame(markets_frame)
+        btn_frame.pack(fill=tk.X)
+        ttk.Button(
+            btn_frame, text="Add", command=self._arb_add_market,
+        ).pack(side=tk.LEFT, padx=3)
+        ttk.Button(
+            btn_frame, text="Remove Selected", command=self._arb_remove_market,
+        ).pack(side=tk.LEFT, padx=3)
+        ttk.Button(
+            btn_frame, text="Clear All", command=self._arb_clear_markets,
+        ).pack(side=tk.LEFT, padx=3)
+
+        # Status label (updated while running)
+        self.arb_status_var = tk.StringVar(value="Arbitrage: idle")
+        ttk.Label(
+            parent, textvariable=self.arb_status_var,
+            font=("Courier", 10, "bold"),
+        ).pack(anchor=tk.W, pady=(5, 0))
+
+    def _arb_add_market(self):
+        cid = self.arb_new_cid_entry.get().strip()
+        if cid and cid not in list(self.arb_market_listbox.get(0, tk.END)):
+            self.arb_market_listbox.insert(tk.END, cid)
+            self.arb_new_cid_entry.delete(0, tk.END)
+
+    def _arb_remove_market(self):
+        sel = self.arb_market_listbox.curselection()
+        if sel:
+            self.arb_market_listbox.delete(sel[0])
+
+    def _arb_clear_markets(self):
+        self.arb_market_listbox.delete(0, tk.END)
+
     def _build_log_tab(self, parent):
         self.log_area = scrolledtext.ScrolledText(
             parent, state="disabled", wrap=tk.WORD, font=("Courier", 9), height=25
@@ -6218,6 +6672,14 @@ class CopyTraderGUI:
             self.pk_entry.insert(0, pk)
         for addr in self.cfg.get("watched_addresses", []):
             self.addr_listbox.insert(tk.END, addr)
+        # Arbitrage fields
+        self.arb_enabled_var.set(self.cfg.get("arb_enabled", False))
+        self.arb_min_edge_entry.insert(0, str(self.cfg.get("arb_min_edge_pct", 1.0)))
+        self.arb_size_entry.insert(0, str(self.cfg.get("arb_size_usdc", 10.0)))
+        self.arb_max_pos_entry.insert(0, str(self.cfg.get("arb_max_positions", 5)))
+        self.arb_poll_entry.insert(0, str(self.cfg.get("arb_poll_seconds", 2)))
+        for cid in self.cfg.get("arb_condition_ids", []):
+            self.arb_market_listbox.insert(tk.END, cid)
 
     def _read_fields_to_config(self):
         self.cfg["rpc_url"] = self.rpc_entry.get().strip()
@@ -6277,6 +6739,33 @@ class CopyTraderGUI:
         except ValueError:
             pass
         self.cfg["watched_addresses"] = list(self.addr_listbox.get(0, tk.END))
+        # Arbitrage fields
+        self.cfg["arb_enabled"] = self.arb_enabled_var.get()
+        self.cfg["arb_condition_ids"] = list(self.arb_market_listbox.get(0, tk.END))
+        try:
+            val = float(self.arb_min_edge_entry.get().strip())
+            if val > 0:
+                self.cfg["arb_min_edge_pct"] = val
+        except ValueError:
+            pass
+        try:
+            val = float(self.arb_size_entry.get().strip())
+            if val > 0:
+                self.cfg["arb_size_usdc"] = val
+        except ValueError:
+            pass
+        try:
+            val = int(self.arb_max_pos_entry.get().strip())
+            if val >= 1:
+                self.cfg["arb_max_positions"] = val
+        except ValueError:
+            pass
+        try:
+            val = int(self.arb_poll_entry.get().strip())
+            if val >= 1:
+                self.cfg["arb_poll_seconds"] = val
+        except ValueError:
+            pass
 
     # ---- Button handlers ----
 
@@ -6353,8 +6842,13 @@ class CopyTraderGUI:
         if pk:
             save_private_key(pk, self.cfg)
 
-        if not self.cfg.get("watched_addresses"):
-            messagebox.showwarning("No Addresses", "Add at least one trader address to watch.")
+        arb_mode = self.cfg.get("arb_enabled") and self.cfg.get("arb_condition_ids")
+        if not self.cfg.get("watched_addresses") and not arb_mode:
+            messagebox.showwarning(
+                "No Addresses",
+                "Add at least one trader address to watch, "
+                "or enable arbitrage mode with market condition IDs.",
+            )
             return
         if not self.cfg.get("rpc_url") and not self.cfg.get("ws_rpc_url"):
             if not self.cfg.get("use_clob_api"):
@@ -6487,9 +6981,29 @@ def run_headless():
         cfg["proxy_withdraw"] = os.environ["PROXY_WITHDRAW"].lower() in ("1", "true", "yes")
     if os.environ.get("PROXY_ADDRESS"):
         cfg["proxy_address"] = os.environ["PROXY_ADDRESS"].strip()
+    # Arbitrage env vars
+    if os.environ.get("ARB_ENABLED"):
+        cfg["arb_enabled"] = os.environ["ARB_ENABLED"].lower() in ("1", "true", "yes")
+    if os.environ.get("ARB_CONDITION_IDS"):
+        cfg["arb_condition_ids"] = [
+            c.strip() for c in os.environ["ARB_CONDITION_IDS"].split(",") if c.strip()
+        ]
+    if os.environ.get("ARB_MIN_EDGE_PCT"):
+        cfg["arb_min_edge_pct"] = float(os.environ["ARB_MIN_EDGE_PCT"])
+    if os.environ.get("ARB_SIZE_USDC"):
+        cfg["arb_size_usdc"] = float(os.environ["ARB_SIZE_USDC"])
+    if os.environ.get("ARB_MAX_POSITIONS"):
+        cfg["arb_max_positions"] = int(os.environ["ARB_MAX_POSITIONS"])
+    if os.environ.get("ARB_POLL_SECONDS"):
+        cfg["arb_poll_seconds"] = int(os.environ["ARB_POLL_SECONDS"])
 
-    if not cfg.get("watched_addresses"):
-        logger.error("No watched addresses configured. Set the WATCHED_ADDRESSES env var (comma-separated).")
+    arb_mode = cfg.get("arb_enabled") and cfg.get("arb_condition_ids")
+    if not cfg.get("watched_addresses") and not arb_mode:
+        logger.error(
+            "No watched addresses or arb markets configured. "
+            "Set WATCHED_ADDRESSES (comma-separated) or "
+            "ARB_ENABLED=1 + ARB_CONDITION_IDS."
+        )
         sys.exit(1)
 
     logger.info("=== Polymarket Copy Trader — Headless Mode ===")
@@ -6503,6 +7017,11 @@ def run_headless():
                 cfg.get("stop_loss_pct", 50))
     logger.info("Proxy redeem: %s | Proxy withdraw: %s",
                 cfg.get("proxy_redeem", True), cfg.get("proxy_withdraw", True))
+    if cfg.get("arb_enabled"):
+        logger.info("Arbitrage: ENABLED | Markets: %d | Min edge: %s%% | Size: $%s/side",
+                    len(cfg.get("arb_condition_ids", [])),
+                    cfg.get("arb_min_edge_pct", 1.0),
+                    cfg.get("arb_size_usdc", 10.0))
 
     bot = CopyTraderBot(cfg, logger)
 
