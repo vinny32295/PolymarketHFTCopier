@@ -4091,7 +4091,7 @@ class MartingaleBot(threading.Thread):
         if self.notify_callback:
             self.notify_callback(
                 f"{self.strategy_name} BET ${actual_cost:.2f} "
-                f"@ ${fill_price:.4f} (ask ${ask_price:.4f}){slip_tag} "
+                f"@ ${fill_price:.4f} (ask ${ask_price:.4f}) "
                 f"| streak: {self.consecutive_losses}"
             )
         return True
