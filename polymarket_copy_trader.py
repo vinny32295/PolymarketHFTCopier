@@ -2861,8 +2861,41 @@ class MartingaleBot(threading.Thread):
                 self.current_bet, self.consecutive_losses,
                 self.session_pnl, self.direction, self._last_window_ts,
             )
+
+            # Discard stale active bets from a previous session.
+            # If the bet's window ended more than 2 windows ago, it is
+            # from an old run that was stopped before resolution.  Do NOT
+            # treat it as a timeout loss — just drop it.
+            if self._active_bet:
+                window = int(self.cfg.get("martingale_window", 300))
+                now = int(time.time())
+                window_end = int(self._active_bet.get("window_end", 0))
+                if window_end and now > window_end + window * 2:
+                    self.logger.warning(
+                        "MARTINGALE: discarding stale active bet from "
+                        "window ending %d (%ds ago) — will NOT count as loss",
+                        window_end, now - window_end,
+                    )
+                    self._active_bet = None
+                    self._save_state()
+
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             pass
+
+    def reset_state(self):
+        """Wipe persisted state and reset to defaults."""
+        self.current_bet = self.start_bet
+        self.consecutive_losses = 0
+        self.session_pnl = 0.0
+        self._active_bet = None
+        self._last_window_ts = 0
+        try:
+            os.remove(self.STATE_FILE)
+        except OSError:
+            pass
+        self.logger.info(
+            "MARTINGALE: state reset — bet=$%.2f, streak=0", self.start_bet,
+        )
 
     # -- slug / timing helpers ----------------------------------------------
 
@@ -8266,12 +8299,20 @@ class CopyTraderGUI:
         self.mart_max_entry_entry = ttk.Entry(settings_frame, width=10)
         self.mart_max_entry_entry.grid(row=row, column=1, padx=2, pady=2)
 
-        # Status label
+        # Status label + reset button
+        status_frame = ttk.Frame(parent)
+        status_frame.pack(fill=tk.X, pady=(10, 0))
+
         self.mart_status_var = tk.StringVar(value="Martingale: idle")
         ttk.Label(
-            parent, textvariable=self.mart_status_var,
+            status_frame, textvariable=self.mart_status_var,
             font=("Courier", 10, "bold"),
-        ).pack(anchor=tk.W, pady=(10, 0))
+        ).pack(side=tk.LEFT)
+
+        ttk.Button(
+            status_frame, text="Reset State",
+            command=self._reset_martingale_state,
+        ).pack(side=tk.RIGHT, padx=5)
 
     def _build_log_tab(self, parent):
         self.log_area = scrolledtext.ScrolledText(
@@ -8667,6 +8708,19 @@ class CopyTraderGUI:
 
     # ---- Button handlers ----
 
+    def _reset_martingale_state(self):
+        """Delete martingale_state.json and reset in-memory state."""
+        try:
+            os.remove(MartingaleBot.STATE_FILE)
+        except OSError:
+            pass
+        if hasattr(self, "bot") and self.bot and hasattr(self.bot, "_martingale"):
+            mg = self.bot._martingale
+            if mg:
+                mg.reset_state()
+        self.mart_status_var.set("Martingale: state reset")
+        self._append_log("[Martingale] State reset — next run starts fresh\n")
+
     def _toggle_pk(self):
         current = self.pk_entry.cget("show")
         self.pk_entry.configure(show="" if current == "*" else "*")
@@ -8935,6 +8989,14 @@ def run_headless():
         cfg["martingale_price_max"] = float(os.environ["MARTINGALE_PRICE_MAX"])
     if os.environ.get("MARTINGALE_MAX_ENTRY_SECONDS"):
         cfg["martingale_max_entry_seconds"] = int(os.environ["MARTINGALE_MAX_ENTRY_SECONDS"])
+
+    # Delete stale state file for a clean start
+    if os.environ.get("MARTINGALE_RESET", "").strip().lower() in ("1", "true", "yes"):
+        try:
+            os.remove(MartingaleBot.STATE_FILE)
+            logger.info("MARTINGALE_RESET: deleted %s for fresh start", MartingaleBot.STATE_FILE)
+        except OSError:
+            pass
 
     arb_mode = cfg.get("arb_enabled") and (
         cfg.get("arb_condition_ids")

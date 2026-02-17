@@ -3289,6 +3289,62 @@ class TestMartingaleBot(unittest.TestCase):
         result = mb._cycle()
         self.assertTrue(result)  # waiting for window to end
 
+    # -- stale bet / reset --
+
+    def test_load_state_discards_stale_active_bet(self):
+        """A stale active_bet from a previous session is discarded."""
+        mb = self._make_bot()
+        window = 300
+        stale_window_end = int(time.time()) - window * 3  # 3 windows ago
+        state = {
+            "current_bet": 20.0,
+            "consecutive_losses": 2,
+            "session_pnl": -15.0,
+            "direction": "Up",
+            "active_bet": {
+                "slug": "btc-updown-5m-old",
+                "condition_id": "cid_old",
+                "direction": "Up",
+                "window_end": stale_window_end,
+                "bet_size": 10.0,
+                "cost": 10.0,
+                "shares": 20.0,
+                "token_id": "tok",
+                "question": "old",
+                "ts": "2026-01-01",
+            },
+            "last_window_ts": stale_window_end - window,
+        }
+        with open(bot.MartingaleBot.STATE_FILE, "w") as fh:
+            json.dump(state, fh)
+        try:
+            mb._load_state()
+            # Stale bet should be discarded, NOT treated as a loss
+            self.assertIsNone(mb._active_bet)
+            # But the rest of the state (streak, bet size) should be preserved
+            self.assertEqual(mb.current_bet, 20.0)
+            self.assertEqual(mb.consecutive_losses, 2)
+        finally:
+            try:
+                os.remove(bot.MartingaleBot.STATE_FILE)
+            except OSError:
+                pass
+
+    def test_reset_state_clears_everything(self):
+        """reset_state wipes bet/streak/pnl back to defaults."""
+        mb = self._make_bot()
+        mb.current_bet = 40.0
+        mb.consecutive_losses = 4
+        mb.session_pnl = -75.0
+        mb._active_bet = {"dummy": True}
+        mb._last_window_ts = 999999
+        mb.reset_state()
+        self.assertEqual(mb.current_bet, mb.start_bet)
+        self.assertEqual(mb.consecutive_losses, 0)
+        self.assertEqual(mb.session_pnl, 0.0)
+        self.assertIsNone(mb._active_bet)
+        self.assertEqual(mb._last_window_ts, 0)
+
     # -- win/loss handling --
 
     def test_handle_win_resets_bet(self):
