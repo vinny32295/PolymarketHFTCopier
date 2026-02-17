@@ -4745,9 +4745,6 @@ class MartingaleBot(threading.Thread):
         self._save_state()
 
     def _log_bet(self, bet, won, profit):
-        if not self.log_trade_callback:
-            return
-
         fill_price = bet.get("fill_price", 0)
         ask_price = bet.get("price", 0)
         slippage_vs_ask = bet.get("slippage_vs_ask", 0)
@@ -4781,10 +4778,19 @@ class MartingaleBot(threading.Thread):
                 "session_pnl": round(self.session_pnl, 6),
             },
         }
-        try:
-            self.log_trade_callback(record)
-        except Exception as exc:
-            self.logger.debug("Failed to log martingale trade: %s", exc)
+
+        if self.log_trade_callback:
+            try:
+                self.log_trade_callback(record)
+            except Exception as exc:
+                self.logger.warning("Failed to log martingale trade to history: %s", exc)
+        else:
+            self.logger.warning(
+                "MARTINGALE [%s]: log_trade_callback not set — trade record "
+                "will not appear in trade_history.json (persisting to "
+                "martingale_history.json only)",
+                self.strategy_name,
+            )
 
         # --- Persist to dedicated martingale history & summary ---
         self._persist_martingale_record(record)
@@ -4921,7 +4927,7 @@ class MartingaleBot(threading.Thread):
                     json.dump(summary, fh, indent=2)
                 os.replace(tmp_sf, MARTINGALE_SUMMARY_FILE)
         except Exception as exc:
-            self.logger.debug("Could not persist martingale record: %s", exc)
+            self.logger.warning("Could not persist martingale record: %s", exc)
 
     # -- main loop ----------------------------------------------------------
 
@@ -8286,7 +8292,7 @@ class CopyTraderBot:
                     pass
 
         except Exception as exc:
-            self.logger.debug("Could not append trade history: %s", exc)
+            self.logger.warning("Could not append trade history: %s", exc)
 
     def _save_session_trades(self):
         """Persist session trades to disk immediately (crash-safe).
