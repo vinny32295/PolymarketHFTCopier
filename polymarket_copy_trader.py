@@ -4042,6 +4042,16 @@ class MartingaleBot(threading.Thread):
         actual_shares = float(result.get("takingAmount", 0)) or target_shares
         actual_cost = float(result.get("makingAmount", 0)) or self.current_bet
 
+        # -- Slippage calculation --
+        # fill_price: what we actually paid per share
+        # ask_price:  best ask at order time (what we expected to pay)
+        # fair_price: 0.50 for a 50/50 binary — deviation from this is the
+        #             theoretical edge we're giving up
+        fill_price = round(actual_cost / actual_shares, 6) if actual_shares > 0 else ask_price
+        slippage_vs_ask = round(fill_price - ask_price, 6)          # execution slippage
+        slippage_vs_fair = round(fill_price - 0.50, 6)              # edge slippage (cost above fair)
+        slippage_usdc = round(slippage_vs_ask * actual_shares, 6)   # total $ execution slippage
+
         opposite_token = (
             market["down_token"] if direction == "Up"
             else market["up_token"]
@@ -4054,8 +4064,12 @@ class MartingaleBot(threading.Thread):
             "direction": direction,
             "bet_size": self.current_bet,
             "price": ask_price,
+            "fill_price": fill_price,
             "shares": actual_shares,
             "cost": actual_cost,
+            "slippage_vs_ask": slippage_vs_ask,
+            "slippage_vs_fair": slippage_vs_fair,
+            "slippage_usdc": slippage_usdc,
             "question": market["question"],
             "window_end": self._get_window_end(),
             "ts": datetime.now().isoformat(),
@@ -4065,15 +4079,20 @@ class MartingaleBot(threading.Thread):
         self._windows_attempted += 1
         self._save_state()
 
+        slip_tag = ""
+        if abs(slippage_vs_ask) >= 0.0001:
+            slip_tag = f" | slip ${slippage_usdc:+.4f} ({slippage_vs_ask:+.4f}/sh)"
         self.logger.info(
-            "MARTINGALE BET [%s]: %s $%.2f @ $%.4f (%.1f shares) — streak: %d",
-            self.strategy_name, direction, actual_cost, ask_price, actual_shares,
-            self.consecutive_losses,
+            "MARTINGALE BET [%s]: %s $%.2f @ ask $%.4f fill $%.4f "
+            "(%.1f shares) — streak: %d%s",
+            self.strategy_name, direction, actual_cost, ask_price,
+            fill_price, actual_shares, self.consecutive_losses, slip_tag,
         )
         if self.notify_callback:
             self.notify_callback(
                 f"{self.strategy_name} BET ${actual_cost:.2f} "
-                f"@ ${ask_price:.4f} | streak: {self.consecutive_losses}"
+                f"@ ${fill_price:.4f} (ask ${ask_price:.4f}){slip_tag} "
+                f"| streak: {self.consecutive_losses}"
             )
         return True
 
@@ -4081,11 +4100,22 @@ class MartingaleBot(threading.Thread):
         profit = bet["shares"] - bet["cost"]
         self.session_pnl += profit
 
+        # Slippage impact: how much profit was lost to paying above fair ($0.50)
+        slip_fair = bet.get("slippage_vs_fair", 0)
+        slip_usdc = bet.get("slippage_usdc", 0)
+        slip_info = ""
+        if abs(slip_fair) >= 0.0001:
+            lost_to_slip = slip_fair * bet["shares"]
+            slip_info = (
+                f" | slippage: fill ${bet.get('fill_price', 0):.4f} vs "
+                f"fair $0.50 = ${lost_to_slip:+.4f} impact"
+            )
+
         self.logger.info(
             "MARTINGALE WIN: %s +$%.4f (shares=%.1f, cost=$%.2f) — "
-            "resetting to $%.2f | session P&L: $%.4f",
+            "resetting to $%.2f | session P&L: $%.4f%s",
             bet["direction"], profit, bet["shares"], bet["cost"],
-            self.start_bet, self.session_pnl,
+            self.start_bet, self.session_pnl, slip_info,
         )
 
         self._log_bet(bet, won=True, profit=profit)
@@ -4131,12 +4161,17 @@ class MartingaleBot(threading.Thread):
                 "MARTINGALE [%s]: bet capped at max $%.2f", self.strategy_name, max_bet,
             )
 
+        slip_usdc = bet.get("slippage_usdc", 0)
+        slip_info = ""
+        if abs(slip_usdc) >= 0.0001:
+            slip_info = f" | exec slippage: ${slip_usdc:+.4f}"
+
         self.logger.info(
-            "MARTINGALE LOSS: %s -$%.2f — next bet $%.2f "
-            "(start $%.2f × 2^%d), streak: %d | session P&L: $%.4f",
-            bet["direction"], loss, self.current_bet,
-            self.start_bet, self.consecutive_losses,
-            self.consecutive_losses, self.session_pnl,
+            "MARTINGALE LOSS: %s -$%.2f (fill $%.4f) — next bet $%.2f "
+            "(start $%.2f × 2^%d), streak: %d | session P&L: $%.4f%s",
+            bet["direction"], loss, bet.get("fill_price", 0),
+            self.current_bet, self.start_bet, self.consecutive_losses,
+            self.consecutive_losses, self.session_pnl, slip_info,
         )
 
         self._log_bet(bet, won=False, profit=-loss)
@@ -4152,6 +4187,13 @@ class MartingaleBot(threading.Thread):
     def _log_bet(self, bet, won, profit):
         if not self.log_trade_callback:
             return
+
+        fill_price = bet.get("fill_price", 0)
+        ask_price = bet.get("price", 0)
+        slippage_vs_ask = bet.get("slippage_vs_ask", 0)
+        slippage_vs_fair = bet.get("slippage_vs_fair", 0)
+        slippage_usdc = bet.get("slippage_usdc", 0)
+
         record = {
             "closed_at": datetime.now().isoformat(),
             "token_id": bet["token_id"],
@@ -4164,6 +4206,13 @@ class MartingaleBot(threading.Thread):
             "pnl_usdc": round(profit, 6),
             "outcome": "won" if won else "lost",
             "reason": "martingale",
+            "slippage": {
+                "ask_price": ask_price,
+                "fill_price": fill_price,
+                "vs_ask": slippage_vs_ask,
+                "vs_fair": slippage_vs_fair,
+                "total_usdc": slippage_usdc,
+            },
             "martingale_details": {
                 "strategy": self.strategy_name,
                 "direction": bet["direction"],
@@ -4179,6 +4228,32 @@ class MartingaleBot(threading.Thread):
 
         # --- Persist to dedicated martingale history & summary ---
         self._persist_martingale_record(record)
+
+    @staticmethod
+    def _aggregate_slippage(records):
+        """Compute slippage stats from a list of trade records."""
+        slips_vs_ask = []
+        slips_vs_fair = []
+        total_slip_usdc = 0.0
+        fill_prices = []
+        for r in records:
+            s = r.get("slippage") or {}
+            if s:
+                slips_vs_ask.append(s.get("vs_ask", 0))
+                slips_vs_fair.append(s.get("vs_fair", 0))
+                total_slip_usdc += s.get("total_usdc", 0)
+                if s.get("fill_price"):
+                    fill_prices.append(s["fill_price"])
+        n = len(slips_vs_ask) or 1
+        return {
+            "total_slippage_usdc": round(total_slip_usdc, 6),
+            "avg_slippage_vs_ask": round(sum(slips_vs_ask) / n, 6) if slips_vs_ask else 0,
+            "avg_slippage_vs_fair": round(sum(slips_vs_fair) / n, 6) if slips_vs_fair else 0,
+            "max_slippage_vs_ask": round(max(slips_vs_ask), 6) if slips_vs_ask else 0,
+            "avg_fill_price": round(sum(fill_prices) / len(fill_prices), 6) if fill_prices else 0,
+            "bets_with_slippage_data": len(slips_vs_ask),
+            "net_direction": "positive" if total_slip_usdc > 0 else ("negative" if total_slip_usdc < 0 else "zero"),
+        }
 
     def _persist_martingale_record(self, record):
         """Append to martingale_history.json and update martingale_summary.json."""
@@ -4204,6 +4279,9 @@ class MartingaleBot(threading.Thread):
                 losses = sum(1 for r in m_history if r.get("outcome") in ("lost", "loss"))
                 decided = wins + losses
                 win_rate = (wins / decided * 100) if decided > 0 else 0
+
+                # Overall slippage aggregation
+                overall_slippage = self._aggregate_slippage(m_history)
 
                 # Per-strategy breakdown
                 strat_buckets = {}
@@ -4231,6 +4309,7 @@ class MartingaleBot(threading.Thread):
                             (r.get("martingale_details", {}).get("streak", 0) for r in records),
                             default=0,
                         ),
+                        "slippage": self._aggregate_slippage(records),
                     }
 
                 summary = {
@@ -4243,6 +4322,7 @@ class MartingaleBot(threading.Thread):
                     "capital_deployed_usdc": round(total_cost, 6),
                     "capital_returned_usdc": round(total_proceeds, 6),
                     "roi_pct": round((total_pnl / total_cost * 100) if total_cost > 0 else 0, 2),
+                    "slippage": overall_slippage,
                     "strategies": strategies,
                 }
                 tmp_sf = MARTINGALE_SUMMARY_FILE + ".tmp"
