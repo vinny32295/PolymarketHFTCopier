@@ -489,6 +489,7 @@ DEFAULT_CONFIG = {
     "arb_size_usdc": 10.0,           # USDC to spend per side of each arb trade
     "arb_max_positions": 5,           # max simultaneous arb positions
     "arb_poll_seconds": 2,            # how often to scan orderbooks
+    "arb_log_interval": 5,            # seconds between INFO-level arb scan logs
 }
 
 # Keys from DEFAULT_CONFIG that are worth persisting across restarts.
@@ -2147,10 +2148,24 @@ class ArbitrageMonitor(threading.Thread):
                     )
                 continue
 
+            # Sort asks by price ascending so asks[0] is the *cheapest*
+            # offer.  The CLOB API does not guarantee sort order, so
+            # without this we may pick a stale $0.99 resting order
+            # instead of the tightest available ask.
+            asks_yes = sorted(asks_yes, key=lambda e: float(e.get("price", "0")))
+            asks_no = sorted(asks_no, key=lambda e: float(e.get("price", "0")))
+
             best_ask_yes = float(asks_yes[0].get("price", 0))
             best_ask_no = float(asks_no[0].get("price", 0))
             avail_yes = float(asks_yes[0].get("size", 0))
             avail_no = float(asks_no[0].get("size", 0))
+
+            self.logger.debug(
+                "Arb orderbook: %s — Yes top3 asks: %s / No top3 asks: %s",
+                mkt["question"][:30],
+                [(float(a.get("price", 0)), float(a.get("size", 0))) for a in asks_yes[:3]],
+                [(float(a.get("price", 0)), float(a.get("size", 0))) for a in asks_no[:3]],
+            )
 
             if best_ask_yes <= 0 or best_ask_no <= 0:
                 continue
@@ -2160,10 +2175,11 @@ class ArbitrageMonitor(threading.Thread):
             edge_pct = edge * 100.0
 
             if edge_pct < min_edge_pct:
-                # Log at INFO every ~30s so user can see the monitor is
+                # Log at INFO periodically so user can see the monitor is
                 # actively scanning and what the current spread looks like.
+                log_interval = self.cfg.get("arb_log_interval", 5)
                 now = time.time()
-                if not hasattr(self, '_last_edge_log_t') or now - self._last_edge_log_t >= 30:
+                if not hasattr(self, '_last_edge_log_t') or now - self._last_edge_log_t >= log_interval:
                     self._last_edge_log_t = now
                     self.logger.info(
                         "Arb scan: %s — %s=$%.3f + %s=$%.3f = $%.4f "
