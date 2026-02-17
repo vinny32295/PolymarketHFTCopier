@@ -3475,6 +3475,69 @@ class TestMartingaleBot(unittest.TestCase):
         self.assertTrue(resolved)
         self.assertTrue(won)
 
+    def test_check_resolution_orderbook_win(self):
+        """Orderbook fallback detects a win when ask >= 0.95."""
+        mb = self._make_bot()
+        mb.clob_client.get_order_book.return_value = {
+            "asks": [{"price": "0.97", "size": "50"}],
+        }
+        bet = {"token_id": "tok_up", "direction": "Up"}
+        result = mb._check_resolution_orderbook(bet)
+        self.assertTrue(result)
+
+    def test_check_resolution_orderbook_loss(self):
+        """Orderbook fallback detects a loss when ask <= 0.05."""
+        mb = self._make_bot()
+        mb.clob_client.get_order_book.return_value = {
+            "asks": [{"price": "0.03", "size": "50"}],
+        }
+        bet = {"token_id": "tok_up", "direction": "Up"}
+        result = mb._check_resolution_orderbook(bet)
+        self.assertFalse(result)
+
+    def test_check_resolution_orderbook_inconclusive(self):
+        """Orderbook fallback returns None for mid-range prices."""
+        mb = self._make_bot()
+        mb.clob_client.get_order_book.return_value = {
+            "asks": [{"price": "0.55", "size": "50"}],
+        }
+        bet = {"token_id": "tok_up", "direction": "Up"}
+        result = mb._check_resolution_orderbook(bet)
+        self.assertIsNone(result)
+
+    def test_cycle_uses_orderbook_fallback(self):
+        """Cycle uses orderbook fallback when API says not resolved."""
+        mb = self._make_bot()
+        # API says market not closed
+        mb.clob_client._get_public.return_value = [{
+            "closed": False,
+            "active": True,
+            "outcomes": '["Up", "Down"]',
+            "outcomePrices": '[0.55, 0.45]',
+        }]
+        # But orderbook shows Up won (ask at 0.97)
+        mb.clob_client.get_order_book.return_value = {
+            "asks": [{"price": "0.97", "size": "50"}],
+        }
+        mb._active_bet = {
+            "slug": "btc-updown-5m-test",
+            "condition_id": "cid1",
+            "token_id": "tok_up",
+            "direction": "Up",
+            "bet_size": 10.0,
+            "price": 0.50,
+            "shares": 20.0,
+            "cost": 10.0,
+            "question": "BTC?",
+            "window_end": int(time.time()) - 120,  # ended 2 min ago
+            "ts": "2026-01-01",
+        }
+        mb.log_trade_callback = MagicMock()
+        result = mb._cycle()
+        self.assertFalse(result)  # resolved, switch to fast poll
+        self.assertIsNone(mb._active_bet)
+        self.assertEqual(mb.current_bet, mb.start_bet)  # win resets bet
+
     # -- cycle state machine --
 
     def test_cycle_places_bet_when_no_active(self):

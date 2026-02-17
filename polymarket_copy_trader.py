@@ -3025,47 +3025,73 @@ class MartingaleBot(threading.Thread):
                 market = data
 
             if not market:
+                self.logger.info(
+                    "MARTINGALE RESOLUTION: no market data for %s",
+                    condition_id[:16] + "...",
+                )
                 return False, None
 
             # Check closure flag
             closed = market.get("closed", False)
             active = market.get("active", True)
-            if not closed and active:
-                return False, None
 
-            # Parse outcome prices
+            # Parse outcome prices (needed for both API and orderbook paths)
             raw_prices = market.get("outcomePrices")
             raw_outcomes = market.get("outcomes")
-            if not raw_prices:
-                return False, None
 
-            if isinstance(raw_prices, str):
-                try:
-                    outcome_prices = json.loads(raw_prices)
-                except (json.JSONDecodeError, TypeError):
-                    outcome_prices = [
-                        float(x.strip()) for x in raw_prices.split(",")
-                    ]
-            elif isinstance(raw_prices, list):
-                outcome_prices = [float(x) for x in raw_prices]
-            else:
-                return False, None
+            outcome_prices = None
+            if raw_prices:
+                if isinstance(raw_prices, str):
+                    try:
+                        outcome_prices = [float(x) for x in json.loads(raw_prices)]
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        try:
+                            outcome_prices = [
+                                float(x.strip()) for x in raw_prices.split(",")
+                            ]
+                        except (ValueError, AttributeError):
+                            pass
+                elif isinstance(raw_prices, list):
+                    try:
+                        outcome_prices = [float(x) for x in raw_prices]
+                    except (ValueError, TypeError):
+                        pass
 
-            if isinstance(raw_outcomes, str):
-                try:
-                    outcomes = json.loads(raw_outcomes)
-                except (json.JSONDecodeError, TypeError):
-                    outcomes = [x.strip() for x in raw_outcomes.split(",")]
-            elif isinstance(raw_outcomes, list):
-                outcomes = raw_outcomes
-            else:
+            outcomes = None
+            if raw_outcomes:
+                if isinstance(raw_outcomes, str):
+                    try:
+                        outcomes = json.loads(raw_outcomes)
+                    except (json.JSONDecodeError, TypeError):
+                        outcomes = [x.strip() for x in raw_outcomes.split(",")]
+                elif isinstance(raw_outcomes, list):
+                    outcomes = raw_outcomes
+            if not outcomes:
                 outcomes = ["Up", "Down"]
 
-            if len(outcome_prices) < 2:
+            if not closed and active:
+                self.logger.info(
+                    "MARTINGALE RESOLUTION: market not closed yet "
+                    "(closed=%s, active=%s, prices=%s)",
+                    closed, active, outcome_prices,
+                )
+                return False, None
+
+            if not outcome_prices or len(outcome_prices) < 2:
+                self.logger.info(
+                    "MARTINGALE RESOLUTION: no outcome prices yet "
+                    "(closed=%s, prices=%s)",
+                    closed, outcome_prices,
+                )
                 return False, None
 
             # Need a clear winner (one price near 1.0)
             if max(outcome_prices) < 0.9:
+                self.logger.info(
+                    "MARTINGALE RESOLUTION: no clear winner yet "
+                    "(prices=%s, max=%.2f < 0.9)",
+                    outcome_prices, max(outcome_prices),
+                )
                 return False, None
 
             winner_idx = outcome_prices.index(max(outcome_prices))
@@ -3078,8 +3104,40 @@ class MartingaleBot(threading.Thread):
             )
             return True, won
         except Exception as exc:
-            self.logger.debug("Resolution check error: %s", exc)
+            self.logger.info("MARTINGALE RESOLUTION: check error: %s", exc)
             return False, None
+
+    def _check_resolution_orderbook(self, bet):
+        """Fallback resolution via orderbook prices.
+
+        If the Gamma API is slow to mark a market as closed, we can
+        detect a clear winner by looking at the orderbook best ask.
+        A price >= $0.95 strongly indicates that side won.
+        """
+        try:
+            token_id = bet["token_id"]
+            ask_price, _ = self._get_best_ask(token_id)
+            if ask_price is None:
+                # No asks at all — might mean the market ended and
+                # the orderbook is empty.  Check the opposite side.
+                return None
+            if ask_price >= 0.95:
+                self.logger.info(
+                    "MARTINGALE ORDERBOOK RESOLUTION: %s ask=$%.4f >= $0.95 — "
+                    "treating as WIN",
+                    bet["direction"], ask_price,
+                )
+                return True
+            if ask_price <= 0.05:
+                self.logger.info(
+                    "MARTINGALE ORDERBOOK RESOLUTION: %s ask=$%.4f <= $0.05 — "
+                    "treating as LOSS",
+                    bet["direction"], ask_price,
+                )
+                return False
+            return None  # inconclusive
+        except Exception:
+            return None
 
     # -- bet placement & result handling ------------------------------------
 
@@ -3327,14 +3385,28 @@ class MartingaleBot(threading.Thread):
         """
         if self._active_bet:
             bet = self._active_bet
-            # Wait until window has ended + buffer before checking resolution
             now = int(time.time())
+
+            # Wait until window has ended + buffer before checking
             if now < bet["window_end"] + 30:
                 return True  # waiting — slow poll
 
+            # --- Try Gamma API resolution first ---
             resolved, won = self._check_resolution(
                 bet["condition_id"], bet["direction"],
             )
+
+            if not resolved:
+                # --- Fallback: orderbook-based resolution ---
+                # If the API is slow to mark closed, check if the
+                # orderbook shows a clear winner (price >= $0.95).
+                elapsed = now - bet["window_end"]
+                if elapsed >= 60:  # only try fallback after 60s
+                    ob_result = self._check_resolution_orderbook(bet)
+                    if ob_result is not None:
+                        resolved = True
+                        won = ob_result
+
             if not resolved:
                 # Timeout: if 10 min past window end, give up
                 if now > bet["window_end"] + 600:
