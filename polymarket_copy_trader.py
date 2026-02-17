@@ -1844,9 +1844,14 @@ class ArbitrageMonitor(threading.Thread):
         the slug follows a deterministic pattern:
             ``{base_slug}-{window_start_timestamp}``
 
+        The Gamma events API returns markets with:
+          - ``clobTokenIds``: a **stringified** JSON array of token ID strings
+          - ``outcomes``: a **stringified** JSON array of outcome labels
+          - ``condition_id`` / ``conditionId``: the market condition ID
+
         This method computes the current slug, fetches it from the Gamma
-        API ``/events`` endpoint, extracts the first market's condition_id
-        and tokens, and populates ``self._markets``.
+        API ``/events`` endpoint, parses the stringified fields, and
+        populates ``self._markets``.
 
         Returns True if a new market was resolved, False otherwise.
         """
@@ -1857,6 +1862,10 @@ class ArbitrageMonitor(threading.Thread):
         window_ts = self._get_dynamic_window_ts()
         if window_ts == self._current_window_ts and self._markets:
             return False  # same window, already resolved
+
+        # Avoid spamming the API if we already failed for this window
+        if window_ts == getattr(self, "_last_failed_window_ts", 0):
+            return False
 
         slug = f"{base_slug}-{window_ts}"
         self.logger.info("Arb dynamic: discovering market for slug '%s'", slug)
@@ -1877,6 +1886,7 @@ class ArbitrageMonitor(threading.Thread):
                     "Arb dynamic: no event found for slug '%s' — "
                     "market may not be open yet", slug,
                 )
+                self._last_failed_window_ts = window_ts
                 return False
 
             # An event contains a list of markets; grab the first binary one
@@ -1885,31 +1895,83 @@ class ArbitrageMonitor(threading.Thread):
                 self.logger.warning(
                     "Arb dynamic: event '%s' has no markets", slug,
                 )
+                self._last_failed_window_ts = window_ts
                 return False
 
             market = markets[0]
             cid = market.get("condition_id") or market.get("conditionId") or ""
-            tokens = market.get("tokens") or []
 
             if not cid:
                 self.logger.warning(
                     "Arb dynamic: market in event '%s' has no condition_id", slug,
                 )
+                self._last_failed_window_ts = window_ts
                 return False
 
-            if len(tokens) < 2:
+            # --- Parse token IDs ---
+            # The Gamma events API returns clobTokenIds and outcomes as
+            # *stringified* JSON arrays, e.g.:
+            #   "clobTokenIds": "[\"abc123...\", \"def456...\"]"
+            #   "outcomes": "[\"Up\", \"Down\"]"
+            # We also fall back to a native "tokens" array (CLOB API format)
+            # in case the response shape varies.
+            token_ids = []
+            outcome_labels = []
+
+            # Try clobTokenIds (Gamma events API format — stringified)
+            raw_clob = market.get("clobTokenIds") or ""
+            if isinstance(raw_clob, str) and raw_clob.strip():
+                try:
+                    parsed = json.loads(raw_clob)
+                    if isinstance(parsed, list):
+                        token_ids = [str(t) for t in parsed]
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            elif isinstance(raw_clob, list):
+                token_ids = [str(t) for t in raw_clob]
+
+            # Try outcomes (also stringified)
+            raw_outcomes = market.get("outcomes") or ""
+            if isinstance(raw_outcomes, str) and raw_outcomes.strip():
+                try:
+                    parsed = json.loads(raw_outcomes)
+                    if isinstance(parsed, list):
+                        outcome_labels = [str(o) for o in parsed]
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            elif isinstance(raw_outcomes, list):
+                outcome_labels = [str(o) for o in raw_outcomes]
+
+            # Fallback: try native "tokens" array (CLOB API format)
+            if len(token_ids) < 2:
+                tokens = market.get("tokens") or []
+                if len(tokens) >= 2:
+                    token_ids = [
+                        tokens[0].get("token_id") or tokens[0].get("tokenId") or "",
+                        tokens[1].get("token_id") or tokens[1].get("tokenId") or "",
+                    ]
+                    outcome_labels = [
+                        tokens[0].get("outcome", "A"),
+                        tokens[1].get("outcome", "B"),
+                    ]
+
+            if len(token_ids) < 2 or not token_ids[0] or not token_ids[1]:
                 self.logger.warning(
-                    "Arb dynamic: market %s has %d tokens (need 2) — skipping",
-                    cid[:20], len(tokens),
+                    "Arb dynamic: market %s has insufficient token data "
+                    "(clobTokenIds=%r, tokens=%r) — skipping",
+                    cid[:20],
+                    market.get("clobTokenIds", ""),
+                    len(market.get("tokens") or []),
                 )
+                self._last_failed_window_ts = window_ts
                 return False
 
-            t0 = tokens[0]
-            t1 = tokens[1]
-            tid0 = t0.get("token_id") or t0.get("tokenId") or ""
-            tid1 = t1.get("token_id") or t1.get("tokenId") or ""
-            label0 = t0.get("outcome", "A")
-            label1 = t1.get("outcome", "B")
+            # Default labels if not parsed
+            if len(outcome_labels) < 2:
+                outcome_labels = ["A", "B"]
+
+            tid0, tid1 = token_ids[0], token_ids[1]
+            label0, label1 = outcome_labels[0], outcome_labels[1]
             question = market.get("question") or event.get("title") or slug
 
             # Clear previous window's market(s) so we only track the current one
@@ -1925,6 +1987,7 @@ class ArbitrageMonitor(threading.Thread):
                 "question": question,
             }
             self._current_window_ts = window_ts
+            self._last_failed_window_ts = 0
             self.logger.info(
                 "Arb dynamic: resolved '%s' — %s=%s... / %s=%s... (window %d)",
                 question[:50], label0, tid0[:12], label1, tid1[:12], window_ts,
@@ -1933,6 +1996,7 @@ class ArbitrageMonitor(threading.Thread):
 
         except Exception as exc:
             self.logger.warning("Arb dynamic: failed to resolve slug '%s': %s", slug, exc)
+            self._last_failed_window_ts = window_ts
             return False
 
     # -- core loop ----------------------------------------------------------
