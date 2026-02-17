@@ -3017,6 +3017,24 @@ class MartingaleBot(threading.Thread):
         except Exception:
             return None, 0.0
 
+    def _get_book_depth(self, token_id, max_price):
+        """Return total shares available on the ask side up to *max_price*.
+
+        Aggregates across all price levels so we know the true fillable
+        depth for a FOK/market order, not just top-of-book.
+        """
+        try:
+            book = self.clob_client.get_order_book(token_id)
+            asks = book.get("asks") or []
+            total = 0.0
+            for level in asks:
+                px = float(level.get("price", "0"))
+                if px <= max_price:
+                    total += float(level.get("size", 0))
+            return total
+        except Exception:
+            return 0.0
+
     # -- resolution detection -----------------------------------------------
 
     def _check_resolution(self, condition_id, direction):
@@ -3302,11 +3320,16 @@ class MartingaleBot(threading.Thread):
             )
             return False  # don't mark skipped — price might come back
 
+        # Check aggregate depth across all ask levels up to price_max.
+        # FOK/market orders sweep multiple levels, so single-level
+        # size is not the right measure.
         target_shares = self.current_bet / ask_price
-        if target_shares > ask_size:
+        book_depth = self._get_book_depth(token_id, price_max)
+        if book_depth < target_shares:
             self.logger.warning(
-                "MARTINGALE: insufficient liquidity (need %.1f, have %.1f)",
-                target_shares, ask_size,
+                "MARTINGALE: insufficient book depth "
+                "(need %.1f shares, book has %.1f up to $%.2f)",
+                target_shares, book_depth, price_max,
             )
             return False
 
