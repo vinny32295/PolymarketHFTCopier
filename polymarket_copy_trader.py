@@ -6514,6 +6514,9 @@ class TradeExecutor:
         """Sign and broadcast a transaction with retries."""
         for attempt in range(retries):
             try:
+                # Refresh nonce on retries so we don't resend a stale value
+                if attempt > 0:
+                    tx["nonce"] = self._get_nonce()
                 # Estimate gas
                 gas_est = self.w3.eth.estimate_gas(tx)
                 tx["gas"] = int(gas_est * self.gas_multiplier)
