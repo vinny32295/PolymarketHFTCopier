@@ -2233,13 +2233,12 @@ class PolymarketCLOBClient:
                         retry_ask = float(retry_asks[0].get("price", 0)) if retry_asks else 0
                         if side.upper() == "BUY" and retry_ask > 0:
                             retry_price = round(min(retry_ask * 1.005, 0.99), 2)
-                            # Respect arb-imposed price cap to preserve edge
+                            # Respect price cap (arb edge / martingale price_max)
                             if max_retry_price is not None:
                                 if retry_price > max_retry_price:
                                     self.logger.warning(
                                         "FOK retry: refreshed ask $%.4f exceeds "
-                                        "max retry price $%.4f — aborting to "
-                                        "preserve arb edge",
+                                        "max price cap $%.4f — aborting",
                                         retry_price, max_retry_price,
                                     )
                                     return {"status": "fok_rejected",
@@ -4596,6 +4595,7 @@ class MartingaleBot(threading.Thread):
             size_usdc=self.current_bet,
             price=ask_price,
             use_fok=True,
+            max_retry_price=price_max,
         )
 
         if isinstance(result, dict) and (
