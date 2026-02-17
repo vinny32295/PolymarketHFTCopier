@@ -10410,7 +10410,7 @@ class CopyTraderGUI:
     def _build_history_tab(self, parent):
         columns = (
             "closed_at", "market", "shares", "entry_price",
-            "exit_price", "pnl_usdc", "outcome", "reason",
+            "exit_price", "pnl_usdc", "slip_usdc", "outcome", "reason",
         )
         col_headings = {
             "closed_at": "Closed At",
@@ -10419,13 +10419,14 @@ class CopyTraderGUI:
             "entry_price": "Entry",
             "exit_price": "Exit",
             "pnl_usdc": "P&L ($)",
+            "slip_usdc": "Slip ($)",
             "outcome": "Result",
             "reason": "Reason",
         }
         col_widths = {
             "closed_at": 145, "market": 150, "shares": 70,
             "entry_price": 70, "exit_price": 70, "pnl_usdc": 85,
-            "outcome": 55, "reason": 85,
+            "slip_usdc": 75, "outcome": 55, "reason": 85,
         }
 
         tree_frame = ttk.Frame(parent)
@@ -10440,7 +10441,7 @@ class CopyTraderGUI:
 
         for col in columns:
             self.history_tree.heading(col, text=col_headings[col])
-            anchor = tk.E if col in ("shares", "entry_price", "exit_price", "pnl_usdc") else tk.W
+            anchor = tk.E if col in ("shares", "entry_price", "exit_price", "pnl_usdc", "slip_usdc") else tk.W
             self.history_tree.column(col, width=col_widths.get(col, 80), anchor=anchor)
 
         self.history_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -10499,6 +10500,7 @@ class CopyTraderGUI:
 
         total_cost = 0.0
         total_proceeds = 0.0
+        total_slip_usdc = 0.0
         wins = losses = 0
         for rec in reversed(history):  # newest first
             pnl = rec.get("pnl_usdc", 0)
@@ -10509,6 +10511,13 @@ class CopyTraderGUI:
                 wins += 1
             elif outcome in ("lost", "loss"):
                 losses += 1
+
+            # Per-trade slippage (martingale records only)
+            slip = rec.get("slippage") or {}
+            slip_usdc = slip.get("total_usdc", 0)
+            total_slip_usdc += slip_usdc
+            slip_display = f"{slip_usdc:+.4f}" if slip_usdc else ""
+
             closed_at = rec.get("closed_at", "")
             # Shorten the ISO timestamp for display
             if "T" in closed_at:
@@ -10529,6 +10538,7 @@ class CopyTraderGUI:
                 f"{rec.get('entry_price', 0):.4f}",
                 f"{rec.get('exit_price', 0):.4f}",
                 f"{pnl:+.4f}",
+                slip_display,
                 outcome.upper() if outcome else rec.get("reason", ""),
                 rec.get("reason", ""),
             ))
@@ -10536,11 +10546,12 @@ class CopyTraderGUI:
         n = len(history)
         total_pnl = total_proceeds - total_cost
         win_rate = f"{wins/(wins+losses)*100:.0f}%" if (wins + losses) > 0 else "N/A"
+        slip_summary = f"  |  Slip: ${total_slip_usdc:+,.2f}" if total_slip_usdc else ""
         self.history_summary_var.set(
             f"Trades: {n}  |  Deployed: ${total_cost:,.2f}  |  "
             f"Returned: ${total_proceeds:,.2f}  |  "
             f"P&L: ${total_pnl:+,.2f}  |  "
-            f"W/L: {wins}/{losses} ({win_rate})"
+            f"W/L: {wins}/{losses} ({win_rate}){slip_summary}"
         )
 
     def _export_history_csv(self):
