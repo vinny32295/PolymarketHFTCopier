@@ -2329,6 +2329,13 @@ class ArbitrageMonitor(threading.Thread):
         poll_interval = max(self.cfg.get("arb_poll_seconds", 2), 0.5)
 
         while not self._stop_event.is_set():
+            # Runtime toggle: if arb_enabled is turned off, stop gracefully
+            if not self.cfg.get("arb_enabled", True):
+                self.logger.info(
+                    "Arbitrage monitor: arb_enabled toggled off — stopping"
+                )
+                break
+
             try:
                 # For dynamic slugs, re-resolve when any window rotates
                 if slug_entries:
@@ -6973,8 +6980,29 @@ class CopyTraderBot:
         _last_exit_check = 0  # exit checks should start immediately
         exit_check_interval = self.cfg.get("exit_check_seconds", 5)
 
+        # Runtime-togglable config keys — re-read from config.json
+        _RUNTIME_TOGGLE_KEYS = {"arb_enabled", "martingale_enabled"}
+        _last_config_reload = 0
+
         while self.running:
             try:
+                # --- Hot-reload togglable config from config.json ---
+                _now_reload = time.time()
+                if _now_reload - _last_config_reload >= 30:
+                    _last_config_reload = _now_reload
+                    try:
+                        disk_cfg = load_user_config()
+                        for k in _RUNTIME_TOGGLE_KEYS:
+                            if k in disk_cfg and disk_cfg[k] != self.cfg.get(k):
+                                old = self.cfg.get(k)
+                                self.cfg[k] = disk_cfg[k]
+                                self.logger.info(
+                                    "Config hot-reload: %s changed %s → %s",
+                                    k, old, disk_cfg[k],
+                                )
+                    except Exception:
+                        pass  # config.json may not exist or be corrupt
+
                 # --- Low-balance pause / resume check ---
                 if self.executor:
                     try:
@@ -7163,10 +7191,15 @@ class CopyTraderBot:
                 # Arb and copy trading share the same CLOB client and
                 # balance; running both simultaneously slows the arb bot
                 # down with unnecessary wallet polling & API calls.
+                _arb_mon = getattr(self, "_arb_monitor", None)
                 _arb_active = (
                     self.cfg.get("arb_enabled")
-                    and getattr(self, "_arb_monitor", None) is not None
+                    and _arb_mon is not None
+                    and _arb_mon.is_alive()
                 )
+                # Clean up dead monitor (e.g. after runtime toggle-off)
+                if _arb_mon is not None and not _arb_mon.is_alive():
+                    self._arb_monitor = None
 
                 # --- Skip trade detection & execution while paused ---
                 if self._paused_low_balance:
