@@ -796,6 +796,7 @@ class TelegramCommandBot:
             "/positions": self._cmd_positions,
             "/trades": self._cmd_trades,
             "/stats": self._cmd_stats,
+            "/strategies": self._cmd_strategies,
             "/status": self._cmd_status,
             "/help": self._cmd_help,
             "/start": self._cmd_help,
@@ -1060,6 +1061,64 @@ class TelegramCommandBot:
 
         self.send("\n".join(lines))
 
+    def _cmd_strategies(self):
+        """Per-strategy diagnostic view — shows why each martingale
+        strategy is or isn't betting."""
+        mgr = getattr(self.bot, "_martingale_mgr", None) if self.bot else None
+        if not mgr or not mgr.bots:
+            self.send("No martingale strategies configured.")
+            return
+
+        lines = ["STRATEGY DIAGNOSTICS"]
+        for mb in mgr.bots:
+            window = int(mb._scfg("window", "martingale_window", 300))
+            slug_base = mb._scfg("slug_base", "martingale_slug_base", "?")
+            default_entry = min(max(window // 5, 60), 180)
+            max_entry = int(mb._scfg("max_entry_seconds",
+                                     "martingale_max_entry_seconds",
+                                     default_entry))
+            now = int(time.time())
+            window_ts = mb._get_window_ts(window)
+            secs_in = now - window_ts
+            next_slug = f"{slug_base}-{window_ts}"
+
+            lines.append("")
+            lines.append(f"[{mb.strategy_name}]")
+            lines.append(f"  slug: {next_slug}")
+            lines.append(
+                f"  window: {window}s  |  entry: {secs_in}s / {max_entry}s"
+            )
+            lines.append(
+                f"  dir: {mb.direction}  |  bet: ${mb.current_bet:.2f}  |  "
+                f"streak: {mb.consecutive_losses}"
+            )
+            lines.append(f"  P&L: ${mb.session_pnl:+,.2f}")
+
+            # Counters
+            lines.append(
+                f"  windows: {mb._windows_attempted} bet  |  "
+                f"{mb._windows_skipped} skipped  |  "
+                f"{mb._windows_no_market} no-market"
+            )
+
+            # Current state
+            if mb._active_bet:
+                bet = mb._active_bet
+                time_left = bet["window_end"] - now
+                lines.append(
+                    f"  ACTIVE: {bet['direction']} ${bet['cost']:.2f} "
+                    f"@ ${bet['price']:.4f}  |  "
+                    f"resolves in {max(time_left, 0)}s"
+                )
+            elif mb._skip_reason:
+                lines.append(f"  BLOCKED: {mb._skip_reason}")
+            elif mb._stop_event.is_set():
+                lines.append("  STOPPED")
+            else:
+                lines.append("  waiting for next window")
+
+        self.send("\n".join(lines))
+
     def _cmd_status(self):
         running = self.bot.running if self.bot else False
         lines = [f"BOT STATUS: {'RUNNING' if running else 'STOPPED'}"]
@@ -1108,6 +1167,7 @@ class TelegramCommandBot:
             "/positions — open positions with P/L\n"
             "/trades — recent trade history\n"
             "/stats — session W/L, win %, P&L, ROI\n"
+            "/strategies — per-strategy diagnostics\n"
             "/status — bot state, uptime, session info\n"
             "/help — this message"
         )
@@ -3303,6 +3363,10 @@ class MartingaleBot(threading.Thread):
         self._bet_history = []
         self._last_window_ts = 0
         self._next_window_cache = None  # pre-fetched market for next window
+        self._skip_reason = None        # last reason a window was skipped
+        self._windows_attempted = 0     # windows where we tried to bet
+        self._windows_skipped = 0       # windows skipped (entry too late, etc)
+        self._windows_no_market = 0     # market slug not found on Gamma API
 
         # Callbacks (wired by CopyTraderBot)
         self.notify_callback = None
@@ -3824,10 +3888,12 @@ class MartingaleBot(threading.Thread):
             return False  # already bet or skipped this window
 
         # Check how far into the window we are — only bet in the early
-        # portion (default first 60s) when prices are closest to $0.50.
+        # portion when prices are closest to $0.50.  Default scales with
+        # window size: 60s for 5-min (300s), 120s for 15-min (900s), etc.
         now = int(time.time())
         seconds_into = now - current_window_ts
-        max_entry = int(self._scfg("max_entry_seconds", "martingale_max_entry_seconds", 60))
+        default_entry = min(max(window // 5, 60), 180)
+        max_entry = int(self._scfg("max_entry_seconds", "martingale_max_entry_seconds", default_entry))
         if seconds_into > max_entry:
             self.logger.info(
                 "MARTINGALE [%s]: window %d is %ds old (max %ds) — skipping, "
@@ -3835,6 +3901,8 @@ class MartingaleBot(threading.Thread):
                 self.strategy_name, current_window_ts, seconds_into, max_entry,
             )
             self._last_window_ts = current_window_ts  # mark skipped
+            self._skip_reason = f"entry too late ({seconds_into}s > {max_entry}s)"
+            self._windows_skipped += 1
             return False
 
         # Allow runtime direction toggle via config (must happen before
@@ -3859,9 +3927,12 @@ class MartingaleBot(threading.Thread):
             market = self._fetch_market(slug)
             if not market:
                 self.logger.info(
-                    "MARTINGALE: market not available yet for '%s' — "
-                    "will retry (%ds into window)", slug, seconds_into,
+                    "MARTINGALE [%s]: market not available yet for '%s' — "
+                    "will retry (%ds into window)",
+                    self.strategy_name, slug, seconds_into,
                 )
+                self._skip_reason = f"market not found: {slug}"
+                self._windows_no_market += 1
                 return False  # don't mark as skipped — retry on next poll
 
             token_id = (
@@ -3871,9 +3942,10 @@ class MartingaleBot(threading.Thread):
         ask_price, ask_size = self._get_best_ask(token_id)
         if not ask_price or ask_price <= 0:
             self.logger.info(
-                "MARTINGALE: no asks for %s token yet — will retry "
-                "(%ds into window)", direction, seconds_into,
+                "MARTINGALE [%s]: no asks for %s token yet — will retry "
+                "(%ds into window)", self.strategy_name, direction, seconds_into,
             )
+            self._skip_reason = f"no asks for {direction} token"
             return False
 
         # Price range check — only bet when price is within the target range
@@ -3881,10 +3953,11 @@ class MartingaleBot(threading.Thread):
         price_max = float(self._scfg("price_max", "martingale_price_max", 0.55))
         if ask_price < price_min or ask_price > price_max:
             self.logger.info(
-                "MARTINGALE: price $%.4f outside range [$%.2f–$%.2f] "
+                "MARTINGALE [%s]: price $%.4f outside range [$%.2f–$%.2f] "
                 "— will retry",
-                ask_price, price_min, price_max,
+                self.strategy_name, ask_price, price_min, price_max,
             )
+            self._skip_reason = f"price ${ask_price:.4f} outside [{price_min:.2f}–{price_max:.2f}]"
             return False  # don't mark skipped — price might come back
 
         # Check aggregate depth across all ask levels up to price_max.
@@ -3894,10 +3967,11 @@ class MartingaleBot(threading.Thread):
         book_depth = self._get_book_depth(token_id, price_max)
         if book_depth < target_shares:
             self.logger.warning(
-                "MARTINGALE: insufficient book depth "
+                "MARTINGALE [%s]: insufficient book depth "
                 "(need %.1f shares, book has %.1f up to $%.2f)",
-                target_shares, book_depth, price_max,
+                self.strategy_name, target_shares, book_depth, price_max,
             )
+            self._skip_reason = f"thin book ({book_depth:.0f}/{target_shares:.0f} shares)"
             return False
 
         # Dry run guard
@@ -3954,11 +4028,13 @@ class MartingaleBot(threading.Thread):
             "ts": datetime.now().isoformat(),
         }
         self._last_window_ts = current_window_ts
+        self._skip_reason = None  # bet placed successfully
+        self._windows_attempted += 1
         self._save_state()
 
         self.logger.info(
-            "MARTINGALE BET: %s $%.2f @ $%.4f (%.1f shares) — streak: %d",
-            direction, actual_cost, ask_price, actual_shares,
+            "MARTINGALE BET [%s]: %s $%.2f @ $%.4f (%.1f shares) — streak: %d",
+            self.strategy_name, direction, actual_cost, ask_price, actual_shares,
             self.consecutive_losses,
         )
         if self.notify_callback:
@@ -3996,7 +4072,13 @@ class MartingaleBot(threading.Thread):
         loss = bet["cost"]
         self.session_pnl -= loss
         self.consecutive_losses += 1
-        self.current_bet = round(bet["bet_size"] * 2, 2)
+        # Double the ACTUAL amount risked (bet["cost"]), not the pre-bump
+        # configured size (bet["bet_size"]).  When place_order bumps a small
+        # bet to meet Polymarket minimums (e.g. $2 → $2.50 for 5-token min),
+        # the next martingale bet must cover the real loss, not the smaller
+        # intended amount.
+        actual_risked = max(bet.get("cost", 0), bet.get("bet_size", 0))
+        self.current_bet = round(actual_risked * 2, 2)
 
         max_bet = float(self._scfg("max_bet", "martingale_max_bet", 0))
         if max_bet > 0 and self.current_bet > max_bet:
@@ -4150,6 +4232,8 @@ class MartingaleBot(threading.Thread):
         )
         if self._active_bet:
             status += f" | Active: {self._active_bet['slug']}"
+        elif self._skip_reason:
+            status += f" | Skip: {self._skip_reason}"
         return status
 
 
