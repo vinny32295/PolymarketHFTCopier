@@ -212,6 +212,7 @@ POSITIONS_FILE = "positions.json"
 TRADE_HISTORY_FILE = "trade_history.json"
 SESSION_TRADES_FILE = "session_trades.json"
 WHALE_COMPARISON_FILE = "whale_comparison.json"
+USER_CONFIG_FILE = "config.json"  # persists RPC URLs, proxy address, etc.
 
 # Polymarket Proxy Wallet Factory on Polygon
 # Deploys lightweight proxy wallets for Polymarket users; each EOA has
@@ -489,6 +490,50 @@ DEFAULT_CONFIG = {
     "arb_max_positions": 5,           # max simultaneous arb positions
     "arb_poll_seconds": 2,            # how often to scan orderbooks
 }
+
+# Keys from DEFAULT_CONFIG that are worth persisting across restarts.
+# Sensitive secrets (private key, API keys) are excluded.
+_PERSISTENT_CONFIG_KEYS = [
+    "rpc_url", "ws_rpc_url", "proxy_address",
+    "watched_addresses", "copy_percentage", "max_trade_usdc",
+    "slippage_tolerance_bps", "poll_interval_seconds", "order_ttl_seconds",
+    "resume_threshold_usdc", "take_profit_price", "take_profit_pct",
+    "stop_loss_pct", "max_loss_usdc", "exit_check_seconds", "exit_mode",
+    "dry_run", "auto_redeem_settled", "proxy_redeem", "proxy_withdraw",
+    "max_price_deviation_pct", "trade_max_age_seconds",
+    "arb_enabled", "arb_condition_ids", "arb_dynamic_slug",
+    "arb_dynamic_window", "arb_min_edge_pct", "arb_size_usdc",
+    "arb_max_positions", "arb_poll_seconds",
+    "webhook_url",
+]
+
+
+def load_user_config():
+    """Load persisted settings from config.json, returning a dict.
+
+    Only returns keys that are in _PERSISTENT_CONFIG_KEYS.
+    Returns an empty dict if the file doesn't exist or is corrupt.
+    """
+    try:
+        with open(USER_CONFIG_FILE, "r") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            return {}
+        return {k: v for k, v in data.items() if k in _PERSISTENT_CONFIG_KEYS}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_user_config(cfg):
+    """Persist user settings to config.json (only safe, non-secret keys)."""
+    data = {k: cfg[k] for k in _PERSISTENT_CONFIG_KEYS if k in cfg}
+    try:
+        tmp = USER_CONFIG_FILE + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(data, fh, indent=2, default=str)
+        os.replace(tmp, USER_CONFIG_FILE)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -4219,6 +4264,17 @@ class TradeExecutor:
             self._proxy_discovery_done = True
             return addr
 
+        # 1b. Cached "no proxy" from a previous run — skip the 25s scan
+        if cfg_addr == "none":
+            self.logger.info(
+                "Proxy discovery cached as 'none' from previous run — "
+                "skipping auto-discovery. Clear proxy_address in config.json "
+                "or set PROXY_ADDRESS env var to re-scan."
+            )
+            self._proxy_address = None
+            self._proxy_discovery_done = True
+            return None
+
         self.logger.info(
             "No proxy_address in config (got %r) — trying auto-discovery...",
             self.cfg.get("proxy_address", ""),
@@ -4233,6 +4289,7 @@ class TradeExecutor:
             self._proxy_is_safe = self._check_is_safe(api_result)
             self._proxy_address = api_result
             self._proxy_discovery_done = True
+            self._persist_proxy_result(api_result)
             return api_result
 
         # ------ Legacy Proxy Factory ------
@@ -4255,6 +4312,7 @@ class TradeExecutor:
                     self._proxy_is_safe = False
                     self._proxy_address = addr
                     self._proxy_discovery_done = True
+                    self._persist_proxy_result(addr)
                     return addr
                 self.logger.info(
                     "Factory.%s returned zero address — trying next method",
@@ -4272,6 +4330,7 @@ class TradeExecutor:
             self._proxy_is_safe = False
             self._proxy_address = result
             self._proxy_discovery_done = True
+            self._persist_proxy_result(result)
             return result
 
         # ------ Safe Proxy Factory ------
@@ -4289,6 +4348,7 @@ class TradeExecutor:
             self.logger.info(
                 "Wallet is a Gnosis Safe — will use execTransaction for proxy ops",
             )
+            self._persist_proxy_result(result)
             return result
 
         # ------ Polygonscan API fallback ------
@@ -4302,6 +4362,7 @@ class TradeExecutor:
             self._proxy_is_safe = self._check_is_safe(scan_result)
             self._proxy_address = scan_result
             self._proxy_discovery_done = True
+            self._persist_proxy_result(scan_result)
             return scan_result
 
         self.logger.warning(
@@ -4311,7 +4372,26 @@ class TradeExecutor:
             self.address,
         )
         self._proxy_discovery_done = True  # don't retry every 5 min
+        # Cache the "no proxy" result so next restart skips the ~25s scan.
+        self._persist_proxy_result("none")
         return None
+
+    def _persist_proxy_result(self, address):
+        """Write discovered proxy address into config.json for next startup.
+
+        Pass ``"none"`` to record that no proxy exists (skips future scans).
+        Pass a ``0x...`` address to cache the discovered proxy.
+        """
+        try:
+            saved = load_user_config()
+            saved["proxy_address"] = address
+            save_user_config(saved)
+            self.logger.info(
+                "Proxy discovery result cached to %s (value: %s)",
+                USER_CONFIG_FILE, address[:20] if address else "none",
+            )
+        except Exception as exc:
+            self.logger.debug("Could not cache proxy result: %s", exc)
 
     def _check_is_safe(self, address):
         """Probe whether *address* is a Gnosis Safe by calling ``nonce()``."""
@@ -6052,8 +6132,10 @@ class CopyTraderGUI:
     def __init__(self):
         _import_tkinter()
 
-        # Start from built-in defaults — all settings come from the GUI.
+        # Start from built-in defaults, then overlay any previously-saved
+        # settings from config.json (RPC URLs, proxy address, etc.).
         self.cfg = dict(DEFAULT_CONFIG)
+        self.cfg.update(load_user_config())
 
         self.bot = None
         self.logger = None
@@ -7154,8 +7236,11 @@ class CopyTraderGUI:
 
     def _start_bot(self):
         # Pull the latest values from the GUI fields into self.cfg.
-        # No config file write is needed — the bot runs from memory.
         self._read_fields_to_config()
+
+        # Persist settings to config.json so RPC URLs, proxy address, etc.
+        # survive restarts without re-entering them.
+        save_user_config(self.cfg)
 
         # Persist the private key to its own file (needed by the bot at
         # runtime).
@@ -7253,14 +7338,15 @@ class HealthCheckServer:
 # ---------------------------------------------------------------------------
 
 def run_headless():
-    """Run the bot in headless mode using defaults + env vars.
+    """Run the bot in headless mode using defaults + env vars + config.json.
 
-    All settings come from environment variables or built-in defaults.
+    Priority: built-in defaults < config.json < environment variables.
     """
     logger = setup_logging()
 
-    # Start from built-in defaults.
+    # Start from built-in defaults, then overlay saved config.json.
     cfg = dict(DEFAULT_CONFIG)
+    cfg.update(load_user_config())
 
     # Allow env-var overrides for headless operation
     if os.environ.get("RPC_URL"):
@@ -7360,6 +7446,9 @@ def run_headless():
                         len(cfg.get("arb_condition_ids", [])),
                         cfg.get("arb_min_edge_pct", 1.0),
                         cfg.get("arb_size_usdc", 10.0))
+
+    # Persist merged config so next restart picks up everything.
+    save_user_config(cfg)
 
     bot = CopyTraderBot(cfg, logger)
 
