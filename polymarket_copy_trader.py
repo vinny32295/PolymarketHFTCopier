@@ -5630,6 +5630,10 @@ class CopyTraderBot:
                     self.clob_client, self.cfg, self.logger,
                 )
                 self._arb_monitor.start()
+                self.logger.info(
+                    "Copy trading from watched wallets DISABLED while "
+                    "arb mode is active (wallet polling skipped)"
+                )
                 if dynamic_slug:
                     self.logger.info(
                         "Arbitrage monitor enabled — dynamic slug '%s' "
@@ -5902,9 +5906,20 @@ class CopyTraderBot:
                     except Exception:
                         pass  # will be rechecked next cycle
 
+                # --- Skip copy trading when arb mode is active ---
+                # Arb and copy trading share the same CLOB client and
+                # balance; running both simultaneously slows the arb bot
+                # down with unnecessary wallet polling & API calls.
+                _arb_active = (
+                    self.cfg.get("arb_enabled")
+                    and getattr(self, "_arb_monitor", None) is not None
+                )
+
                 # --- Skip trade detection & execution while paused ---
                 if self._paused_low_balance:
                     pass  # just wait for balance to recover
+                elif _arb_active:
+                    pass  # arb mode owns the trading loop
                 else:
                     new_trades = []
 
