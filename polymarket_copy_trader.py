@@ -1156,7 +1156,7 @@ class PolymarketCLOBClient:
                             signed_retry, orderType=OrderType.FOK,
                         )
                         self.logger.info(
-                            "FOK retry filled: %s $%.2f @ %.4f (was %.4f) — %s",
+                            "FOK retry filled: %s $%.2f @ %.4f (was %.4f) for token %s — %s",
                             side, actual_usdc, retry_price, price,
                             token_id[:16] + "...", resp2,
                         )
