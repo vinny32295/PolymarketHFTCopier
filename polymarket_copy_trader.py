@@ -3384,32 +3384,37 @@ class MartingaleBot(threading.Thread):
     def _cycle(self):
         """One tick of the martingale state machine.
 
-        Returns ``True`` when the bot is in a position (slow-poll mode),
-        ``False`` when it's hunting for the next bet (fast-poll mode).
+        Returns ``True`` when the bot is in a position and the window
+        is still open (slow-poll mode), ``False`` for everything else
+        (fast-poll mode: checking resolution OR hunting for next bet).
         """
         if self._active_bet:
             bet = self._active_bet
             now = int(time.time())
 
-            # Wait until window has ended + buffer before checking
-            if now < bet["window_end"] + 30:
-                return True  # waiting — slow poll
+            # While the window is still open, slow-poll is fine
+            if now < bet["window_end"]:
+                return True  # window still open — slow poll
 
-            # --- Try Gamma API resolution first ---
+            # === WINDOW HAS ENDED — fast-poll from here on ===
+            elapsed = now - bet["window_end"]
+
+            # Small buffer (5s) before hitting the API to let the
+            # market settle, but use fast poll so we retry quickly.
+            if elapsed < 5:
+                return False  # fast poll — check again in 2s
+
+            # --- Try Gamma API resolution ---
             resolved, won = self._check_resolution(
                 bet["condition_id"], bet["direction"],
             )
 
-            if not resolved:
-                # --- Fallback: orderbook-based resolution ---
-                # If the API is slow to mark closed, check if the
-                # orderbook shows a clear winner (price >= $0.95).
-                elapsed = now - bet["window_end"]
-                if elapsed >= 60:  # only try fallback after 60s
-                    ob_result = self._check_resolution_orderbook(bet)
-                    if ob_result is not None:
-                        resolved = True
-                        won = ob_result
+            # --- Orderbook fallback (after just 10s) ---
+            if not resolved and elapsed >= 10:
+                ob_result = self._check_resolution_orderbook(bet)
+                if ob_result is not None:
+                    resolved = True
+                    won = ob_result
 
             if not resolved:
                 # Timeout: if 10 min past window end, give up
@@ -3419,14 +3424,13 @@ class MartingaleBot(threading.Thread):
                         bet["slug"],
                     )
                     self._handle_loss(bet)
-                    return False  # switch to fast poll for next bet
-                return True  # still waiting — slow poll
+                return False  # FAST poll — keep checking every 2s
 
             if won:
                 self._handle_win(bet)
             else:
                 self._handle_loss(bet)
-            return False  # resolved — switch to fast poll for next bet
+            return False  # resolved — fast poll for next bet
         else:
             placed = self._try_place_bet()
             return placed  # fast poll until placed, then slow poll
