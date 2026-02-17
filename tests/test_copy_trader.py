@@ -2846,16 +2846,20 @@ class TestArbExecution(unittest.TestCase):
         self.assertAlmostEqual(actual_usdc, 10.0, places=2)
 
     def test_place_arb_leg_passes_max_retry_price(self):
-        """_place_arb_leg forwards max_retry_price to place_order."""
+        """_place_arb_leg uses max_retry_price as initial FOK price."""
         mon = self._make_monitor()
         mon.clob_client.place_order.return_value = {
             "success": True,
             "takingAmount": "16.5",
             "makingAmount": "7.09",
         }
-        mon._place_arb_leg("tok", 0.43, 16.5, "Up", max_retry_price=0.44)
+        mon._place_arb_leg("tok", 0.43, 16.5, "Up", max_retry_price=0.55)
         call_args = mon.clob_client.place_order.call_args
-        self.assertEqual(call_args.kwargs.get("max_retry_price"), 0.44)
+        self.assertEqual(call_args.kwargs.get("max_retry_price"), 0.55)
+        # Initial FOK price should use max_retry_price for wider tolerance
+        self.assertEqual(call_args.kwargs.get("price"), 0.55)
+        # But size_usdc is still based on best ask (0.43)
+        self.assertAlmostEqual(call_args.kwargs.get("size_usdc"), round(16.5 * 0.43, 2))
 
     def test_place_arb_leg_fok_rejected(self):
         """_place_arb_leg returns (None, 0, 0) on FOK rejection."""

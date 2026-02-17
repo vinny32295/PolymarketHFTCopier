@@ -2688,7 +2688,7 @@ class ArbitrageMonitor(threading.Thread):
 
         Args:
             token_id: Token to buy.
-            price: Expected price per share.
+            price: Expected price per share (best ask at scan time).
             target_shares: Number of shares to acquire.
             label: Human-readable label for logging (e.g. "Up").
             max_retry_price: If set, caps the FOK retry price to this
@@ -2700,12 +2700,21 @@ class ArbitrageMonitor(threading.Thread):
             ``(None, 0, 0)`` on failure.
         """
         size_usdc = round(target_shares * price, 2)
+        # Send the initial FOK at the max arb-viable price instead of
+        # the exact best ask.  The CLOB fills at the best available
+        # price up to this limit, so small price movements between the
+        # orderbook fetch and the order submission won't cause a
+        # rejection.  Using the exact best ask (old behaviour) meant
+        # *any* movement resulted in a FOK rejection.
+        fok_price = price
+        if max_retry_price and max_retry_price > price:
+            fok_price = max_retry_price
         try:
             result = self.clob_client.place_order(
                 token_id=token_id,
                 side="BUY",
                 size_usdc=size_usdc,
-                price=price,
+                price=fok_price,
                 use_fok=True,
                 max_retry_price=max_retry_price,
             )
