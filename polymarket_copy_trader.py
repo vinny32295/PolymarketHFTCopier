@@ -478,6 +478,8 @@ DEFAULT_CONFIG = {
     "proxy_withdraw": True,
     "proxy_address": "",
     "webhook_url": "",
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
     "max_price_deviation_pct": 3,
     "max_loss_usdc": 0,
     "trade_max_age_seconds": 20,
@@ -523,6 +525,7 @@ _PERSISTENT_CONFIG_KEYS = [
     "arb_dynamic_window", "arb_dynamic_slugs", "arb_min_edge_pct",
     "arb_size_usdc", "arb_max_positions", "arb_poll_seconds",
     "webhook_url",
+    "telegram_bot_token", "telegram_chat_id",
     "martingale_enabled", "martingale_direction", "martingale_start_bet",
     "martingale_max_bet", "martingale_max_streak",
     "martingale_slug_base", "martingale_window", "martingale_poll_seconds",
@@ -663,6 +666,306 @@ def send_webhook(url, message, logger=None):
                 logger.debug("Webhook failed: %s", exc)
 
     threading.Thread(target=_post, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Telegram notifications & command bot
+# ---------------------------------------------------------------------------
+
+TELEGRAM_API = "https://api.telegram.org/bot{token}"
+
+
+def send_telegram(token, chat_id, message, logger=None, parse_mode=None):
+    """Fire-and-forget a Telegram message.
+
+    Runs in a daemon thread so it never blocks the bot loop.
+    """
+    if not token or not chat_id or not requests:
+        return
+
+    def _post():
+        try:
+            url = TELEGRAM_API.format(token=token) + "/sendMessage"
+            payload = {
+                "chat_id": chat_id,
+                "text": message[:4096],
+            }
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.status_code >= 400 and logger:
+                logger.debug(
+                    "Telegram returned %d: %s",
+                    resp.status_code, resp.text[:200],
+                )
+        except Exception as exc:
+            if logger:
+                logger.debug("Telegram send failed: %s", exc)
+
+    threading.Thread(target=_post, daemon=True).start()
+
+
+class TelegramCommandBot:
+    """Long-polls the Telegram Bot API for commands and replies with bot data.
+
+    Supported commands:
+        /balance  — current USDC & MATIC balances
+        /positions — open positions with floating P&L
+        /trades   — recent trade history (last 10)
+        /status   — bot running state, session P&L, uptime
+        /help     — list available commands
+    """
+
+    def __init__(self, token, chat_id, bot_ref, logger):
+        self.token = token
+        self.chat_id = str(chat_id)
+        self.bot = bot_ref          # CopyTraderBot instance
+        self.logger = logger
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._last_update_id = 0
+
+    def start(self):
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+        self.logger.info("Telegram command bot started (chat_id=%s)", self.chat_id)
+
+    def stop(self):
+        self._stop_event.set()
+        self.logger.info("Telegram command bot stopped")
+
+    def send(self, text, parse_mode=None):
+        """Send a message to the configured chat."""
+        send_telegram(self.token, self.chat_id, text, self.logger, parse_mode)
+
+    # -- polling loop -------------------------------------------------------
+
+    def _poll_loop(self):
+        base = TELEGRAM_API.format(token=self.token)
+        while not self._stop_event.is_set():
+            try:
+                resp = requests.get(
+                    base + "/getUpdates",
+                    params={
+                        "offset": self._last_update_id + 1,
+                        "timeout": 30,
+                    },
+                    timeout=35,
+                )
+                if resp.status_code != 200:
+                    self._stop_event.wait(5)
+                    continue
+                data = resp.json()
+                for update in data.get("result", []):
+                    self._last_update_id = update["update_id"]
+                    msg = update.get("message", {})
+                    # Only respond to our configured chat
+                    if str(msg.get("chat", {}).get("id")) != self.chat_id:
+                        continue
+                    text = (msg.get("text") or "").strip()
+                    if text.startswith("/"):
+                        self._handle_command(text)
+            except requests.exceptions.Timeout:
+                continue
+            except Exception as exc:
+                self.logger.debug("Telegram poll error: %s", exc)
+                self._stop_event.wait(5)
+
+    # -- command handlers ---------------------------------------------------
+
+    def _handle_command(self, text):
+        cmd = text.split()[0].lower().split("@")[0]  # strip @botname
+        handlers = {
+            "/balance": self._cmd_balance,
+            "/positions": self._cmd_positions,
+            "/trades": self._cmd_trades,
+            "/status": self._cmd_status,
+            "/help": self._cmd_help,
+            "/start": self._cmd_help,
+        }
+        handler = handlers.get(cmd)
+        if handler:
+            try:
+                handler()
+            except Exception as exc:
+                self.send(f"Error: {exc}")
+        else:
+            self.send(f"Unknown command: {cmd}\nType /help for available commands.")
+
+    def _get_executor(self):
+        if self.bot and hasattr(self.bot, "executor") and self.bot.executor:
+            return self.bot.executor
+        return None
+
+    def _cmd_balance(self):
+        executor = self._get_executor()
+        if not executor:
+            self.send("Bot not running — no balance data available.")
+            return
+        try:
+            usdc = executor.get_usdc_balance(max_age_seconds=15)
+        except Exception:
+            usdc = None
+        try:
+            matic = executor.get_matic_balance()
+        except Exception:
+            matic = None
+
+        lines = ["BALANCE"]
+        lines.append(f"  USDC:  ${usdc:,.2f}" if usdc is not None else "  USDC:  unavailable")
+        lines.append(f"  MATIC: {matic:,.4f}" if matic is not None else "  MATIC: unavailable")
+
+        # Proxy balance
+        proxy = self.bot.cfg.get("proxy_address", "")
+        if proxy and proxy.startswith("0x") and len(proxy) == 42:
+            try:
+                proxy_usdc = executor.get_proxy_usdc_balance(proxy)
+                lines.append(f"  Proxy: ${proxy_usdc:,.2f}")
+            except Exception:
+                pass
+
+        self.send("\n".join(lines))
+
+    def _cmd_positions(self):
+        executor = self._get_executor()
+        if not executor:
+            self.send("Bot not running — no position data available.")
+            return
+        positions = dict(executor._positions)
+        if not positions:
+            self.send("No open positions.")
+            return
+
+        lines = [f"OPEN POSITIONS ({len(positions)})"]
+        total_cost = Decimal("0")
+        total_value = Decimal("0")
+
+        for token_id, pos in positions.items():
+            tokens = pos.get("tokens", Decimal("0"))
+            entry_price = pos.get("entry_price", Decimal("0"))
+            if tokens <= 0:
+                continue
+            market_name = pos.get("market_name") or (token_id[:16] + "...")
+            cost_basis = tokens * entry_price
+            total_cost += cost_basis
+
+            # Try to get current price
+            cur_price = None
+            if self.bot.clob_client:
+                try:
+                    cur_price = self.bot.clob_client.get_last_trade_price(token_id)
+                except Exception:
+                    pass
+
+            if cur_price is not None:
+                cur_price_d = Decimal(str(cur_price))
+                cur_value = tokens * cur_price_d
+                total_value += cur_value
+                float_pnl = cur_value - cost_basis
+                pnl_sign = "+" if float_pnl >= 0 else ""
+                lines.append(
+                    f"\n  {market_name[:40]}\n"
+                    f"    {tokens:.1f} shares @ ${entry_price:.4f}\n"
+                    f"    Now ${cur_price_d:.4f} | P/L {pnl_sign}${float_pnl:.2f}"
+                )
+            else:
+                total_value += cost_basis
+                lines.append(
+                    f"\n  {market_name[:40]}\n"
+                    f"    {tokens:.1f} shares @ ${entry_price:.4f}"
+                )
+
+        total_pnl = total_value - total_cost
+        pnl_sign = "+" if total_pnl >= 0 else ""
+        lines.append(f"\nTotal: cost ${total_cost:.2f} | value ${total_value:.2f} | {pnl_sign}${total_pnl:.2f}")
+        self.send("\n".join(lines))
+
+    def _cmd_trades(self):
+        # Try session trades first, then trade_history.json
+        trades = []
+        if self.bot:
+            trades = list(getattr(self.bot, "_trade_history", []))
+        if not trades:
+            try:
+                history_file = self.bot.cfg.get("trade_history_file", "trade_history.json") if self.bot else "trade_history.json"
+                with open(history_file, "r") as fh:
+                    trades = json.load(fh)
+            except (FileNotFoundError, json.JSONDecodeError):
+                pass
+
+        if not trades:
+            self.send("No trade history available.")
+            return
+
+        recent = trades[-10:]  # last 10
+        lines = [f"RECENT TRADES (last {len(recent)} of {len(trades)})"]
+        for t in reversed(recent):
+            side = t.get("side", "?")
+            amount = t.get("amount_usdc", t.get("cost", 0))
+            price = t.get("price", 0)
+            ts = t.get("timestamp", t.get("ts", ""))
+            status = t.get("status", "")
+            pnl = t.get("pnl_usdc", "")
+
+            line = f"  {side} ${float(amount):,.2f} @ {float(price):.4f}"
+            if pnl:
+                line += f" | P/L ${float(pnl):+.2f}"
+            if ts:
+                # Show just time portion
+                ts_short = str(ts).split("T")[-1][:8] if "T" in str(ts) else str(ts)[-8:]
+                line += f" [{ts_short}]"
+            lines.append(line)
+
+        self.send("\n".join(lines))
+
+    def _cmd_status(self):
+        running = self.bot.running if self.bot else False
+        lines = [f"BOT STATUS: {'RUNNING' if running else 'STOPPED'}"]
+
+        if running and self.bot:
+            # Uptime
+            start = getattr(self.bot, "_session_start", None)
+            if start:
+                delta = datetime.now() - start
+                hours, rem = divmod(int(delta.total_seconds()), 3600)
+                minutes = rem // 60
+                lines.append(f"  Uptime: {hours}h {minutes}m")
+
+            # Session trades
+            trade_count = len(getattr(self.bot, "_trade_history", []))
+            lines.append(f"  Session trades: {trade_count}")
+
+            # Modes
+            modes = []
+            if self.bot.cfg.get("watched_addresses"):
+                modes.append(f"Copy ({len(self.bot.cfg['watched_addresses'])} addr)")
+            if getattr(self.bot, "_arb_monitor", None):
+                modes.append("Arbitrage")
+            if getattr(self.bot, "_martingale_bot", None):
+                mg = self.bot._martingale_bot
+                lines.append(
+                    f"  Martingale: streak={mg.consecutive_losses}, "
+                    f"bet=${mg.current_bet:.2f}, "
+                    f"P/L=${mg.session_pnl:+.2f}"
+                )
+                modes.append("Martingale")
+            lines.append(f"  Modes: {', '.join(modes) if modes else 'none'}")
+
+            # Dry run
+            if self.bot.cfg.get("dry_run"):
+                lines.append("  DRY RUN MODE")
+
+        self.send("\n".join(lines))
+
+    def _cmd_help(self):
+        self.send(
+            "Polymarket Bot Commands:\n"
+            "/balance — USDC & MATIC balances\n"
+            "/positions — open positions with P/L\n"
+            "/trades — recent trade history\n"
+            "/status — bot state, uptime, session info\n"
+            "/help — this message"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -6711,13 +7014,18 @@ class CopyTraderBot:
         self._ws_wake = threading.Event()
         self._arb_monitor = None
         self._martingale_bot = None
+        self._telegram_bot = None
         self.executor = None
         self.clob_client = None
 
     def _notify(self, message):
-        """Send a webhook notification if configured."""
+        """Send a webhook and/or Telegram notification if configured."""
         url = self.cfg.get("webhook_url", "")
         send_webhook(url, message, logger=self.logger)
+        tg_token = self.cfg.get("telegram_bot_token", "")
+        tg_chat = self.cfg.get("telegram_chat_id", "")
+        if tg_token and tg_chat:
+            send_telegram(tg_token, tg_chat, message, logger=self.logger)
 
     def _append_trade_history(self, record):
         """Append a trade record to the persistent trade_history.json.
@@ -6918,6 +7226,9 @@ class CopyTraderBot:
         # Stop Martingale bot if running
         if self._martingale_bot:
             self._martingale_bot.stop()
+        # Stop Telegram command bot if running
+        if self._telegram_bot:
+            self._telegram_bot.stop()
         # Wake the main loop so it exits the Event.wait() immediately
         if hasattr(self, '_ws_wake'):
             self._ws_wake.set()
@@ -7025,6 +7336,16 @@ class CopyTraderBot:
                 self.cfg.get("martingale_slug_base", "btc-updown-5m"),
                 self.cfg.get("martingale_window", 300),
             )
+
+        # ---- Start Telegram command bot (independent of trading mode) ----
+        tg_token = self.cfg.get("telegram_bot_token", "").strip()
+        tg_chat = self.cfg.get("telegram_chat_id", "").strip()
+        if tg_token and tg_chat and requests:
+            self._telegram_bot = TelegramCommandBot(
+                tg_token, tg_chat, self, self.logger,
+            )
+            self._telegram_bot.start()
+            self._notify("Bot started")
 
         if web3_ok:
             # ---- Backfill market names for legacy positions ----
@@ -8230,6 +8551,43 @@ class CopyTraderGUI:
             wraplength=600,
         ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
 
+        # --- Telegram Notifications ---
+        row += 1
+        ttk.Separator(parent, orient=tk.HORIZONTAL).grid(
+            row=row, column=0, columnspan=3, sticky=tk.EW, pady=8
+        )
+
+        row += 1
+        ttk.Label(
+            parent, text="Telegram Notifications (mobile alerts & commands):",
+            font=("TkDefaultFont", 9, "bold"),
+        ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=3)
+
+        row += 1
+        ttk.Label(parent, text="Bot Token:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.tg_token_entry = ttk.Entry(parent, width=70, show="*")
+        self.tg_token_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, pady=2)
+
+        row += 1
+        ttk.Label(parent, text="Chat ID:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        tg_chat_frame = ttk.Frame(parent)
+        tg_chat_frame.grid(row=row, column=1, columnspan=2, sticky=tk.EW, pady=2)
+        self.tg_chat_entry = ttk.Entry(tg_chat_frame, width=20)
+        self.tg_chat_entry.pack(side=tk.LEFT)
+        ttk.Button(
+            tg_chat_frame, text="Test",
+            command=self._test_telegram,
+        ).pack(side=tk.LEFT, padx=10)
+
+        row += 1
+        ttk.Label(
+            parent,
+            text="Create a bot via @BotFather on Telegram to get the token. "
+                 "Send /start to your bot, then use @userinfobot to find your Chat ID.",
+            foreground="gray",
+            wraplength=600,
+        ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
+
         parent.columnconfigure(1, weight=1)
 
     def _build_address_tab(self, parent):
@@ -8835,6 +9193,9 @@ class CopyTraderGUI:
         self.api_key_entry.insert(0, self.cfg.get("clob_api_key", ""))
         self.api_secret_entry.insert(0, self.cfg.get("clob_api_secret", ""))
         self.api_passphrase_entry.insert(0, self.cfg.get("clob_api_passphrase", ""))
+        # Telegram fields
+        self.tg_token_entry.insert(0, self.cfg.get("telegram_bot_token", ""))
+        self.tg_chat_entry.insert(0, self.cfg.get("telegram_chat_id", ""))
         pk = load_private_key(self.cfg)
         if pk:
             self.pk_entry.insert(0, pk)
@@ -8887,6 +9248,9 @@ class CopyTraderGUI:
         self.cfg["clob_api_key"] = self.api_key_entry.get().strip()
         self.cfg["clob_api_secret"] = self.api_secret_entry.get().strip()
         self.cfg["clob_api_passphrase"] = self.api_passphrase_entry.get().strip()
+        # Telegram
+        self.cfg["telegram_bot_token"] = self.tg_token_entry.get().strip()
+        self.cfg["telegram_chat_id"] = self.tg_chat_entry.get().strip()
         try:
             self.cfg["max_trade_usdc"] = float(self.max_trade_entry.get().strip())
         except ValueError:
@@ -9073,6 +9437,37 @@ class CopyTraderGUI:
         except Exception as exc:
             self.logger.error("Failed to derive API credentials: %s", exc)
             messagebox.showerror("Error", f"Failed to derive credentials:\n{exc}")
+
+    def _test_telegram(self):
+        """Send a test message to the configured Telegram chat."""
+        token = self.tg_token_entry.get().strip()
+        chat_id = self.tg_chat_entry.get().strip()
+        if not token or not chat_id:
+            messagebox.showwarning(
+                "Missing Config",
+                "Enter both Bot Token and Chat ID first.",
+            )
+            return
+        if not requests:
+            messagebox.showerror(
+                "Missing Library",
+                "The requests library is not installed.",
+            )
+            return
+        try:
+            url = TELEGRAM_API.format(token=token) + "/sendMessage"
+            resp = requests.post(
+                url,
+                json={"chat_id": chat_id, "text": "Polymarket Bot: test message received!"},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                messagebox.showinfo("Success", "Test message sent! Check your Telegram.")
+            else:
+                detail = resp.json().get("description", resp.text[:200])
+                messagebox.showerror("Failed", f"Telegram API error:\n{detail}")
+        except Exception as exc:
+            messagebox.showerror("Error", f"Could not send message:\n{exc}")
 
     def _add_address(self):
         addr = self.new_addr_entry.get().strip()
@@ -9312,6 +9707,12 @@ def run_headless():
         cfg["martingale_price_max"] = float(os.environ["MARTINGALE_PRICE_MAX"])
     if os.environ.get("MARTINGALE_MAX_ENTRY_SECONDS"):
         cfg["martingale_max_entry_seconds"] = int(os.environ["MARTINGALE_MAX_ENTRY_SECONDS"])
+
+    # Telegram env vars
+    if os.environ.get("TELEGRAM_BOT_TOKEN"):
+        cfg["telegram_bot_token"] = os.environ["TELEGRAM_BOT_TOKEN"].strip()
+    if os.environ.get("TELEGRAM_CHAT_ID"):
+        cfg["telegram_chat_id"] = os.environ["TELEGRAM_CHAT_ID"].strip()
 
     # Delete stale state file for a clean start
     if os.environ.get("MARTINGALE_RESET", "").strip().lower() in ("1", "true", "yes"):
