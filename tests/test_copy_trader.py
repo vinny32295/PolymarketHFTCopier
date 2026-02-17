@@ -3030,6 +3030,7 @@ class TestMartingaleBot(unittest.TestCase):
         mb._active_bet = None
         mb._bet_history = []
         mb._last_window_ts = 0
+        mb._next_window_cache = None
         mb.notify_callback = None
         mb.log_trade_callback = None
         return mb

@@ -2823,6 +2823,7 @@ class MartingaleBot(threading.Thread):
         self._active_bet = None
         self._bet_history = []
         self._last_window_ts = 0
+        self._next_window_cache = None  # pre-fetched market for next window
 
         # Callbacks (wired by CopyTraderBot)
         self.notify_callback = None
@@ -3091,6 +3092,22 @@ class MartingaleBot(threading.Thread):
 
             # Need a clear winner (one price near 1.0)
             if max(outcome_prices) < 0.9:
+                # Extra check: if the market is closed/inactive AND our
+                # side's price is near zero, we can detect a loss even
+                # when the winner hasn't been priced to 1.0 yet.
+                if (not active or closed) and outcome_prices:
+                    dir_idx = None
+                    for i, o in enumerate(outcomes):
+                        if str(o).lower() == str(direction).lower():
+                            dir_idx = i
+                            break
+                    if dir_idx is not None and outcome_prices[dir_idx] <= 0.05:
+                        self.logger.info(
+                            "MARTINGALE RESOLVED (early): %s price=%.4f "
+                            "≤ 0.05 on closed market — treating as LOSS",
+                            direction, outcome_prices[dir_idx],
+                        )
+                        return True, False
                 self.logger.info(
                     "MARTINGALE RESOLUTION: no clear winner yet "
                     "(prices=%s, max=%.2f < 0.9)",
@@ -3143,6 +3160,45 @@ class MartingaleBot(threading.Thread):
         except Exception:
             return None
 
+    # -- pre-fetch for fast follow-up bet -----------------------------------
+
+    def _prefetch_next_window(self):
+        """Pre-fetch the next window's market so we're ready to bet instantly.
+
+        Called in the final 15s of the current window.  Stores the slug,
+        market data, and token ID so ``_try_place_bet`` can skip the
+        expensive Gamma API call.
+        """
+        try:
+            window = int(self.cfg.get("martingale_window", 300))
+            now = int(time.time())
+            # Next window starts at the next aligned boundary
+            next_window_ts = (now // window + 1) * window
+            base = self.cfg.get("martingale_slug_base", "btc-updown-5m")
+            slug = f"{base}-{next_window_ts}"
+
+            market = self._fetch_market(slug)
+            if not market:
+                return  # market not available yet — will retry on next poll
+
+            direction = self.cfg.get("martingale_direction", self.direction)
+            token_id = (
+                market["up_token"] if direction == "Up" else market["down_token"]
+            )
+
+            self._next_window_cache = {
+                "window_ts": next_window_ts,
+                "slug": slug,
+                "market": market,
+                "token_id": token_id,
+            }
+            self.logger.info(
+                "MARTINGALE: pre-cached next window market '%s' (token=%s..)",
+                slug, token_id[:16] if token_id else "?",
+            )
+        except Exception as exc:
+            self.logger.debug("MARTINGALE: prefetch failed: %s", exc)
+
     # -- bet placement & result handling ------------------------------------
 
     def _try_place_bet(self):
@@ -3190,23 +3246,36 @@ class MartingaleBot(threading.Thread):
             self._last_window_ts = current_window_ts  # mark skipped
             return False
 
-        # Fetch the market
-        slug = self._generate_slug()
-        market = self._fetch_market(slug)
-        if not market:
+        # Use pre-fetched cache if it matches this window
+        cache = self._next_window_cache
+        if cache and cache["window_ts"] == current_window_ts:
+            slug = cache["slug"]
+            market = cache["market"]
+            token_id = cache["token_id"]
+            self._next_window_cache = None  # consumed
             self.logger.info(
-                "MARTINGALE: market not available yet for '%s' — "
-                "will retry (%ds into window)", slug, seconds_into,
+                "MARTINGALE: using pre-cached market for '%s'", slug,
             )
-            return False  # don't mark as skipped — retry on next poll
+        else:
+            # Fetch the market (no cache or stale cache)
+            self._next_window_cache = None
+            slug = self._generate_slug()
+            market = self._fetch_market(slug)
+            if not market:
+                self.logger.info(
+                    "MARTINGALE: market not available yet for '%s' — "
+                    "will retry (%ds into window)", slug, seconds_into,
+                )
+                return False  # don't mark as skipped — retry on next poll
 
-        # Allow runtime direction toggle via config
-        direction = self.cfg.get("martingale_direction", self.direction)
-        self.direction = direction
+            # Allow runtime direction toggle via config
+            direction = self.cfg.get("martingale_direction", self.direction)
+            self.direction = direction
 
-        token_id = (
-            market["up_token"] if direction == "Up" else market["down_token"]
-        )
+            token_id = (
+                market["up_token"] if direction == "Up"
+                else market["down_token"]
+            )
         ask_price, ask_size = self._get_best_ask(token_id)
         if not ask_price or ask_price <= 0:
             self.logger.info(
@@ -3392,6 +3461,13 @@ class MartingaleBot(threading.Thread):
             bet = self._active_bet
             now = int(time.time())
 
+            # Pre-cache next window's market in the final 15s of the
+            # current window so we're ready to bet immediately after
+            # resolution.
+            time_left = bet["window_end"] - now
+            if 0 < time_left <= 15 and not self._next_window_cache:
+                self._prefetch_next_window()
+
             # While the window is still open, slow-poll is fine
             if now < bet["window_end"]:
                 return True  # window still open — slow poll
@@ -3399,22 +3475,24 @@ class MartingaleBot(threading.Thread):
             # === WINDOW HAS ENDED — fast-poll from here on ===
             elapsed = now - bet["window_end"]
 
-            # Small buffer (5s) before hitting the API to let the
-            # market settle, but use fast poll so we retry quickly.
-            if elapsed < 5:
+            # Small buffer (3s) before checking to let the orderbook
+            # settle, but use fast poll so we retry quickly.
+            if elapsed < 3:
                 return False  # fast poll — check again in 2s
 
-            # --- Try Gamma API resolution ---
-            resolved, won = self._check_resolution(
-                bet["condition_id"], bet["direction"],
-            )
+            # --- Orderbook is fastest — check it FIRST ---
+            resolved = False
+            won = None
+            ob_result = self._check_resolution_orderbook(bet)
+            if ob_result is not None:
+                resolved = True
+                won = ob_result
 
-            # --- Orderbook fallback (after just 10s) ---
-            if not resolved and elapsed >= 10:
-                ob_result = self._check_resolution_orderbook(bet)
-                if ob_result is not None:
-                    resolved = True
-                    won = ob_result
+            # --- Gamma API as secondary confirmation ---
+            if not resolved:
+                resolved, won = self._check_resolution(
+                    bet["condition_id"], bet["direction"],
+                )
 
             if not resolved:
                 # Timeout: if 10 min past window end, give up
