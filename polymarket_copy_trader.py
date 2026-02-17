@@ -1014,7 +1014,7 @@ class PolymarketCLOBClient:
         return None
 
     def place_order(self, token_id, side, size_usdc, price, neg_risk=False,
-                    use_fok=False):
+                    use_fok=False, max_retry_price=None):
         """Place an order on the Polymarket CLOB.
 
         By default places a GTC (Good-Till-Cancelled) limit order.  When
@@ -1030,6 +1030,10 @@ class PolymarketCLOBClient:
             price: Price per share (0.0–1.0 range).
             neg_risk: Whether the market uses the neg-risk framework.
             use_fok: If True, try FOK first for instant fill.
+            max_retry_price: If set, caps the FOK retry price.  Used by
+                arb orders to prevent the retry from accepting a fill
+                price that destroys the arb edge.  If the refreshed ask
+                exceeds this cap, the retry is aborted.
 
         Returns:
             Order response dict, or None on failure.
@@ -1133,6 +1137,18 @@ class PolymarketCLOBClient:
                         retry_ask = float(retry_asks[0].get("price", 0)) if retry_asks else 0
                         if side.upper() == "BUY" and retry_ask > 0:
                             retry_price = round(min(retry_ask * 1.005, 0.99), 2)
+                            # Respect arb-imposed price cap to preserve edge
+                            if max_retry_price is not None:
+                                if retry_price > max_retry_price:
+                                    self.logger.warning(
+                                        "FOK retry: refreshed ask $%.4f exceeds "
+                                        "max retry price $%.4f — aborting to "
+                                        "preserve arb edge",
+                                        retry_price, max_retry_price,
+                                    )
+                                    return {"status": "fok_rejected",
+                                            "reason": "retry_price_exceeds_cap"}
+                                retry_price = min(retry_price, max_retry_price)
                         elif side.upper() == "SELL" and retry_bid > 0:
                             retry_price = round(max(retry_bid * 0.995, 0.01), 2)
                         else:
@@ -2337,19 +2353,17 @@ class ArbitrageMonitor(threading.Thread):
             # Calculate how many shares we can buy (limited by available
             # liquidity on both sides and our configured size).
             max_shares_by_budget = arb_size / max(best_ask_yes, best_ask_no)
-            max_shares = min(max_shares_by_budget, avail_yes, avail_no)
-            usdc_yes = round(max_shares * best_ask_yes, 2)
-            usdc_no = round(max_shares * best_ask_no, 2)
-            total_cost = usdc_yes + usdc_no
-            locked_profit = round(max_shares - total_cost, 4)
+            target_shares = min(max_shares_by_budget, avail_yes, avail_no)
+            est_cost = round(target_shares * (best_ask_yes + best_ask_no), 2)
+            est_profit = round(target_shares - est_cost, 4)
 
             self.logger.info(
                 "ARB OPPORTUNITY: %s — %s=$%.3f + %s=$%.3f = $%.4f "
-                "(edge %.2f%%, ~%.0f shares, cost $%.2f, locked profit $%.4f)",
+                "(edge %.2f%%, ~%.0f shares, est cost $%.2f, est profit $%.4f)",
                 mkt["question"][:50],
                 mkt["yes_label"], best_ask_yes,
                 mkt["no_label"], best_ask_no,
-                combined, edge_pct, max_shares, total_cost, locked_profit,
+                combined, edge_pct, target_shares, est_cost, est_profit,
             )
 
             if dry_run:
@@ -2371,10 +2385,22 @@ class ArbitrageMonitor(threading.Thread):
                     )
                     continue
 
-            # Execute both legs
-            yes_result = self._place_arb_leg(
-                yes_token, best_ask_yes, usdc_yes, mkt["yes_label"],
+            # --- Execute first leg ---
+            # Cap the FOK retry price to preserve the arb edge.
+            # Max acceptable price for this leg = $1 - other_side_ask - min_margin.
+            # This prevents the retry from accepting a fill that destroys the arb.
+            max_retry_yes = round(1.0 - best_ask_no - 0.005, 2)
+            yes_result, yes_shares, yes_cost = self._place_arb_leg(
+                yes_token, best_ask_yes, target_shares, mkt["yes_label"],
+                max_retry_price=max(max_retry_yes, 0.01),
             )
+
+            if not yes_result:
+                self.logger.warning(
+                    "ARB ABORTED: first leg (%s) failed for %s",
+                    mkt["yes_label"], mkt["question"][:40],
+                )
+                continue
 
             # Guard between legs: if window rotated after first leg, do NOT
             # place the second leg (it would target a different market).
@@ -2383,59 +2409,154 @@ class ArbitrageMonitor(threading.Thread):
                 if current_wk != window_keys_at_start[cid]:
                     self.logger.warning(
                         "ARB ABORTED BETWEEN LEGS: window rotated after %s leg "
-                        "filled — skipping %s leg to avoid cross-market position. "
-                        "%s leg result: %s",
-                        mkt["yes_label"], mkt["no_label"],
-                        mkt["yes_label"],
-                        "OK" if yes_result else "FAILED",
+                        "filled (%.2f shares @ $%.2f) — skipping %s leg",
+                        mkt["yes_label"], yes_shares, yes_cost,
+                        mkt["no_label"],
                     )
-                    # Track the single-leg fill so we know about it
-                    if yes_result:
-                        self._active_positions[cid] = {
-                            "question": mkt["question"],
-                            "yes_fill": yes_result,
-                            "no_fill": None,
-                            "total_cost": usdc_yes,
-                            "locked_profit": 0,
-                            "edge_pct": 0,
-                            "partial": True,
-                            "ts": datetime.now().isoformat(),
-                        }
-                        self._save_positions()
+                    self._active_positions[cid] = {
+                        "question": mkt["question"],
+                        "yes_fill": yes_result,
+                        "no_fill": None,
+                        "total_cost": yes_cost,
+                        "locked_profit": 0,
+                        "edge_pct": 0,
+                        "partial": True,
+                        "ts": datetime.now().isoformat(),
+                    }
+                    self._save_positions()
                     continue
 
-            no_result = self._place_arb_leg(
-                no_token, best_ask_no, usdc_no, mkt["no_label"],
+            # --- Verify arb viability after first leg ---
+            # The first leg may have filled at a different price than
+            # expected.  Check that the actual cost per share + current
+            # best ask for the other side still yields a profit.
+            yes_eff_price = yes_cost / yes_shares if yes_shares > 0 else best_ask_yes
+            try:
+                fresh_book_no = self.clob_client.get_order_book(no_token)
+                fresh_asks_no = sorted(
+                    (fresh_book_no or {}).get("asks") or [],
+                    key=lambda e: float(e.get("price", "0")),
+                )
+                fresh_ask_no = float(fresh_asks_no[0].get("price", 0)) if fresh_asks_no else 0
+                fresh_avail_no = float(fresh_asks_no[0].get("size", 0)) if fresh_asks_no else 0
+            except Exception:
+                fresh_ask_no = best_ask_no
+                fresh_avail_no = avail_no
+
+            if fresh_ask_no <= 0:
+                self.logger.warning(
+                    "ARB ABORTED: no asks on %s side after first leg fill",
+                    mkt["no_label"],
+                )
+                self._active_positions[cid] = {
+                    "question": mkt["question"],
+                    "yes_fill": yes_result, "no_fill": None,
+                    "total_cost": yes_cost, "locked_profit": 0,
+                    "edge_pct": 0, "partial": True,
+                    "ts": datetime.now().isoformat(),
+                }
+                self._save_positions()
+                continue
+
+            real_combined = yes_eff_price + fresh_ask_no
+            if real_combined >= 1.0:
+                self.logger.warning(
+                    "ARB ABORTED: after first leg, combined cost $%.4f >= $1 "
+                    "(%s eff=$%.4f + %s ask=$%.4f) — no longer profitable",
+                    real_combined,
+                    mkt["yes_label"], yes_eff_price,
+                    mkt["no_label"], fresh_ask_no,
+                )
+                self._active_positions[cid] = {
+                    "question": mkt["question"],
+                    "yes_fill": yes_result, "no_fill": None,
+                    "total_cost": yes_cost, "locked_profit": 0,
+                    "edge_pct": 0, "partial": True,
+                    "ts": datetime.now().isoformat(),
+                }
+                self._save_positions()
+                continue
+
+            # --- Execute second leg ---
+            # CRITICAL: use the ACTUAL share count from the first leg
+            # so both sides have equal shares.  Also cap to available
+            # liquidity on the second side.
+            no_target_shares = min(yes_shares, fresh_avail_no)
+            if no_target_shares < yes_shares * 0.95:
+                self.logger.warning(
+                    "ARB ABORTED: insufficient %s liquidity "
+                    "(need %.2f shares, avail %.2f) for equal-share arb",
+                    mkt["no_label"], yes_shares, fresh_avail_no,
+                )
+                self._active_positions[cid] = {
+                    "question": mkt["question"],
+                    "yes_fill": yes_result, "no_fill": None,
+                    "total_cost": yes_cost, "locked_profit": 0,
+                    "edge_pct": 0, "partial": True,
+                    "ts": datetime.now().isoformat(),
+                }
+                self._save_positions()
+                continue
+
+            max_retry_no = round(1.0 - yes_eff_price - 0.005, 2)
+            no_result, no_shares, no_cost = self._place_arb_leg(
+                no_token, fresh_ask_no, no_target_shares, mkt["no_label"],
+                max_retry_price=max(max_retry_no, 0.01),
             )
 
             if yes_result and no_result:
+                actual_total_cost = yes_cost + no_cost
+                actual_min_shares = min(yes_shares, no_shares)
+                actual_profit = round(actual_min_shares - actual_total_cost, 4)
+                actual_edge = round(
+                    (1.0 - actual_total_cost / actual_min_shares) * 100
+                    if actual_min_shares > 0 else 0, 2,
+                )
                 self._active_positions[cid] = {
                     "question": mkt["question"],
                     "yes_fill": yes_result,
                     "no_fill": no_result,
-                    "total_cost": total_cost,
-                    "locked_profit": locked_profit,
-                    "edge_pct": round(edge_pct, 4),
+                    "yes_shares": yes_shares,
+                    "no_shares": no_shares,
+                    "total_cost": actual_total_cost,
+                    "locked_profit": actual_profit,
+                    "edge_pct": actual_edge,
                     "ts": datetime.now().isoformat(),
                 }
                 self._save_positions()
                 self.logger.info(
-                    "ARB EXECUTED: %s — cost $%.2f, locked profit $%.4f (%.2f%%)",
-                    mkt["question"][:50], total_cost, locked_profit, edge_pct,
+                    "ARB EXECUTED: %s — %s=%.2f shares, %s=%.2f shares, "
+                    "cost $%.2f, locked profit $%.4f (%.2f%%)",
+                    mkt["question"][:50],
+                    mkt["yes_label"], yes_shares,
+                    mkt["no_label"], no_shares,
+                    actual_total_cost, actual_profit, actual_edge,
                 )
+                if abs(yes_shares - no_shares) > 0.01:
+                    self.logger.warning(
+                        "ARB WARNING: share mismatch — %s=%.4f vs %s=%.4f "
+                        "(diff=%.4f, %.2f unhedged shares)",
+                        mkt["yes_label"], yes_shares,
+                        mkt["no_label"], no_shares,
+                        abs(yes_shares - no_shares),
+                        abs(yes_shares - no_shares),
+                    )
             else:
                 self.logger.warning(
-                    "ARB PARTIAL FILL: %s — yes=%s, no=%s (one side may have failed)",
+                    "ARB PARTIAL FILL: %s — %s=%s, %s=%s",
                     mkt["question"][:40],
-                    "OK" if yes_result else "FAILED",
-                    "OK" if no_result else "FAILED",
+                    mkt["yes_label"],
+                    "%.2f shares" % yes_shares if yes_result else "FAILED",
+                    mkt["no_label"],
+                    "%.2f shares" % no_shares if no_result else "FAILED",
                 )
-                # Track partial fills so they aren't silently lost
                 self._active_positions[cid] = {
                     "question": mkt["question"],
                     "yes_fill": yes_result,
                     "no_fill": no_result,
-                    "total_cost": (usdc_yes if yes_result else 0) + (usdc_no if no_result else 0),
+                    "yes_shares": yes_shares if yes_result else 0,
+                    "no_shares": no_shares if no_result else 0,
+                    "total_cost": (yes_cost if yes_result else 0) + (no_cost if no_result else 0),
                     "locked_profit": 0,
                     "edge_pct": round(edge_pct, 4),
                     "partial": True,
@@ -2443,8 +2564,24 @@ class ArbitrageMonitor(threading.Thread):
                 }
                 self._save_positions()
 
-    def _place_arb_leg(self, token_id, price, size_usdc, label):
-        """Place a single FOK buy order for one side of the arb."""
+    def _place_arb_leg(self, token_id, price, target_shares, label,
+                       max_retry_price=None):
+        """Place a single FOK buy order for one side of the arb.
+
+        Args:
+            token_id: Token to buy.
+            price: Expected price per share.
+            target_shares: Number of shares to acquire.
+            label: Human-readable label for logging (e.g. "Up").
+            max_retry_price: If set, caps the FOK retry price to this
+                value.  For arb orders this prevents the retry from
+                accepting a fill price that destroys the arb edge.
+
+        Returns:
+            ``(result_dict, actual_shares, actual_cost)`` on success,
+            ``(None, 0, 0)`` on failure.
+        """
+        size_usdc = round(target_shares * price, 2)
         try:
             result = self.clob_client.place_order(
                 token_id=token_id,
@@ -2452,6 +2589,7 @@ class ArbitrageMonitor(threading.Thread):
                 size_usdc=size_usdc,
                 price=price,
                 use_fok=True,
+                max_retry_price=max_retry_price,
             )
             # Guard against FOK rejections that return a truthy dict like
             # {"status": "fok_rejected", ...} or {"error": ...} — these
@@ -2463,16 +2601,41 @@ class ArbitrageMonitor(threading.Thread):
                 self.logger.warning(
                     "Arb leg NOT filled (%s): %s", label, result,
                 )
-                return None
+                return None, 0.0, 0.0
+
+            # Extract actual fill amounts from the CLOB response.
+            # For BUY: takingAmount = shares received, makingAmount = USDC spent.
+            actual_shares = 0.0
+            actual_cost = 0.0
+            if isinstance(result, dict):
+                try:
+                    actual_shares = float(result.get("takingAmount", 0))
+                except (ValueError, TypeError):
+                    pass
+                try:
+                    actual_cost = float(result.get("makingAmount", 0))
+                except (ValueError, TypeError):
+                    pass
+            # Fallback: if response doesn't have these fields, use our
+            # planned values as a best-effort estimate.
+            if actual_shares <= 0:
+                actual_shares = target_shares
+            if actual_cost <= 0:
+                actual_cost = size_usdc
+
             if result:
+                eff_price = actual_cost / actual_shares if actual_shares > 0 else price
                 self.logger.info(
-                    "Arb leg filled: %s @ $%.3f for $%.2f — %s",
-                    label, price, size_usdc, str(result)[:100],
+                    "Arb leg filled: %s — %.2f shares @ $%.4f eff "
+                    "(planned %.2f @ $%.3f, cost $%.2f) — %s",
+                    label, actual_shares, eff_price,
+                    target_shares, price, actual_cost,
+                    str(result)[:100],
                 )
-            return result
+            return result, actual_shares, actual_cost
         except Exception as exc:
             self.logger.error("Arb leg FAILED (%s): %s", label, exc)
-            return None
+            return None, 0.0, 0.0
 
     # -- public helpers (used by GUI / dashboard) ---------------------------
 

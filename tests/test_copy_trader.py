@@ -2785,5 +2785,207 @@ class TestArbitrageMonitorMultiSlug(unittest.TestCase):
         self.assertTrue(parts[0][0].islower())  # month is lowercase
 
 
+class TestArbExecution(unittest.TestCase):
+    """Tests for arb execution: equal shares, retry cap, viability check."""
+
+    def _make_monitor(self, cfg_overrides=None):
+        cfg = dict(bot.DEFAULT_CONFIG)
+        cfg["arb_min_edge_pct"] = 1.0
+        cfg["arb_size_usdc"] = 10.0
+        cfg["arb_max_positions"] = 5
+        if cfg_overrides:
+            cfg.update(cfg_overrides)
+        logger = logging.getLogger("test_arb_exec")
+        logger.handlers = [logging.NullHandler()]
+        clob = MagicMock()
+        mon = bot.ArbitrageMonitor.__new__(bot.ArbitrageMonitor)
+        mon.clob_client = clob
+        mon.cfg = cfg
+        mon.logger = logger
+        mon._stop_event = MagicMock()
+        mon._market_lock = __import__("threading").Lock()
+        mon._markets = {}
+        mon._active_positions = {}
+        mon._slug_states = {}
+        mon._edge_log_ts = {}
+        mon._noask_log_ts = {}
+        return mon
+
+    def test_place_arb_leg_returns_actual_shares(self):
+        """_place_arb_leg extracts takingAmount/makingAmount from response."""
+        mon = self._make_monitor()
+        mon.clob_client.place_order.return_value = {
+            "success": True,
+            "takingAmount": "15.755",
+            "makingAmount": "7.09",
+            "status": "matched",
+        }
+        result, shares, cost = mon._place_arb_leg(
+            "tok123", 0.43, 16.5, "Up",
+        )
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(shares, 15.755, places=2)
+        self.assertAlmostEqual(cost, 7.09, places=2)
+
+    def test_place_arb_leg_computes_usdc_from_shares(self):
+        """_place_arb_leg passes shares*price as size_usdc to place_order."""
+        mon = self._make_monitor()
+        mon.clob_client.place_order.return_value = {
+            "success": True,
+            "takingAmount": "20.0",
+            "makingAmount": "10.0",
+        }
+        mon._place_arb_leg("tok", 0.50, 20.0, "Up")
+        call_args = mon.clob_client.place_order.call_args
+        # size_usdc should be round(20.0 * 0.50, 2) = 10.0
+        actual_usdc = call_args.kwargs.get("size_usdc", 0)
+        self.assertAlmostEqual(actual_usdc, 10.0, places=2)
+
+    def test_place_arb_leg_passes_max_retry_price(self):
+        """_place_arb_leg forwards max_retry_price to place_order."""
+        mon = self._make_monitor()
+        mon.clob_client.place_order.return_value = {
+            "success": True,
+            "takingAmount": "16.5",
+            "makingAmount": "7.09",
+        }
+        mon._place_arb_leg("tok", 0.43, 16.5, "Up", max_retry_price=0.44)
+        call_args = mon.clob_client.place_order.call_args
+        self.assertEqual(call_args.kwargs.get("max_retry_price"), 0.44)
+
+    def test_place_arb_leg_fok_rejected(self):
+        """_place_arb_leg returns (None, 0, 0) on FOK rejection."""
+        mon = self._make_monitor()
+        mon.clob_client.place_order.return_value = {
+            "status": "fok_rejected",
+            "reason": "test",
+        }
+        result, shares, cost = mon._place_arb_leg(
+            "tok", 0.43, 16.5, "Up",
+        )
+        self.assertIsNone(result)
+        self.assertEqual(shares, 0.0)
+        self.assertEqual(cost, 0.0)
+
+    def test_place_arb_leg_fallback_when_no_amounts(self):
+        """When response lacks takingAmount/makingAmount, use planned values."""
+        mon = self._make_monitor()
+        mon.clob_client.place_order.return_value = {
+            "success": True,
+            "orderID": "0xabc",
+        }
+        result, shares, cost = mon._place_arb_leg(
+            "tok", 0.50, 20.0, "Up",
+        )
+        self.assertIsNotNone(result)
+        # Fallback: target_shares=20, size_usdc=20*0.5=10
+        self.assertAlmostEqual(shares, 20.0)
+        self.assertAlmostEqual(cost, 10.0)
+
+    def test_scan_cycle_matches_second_leg_to_first(self):
+        """Second leg should use actual shares from first leg, not planned."""
+        mon = self._make_monitor({"arb_size_usdc": 10.0, "arb_min_edge_pct": 1.0})
+        mon._markets = {
+            "cid1": {
+                "yes_token": "tok_up", "no_token": "tok_down",
+                "yes_label": "Up", "no_label": "Down",
+                "question": "Test market",
+            },
+        }
+
+        # Orderbook: Up=0.43, Down=0.55, combined=0.98 → 2% edge
+        def mock_orderbook(token_id):
+            if token_id == "tok_up":
+                return {"asks": [{"price": "0.43", "size": "50"}]}
+            return {"asks": [{"price": "0.55", "size": "50"}]}
+
+        mon.clob_client.get_order_book.side_effect = mock_orderbook
+
+        # First leg fills with fewer shares than planned
+        call_count = [0]
+        def mock_place_order(**kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # First leg: we requested ~18 shares at $0.43 but got 15.76
+                return {
+                    "success": True,
+                    "takingAmount": "15.76",
+                    "makingAmount": "6.78",
+                    "status": "matched",
+                }
+            else:
+                # Second leg: should request ~15.76 shares to match
+                size_usdc = kwargs.get("size_usdc", 0)
+                price = kwargs.get("price", 0.55)
+                shares = round(size_usdc / price, 2) if price > 0 else 0
+                return {
+                    "success": True,
+                    "takingAmount": str(round(shares, 4)),
+                    "makingAmount": str(round(size_usdc, 4)),
+                    "status": "matched",
+                }
+
+        mon.clob_client.place_order.side_effect = mock_place_order
+        mon._save_positions = MagicMock()
+
+        mon._scan_cycle()
+
+        # Should have executed an arb
+        self.assertIn("cid1", mon._active_positions)
+        pos = mon._active_positions["cid1"]
+        # First leg got 15.76 shares
+        self.assertAlmostEqual(pos["yes_shares"], 15.76, places=1)
+        # Second leg should approximately match first leg shares
+        self.assertAlmostEqual(pos["no_shares"], pos["yes_shares"], delta=1.0)
+        # Should NOT be marked as partial
+        self.assertNotIn("partial", pos)
+
+    def test_scan_cycle_aborts_when_no_longer_profitable(self):
+        """If combined cost >= $1 after first leg, abort second leg."""
+        mon = self._make_monitor({"arb_size_usdc": 10.0, "arb_min_edge_pct": 1.0})
+        mon._markets = {
+            "cid1": {
+                "yes_token": "tok_up", "no_token": "tok_down",
+                "yes_label": "Up", "no_label": "Down",
+                "question": "Test market",
+            },
+        }
+
+        # Orderbook calls:
+        # 1) Initial scan: Up=0.43, Down=0.55 → combined=0.98 → 2% edge
+        # 2) After first leg: fresh Down check returns 0.60 (price moved)
+        ob_call_count = [0]
+        def mock_orderbook(token_id):
+            ob_call_count[0] += 1
+            if token_id == "tok_up":
+                return {"asks": [{"price": "0.43", "size": "50"}]}
+            # First call for Down (initial scan) = 0.55
+            # Second call for Down (viability re-check) = 0.60
+            if ob_call_count[0] <= 2:
+                return {"asks": [{"price": "0.55", "size": "50"}]}
+            return {"asks": [{"price": "0.60", "size": "50"}]}
+
+        mon.clob_client.get_order_book.side_effect = mock_orderbook
+
+        # First leg fills at a worse effective price ($0.45)
+        mon.clob_client.place_order.return_value = {
+            "success": True,
+            "takingAmount": "15.0",
+            "makingAmount": "6.75",  # eff price = 6.75/15 = $0.45
+            "status": "matched",
+        }
+        mon._save_positions = MagicMock()
+
+        mon._scan_cycle()
+
+        # Should abort — combined = $0.45 + $0.60 = $1.05 > $1.00
+        self.assertIn("cid1", mon._active_positions)
+        pos = mon._active_positions["cid1"]
+        self.assertTrue(pos.get("partial", False))
+        self.assertIsNone(pos.get("no_fill"))
+        # place_order should only be called ONCE (first leg only)
+        self.assertEqual(mon.clob_client.place_order.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
