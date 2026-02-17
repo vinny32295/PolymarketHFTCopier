@@ -3348,6 +3348,11 @@ class MartingaleBot(threading.Thread):
             self._last_window_ts = current_window_ts  # mark skipped
             return False
 
+        # Allow runtime direction toggle via config (must happen before
+        # both the cached and non-cached paths so direction is always set).
+        direction = self.cfg.get("martingale_direction", self.direction)
+        self.direction = direction
+
         # Use pre-fetched cache if it matches this window
         cache = self._next_window_cache
         if cache and cache["window_ts"] == current_window_ts:
@@ -3369,10 +3374,6 @@ class MartingaleBot(threading.Thread):
                     "will retry (%ds into window)", slug, seconds_into,
                 )
                 return False  # don't mark as skipped — retry on next poll
-
-            # Allow runtime direction toggle via config
-            direction = self.cfg.get("martingale_direction", self.direction)
-            self.direction = direction
 
             token_id = (
                 market["up_token"] if direction == "Up"
