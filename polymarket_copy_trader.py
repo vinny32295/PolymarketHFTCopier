@@ -7501,13 +7501,15 @@ class TradeExecutor:
             "Scanning %d token IDs for proxy-held positions...", len(token_ids),
         )
 
-        results = []
+        # ── Phase 1: resolve condition_id + neg_risk from cache/API ──
+        # This is cheap (mostly cache hits), so run sequentially.
+        token_meta = {}  # token_id -> (condition_id, neg_risk, market)
         for token_id in token_ids:
             try:
-                # Use persisted condition_id if available; fall back to API
                 existing_pos = self._positions.get(token_id)
                 condition_id = existing_pos.get("condition_id") if existing_pos else None
                 neg_risk = existing_pos.get("neg_risk", False) if existing_pos else False
+                market = None
 
                 if not condition_id:
                     market = self.clob_client.get_market_by_token(token_id)
@@ -7515,10 +7517,8 @@ class TradeExecutor:
                         condition_id = market.get("condition_id")
                         if condition_id:
                             neg_risk = self._is_neg_risk_market(market)
-                            # Cache neg_risk for future fallback lookups
                             self.clob_client._token_to_neg_risk[token_id] = neg_risk
 
-                    # Fallback: use cached condition_id from activity data
                     if not condition_id:
                         cached_cid = self.clob_client._token_to_condition.get(token_id)
                         if cached_cid:
@@ -7529,15 +7529,46 @@ class TradeExecutor:
                         else:
                             continue
 
-                # Check token balance on the correct contract for the proxy
-                ct_balance = self._get_token_balance(
-                    proxy_address, token_id, neg_risk=neg_risk,
+                token_meta[token_id] = (condition_id, neg_risk, market)
+            except Exception as exc:
+                self.logger.info(
+                    "Error resolving proxy token %s: %s", token_id[:16] + "...", exc,
                 )
-                if ct_balance == 0:
-                    continue
 
-                # On-chain resolution check — tries the API's condition_id
-                # directly, then derives the real CTF conditionId.
+        # ── Phase 2: parallel balance check (the expensive part) ──
+        # Most tokens will have 0 balance; parallelizing cuts ~12s to ~1-2s.
+        held_tokens = {}  # token_id -> balance (only non-zero)
+
+        def _check_balance(tid):
+            cid, nr, _mkt = token_meta[tid]
+            bal = self._get_token_balance(proxy_address, tid, neg_risk=nr)
+            return tid, bal
+
+        scan_workers = min(10, len(token_meta))
+        if scan_workers > 0:
+            with ThreadPoolExecutor(max_workers=scan_workers) as pool:
+                futures = {pool.submit(_check_balance, tid): tid for tid in token_meta}
+                for fut in futures:
+                    try:
+                        tid, bal = fut.result(timeout=10)
+                        if bal > 0:
+                            held_tokens[tid] = bal
+                    except Exception as exc:
+                        tid = futures[fut]
+                        self.logger.info(
+                            "Balance check failed for %s: %s", tid[:16] + "...", exc,
+                        )
+
+        self.logger.info(
+            "Balance scan done: %d/%d tokens have holdings",
+            len(held_tokens), len(token_meta),
+        )
+
+        # ── Phase 3: resolve + redeem only the tokens with balance ──
+        results = []
+        for token_id, ct_balance in held_tokens.items():
+            condition_id, neg_risk, market = token_meta[token_id]
+            try:
                 resolved_cid, payout_denom = self._resolve_condition_id(
                     condition_id, neg_risk=neg_risk,
                 )
@@ -7548,7 +7579,7 @@ class TradeExecutor:
                     )
                     continue
 
-                question = market.get("question", "unknown")
+                question = (market or {}).get("question", "unknown")
                 self.logger.info(
                     "PROXY REDEEM: Resolved position — token %s, "
                     "question: %s, proxy balance: %d, neg_risk: %s",
