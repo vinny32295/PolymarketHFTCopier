@@ -10613,6 +10613,35 @@ def run_headless():
         cfg["martingale_price_max"] = float(os.environ["MARTINGALE_PRICE_MAX"])
     if os.environ.get("MARTINGALE_MAX_ENTRY_SECONDS"):
         cfg["martingale_max_entry_seconds"] = int(os.environ["MARTINGALE_MAX_ENTRY_SECONDS"])
+    # Multi-strategy JSON override: MARTINGALE_STRATEGIES='[{"name":"BTC 5m",...}]'
+    if os.environ.get("MARTINGALE_STRATEGIES"):
+        try:
+            parsed = json.loads(os.environ["MARTINGALE_STRATEGIES"])
+            if isinstance(parsed, list):
+                cfg["martingale_strategies"] = parsed
+                logger.info("MARTINGALE_STRATEGIES env var: loaded %d strategy(ies)", len(parsed))
+            else:
+                logger.warning("MARTINGALE_STRATEGIES env var is not a JSON list — ignoring")
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("MARTINGALE_STRATEGIES env var is not valid JSON — ignoring")
+    else:
+        # When flat MARTINGALE_* env vars are set (defining a single strategy)
+        # but MARTINGALE_STRATEGIES is NOT set, clear any multi-strategy list
+        # that may have been saved to config.json by the GUI.  This ensures
+        # env-var users get exactly ONE strategy from the flat keys.
+        _flat_mart_envs = (
+            "MARTINGALE_SLUG_BASE", "MARTINGALE_DIRECTION",
+            "MARTINGALE_START_BET", "MARTINGALE_WINDOW",
+        )
+        if any(os.environ.get(k) for k in _flat_mart_envs):
+            if cfg.get("martingale_strategies"):
+                logger.info(
+                    "Flat MARTINGALE_* env vars detected — clearing saved "
+                    "martingale_strategies list (%d entries) to use single "
+                    "strategy from env vars",
+                    len(cfg["martingale_strategies"]),
+                )
+                cfg["martingale_strategies"] = []
 
     # Telegram env vars
     if os.environ.get("TELEGRAM_BOT_TOKEN"):
@@ -10678,15 +10707,30 @@ def run_headless():
                         cfg.get("arb_min_edge_pct", 1.0),
                         cfg.get("arb_size_usdc", 10.0))
     if cfg.get("martingale_enabled"):
-        logger.info(
-            "Martingale: ENABLED | Direction: %s | Start bet: $%s | "
-            "Max bet: $%s | Slug: %s (window %ds)",
-            cfg.get("martingale_direction", "Up"),
-            cfg.get("martingale_start_bet", 5.0),
-            cfg.get("martingale_max_bet", 0),
-            cfg.get("martingale_slug_base", "btc-updown-5m"),
-            cfg.get("martingale_window", 300),
-        )
+        _ms = cfg.get("martingale_strategies") or []
+        if _ms:
+            logger.info(
+                "Martingale: ENABLED | %d strategy(ies) from martingale_strategies",
+                len(_ms),
+            )
+            for _s in _ms:
+                logger.info(
+                    "  [%s] slug=%s, window=%ds, direction=%s, start=$%s",
+                    _s.get("name", "?"), _s.get("slug_base", "?"),
+                    _s.get("window", 300), _s.get("direction", "?"),
+                    _s.get("start_bet", "?"),
+                )
+        else:
+            logger.info(
+                "Martingale: ENABLED | 1 strategy (flat keys) | "
+                "Direction: %s | Start bet: $%s | "
+                "Max bet: $%s | Slug: %s (window %ds)",
+                cfg.get("martingale_direction", "Up"),
+                cfg.get("martingale_start_bet", 5.0),
+                cfg.get("martingale_max_bet", 0),
+                cfg.get("martingale_slug_base", "btc-updown-5m"),
+                cfg.get("martingale_window", 300),
+            )
 
     # Persist merged config so next restart picks up everything.
     save_user_config(cfg)
