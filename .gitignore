@@ -25,9 +25,11 @@ bot.log
 session_*_report.json
 
 # Runtime data files
+config.json
 trade_history.json
 trade_history.csv
 positions.json
+arb_positions.json
 whale_comparison.json
 session_trades.json
 
