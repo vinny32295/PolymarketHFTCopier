@@ -30,6 +30,7 @@ trade_history.json
 trade_history.csv
 positions.json
 arb_positions.json
+martingale_state.json
 whale_comparison.json
 session_trades.json
 

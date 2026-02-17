@@ -494,6 +494,15 @@ DEFAULT_CONFIG = {
     "arb_max_positions": 5,           # max simultaneous arb positions
     "arb_poll_seconds": 2,            # how often to scan orderbooks
     "arb_log_interval": 5,            # seconds between INFO-level arb scan logs
+    # --- Martingale mode (double-on-loss binary market betting) ---
+    "martingale_enabled": False,
+    "martingale_direction": "Up",      # "Up" or "Down"
+    "martingale_start_bet": 5.0,       # starting bet size in USDC
+    "martingale_max_bet": 0,           # max bet cap in USDC (0 = no limit)
+    "martingale_max_streak": 0,        # stop after N consecutive losses (0 = no limit)
+    "martingale_slug_base": "btc-updown-5m",  # slug prefix for the market
+    "martingale_window": 300,          # window size in seconds (300 = 5 min)
+    "martingale_poll_seconds": 10,     # how often to check for resolution
 }
 
 # Keys from DEFAULT_CONFIG that are worth persisting across restarts.
@@ -510,6 +519,9 @@ _PERSISTENT_CONFIG_KEYS = [
     "arb_dynamic_window", "arb_dynamic_slugs", "arb_min_edge_pct",
     "arb_size_usdc", "arb_max_positions", "arb_poll_seconds",
     "webhook_url",
+    "martingale_enabled", "martingale_direction", "martingale_start_bet",
+    "martingale_max_bet", "martingale_max_streak",
+    "martingale_slug_base", "martingale_window", "martingale_poll_seconds",
 ]
 
 
@@ -2760,6 +2772,521 @@ class ArbitrageMonitor(threading.Thread):
             f"Markets: {n_markets} | Active arbs: {n_pos} | "
             f"Locked profit: ${total_locked:,.4f}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Martingale Bot – double-on-loss betting on 5-min BTC binary markets
+# ---------------------------------------------------------------------------
+
+class MartingaleBot(threading.Thread):
+    """Martingale strategy on binary Polymarket markets.
+
+    Places a directional bet (Up or Down) on a rotating binary market.
+    If the bet wins, resets to the starting bet.  If it loses, doubles
+    the bet for the next window.
+
+    State is persisted to ``martingale_state.json`` so it survives restarts.
+    """
+
+    STATE_FILE = "martingale_state.json"
+
+    def __init__(self, clob_client, cfg, logger=None):
+        super().__init__(daemon=True, name="MartingaleBot")
+        self.clob_client = clob_client
+        self.cfg = cfg
+        self.logger = logger or logging.getLogger("martingale")
+        self._stop_event = threading.Event()
+
+        # State
+        self.start_bet = float(cfg.get("martingale_start_bet", 5.0))
+        self.current_bet = self.start_bet
+        self.direction = cfg.get("martingale_direction", "Up")
+        self.consecutive_losses = 0
+        self.session_pnl = 0.0
+        self._active_bet = None
+        self._bet_history = []
+        self._last_window_ts = 0
+
+        # Callbacks (wired by CopyTraderBot)
+        self.notify_callback = None
+        self.log_trade_callback = None
+
+        self._load_state()
+
+    # -- persistence --------------------------------------------------------
+
+    def _save_state(self):
+        state = {
+            "current_bet": self.current_bet,
+            "consecutive_losses": self.consecutive_losses,
+            "session_pnl": self.session_pnl,
+            "direction": self.direction,
+            "active_bet": self._active_bet,
+            "last_window_ts": self._last_window_ts,
+        }
+        try:
+            tmp = self.STATE_FILE + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(state, fh, indent=2, default=str)
+            os.replace(tmp, self.STATE_FILE)
+        except OSError as exc:
+            self.logger.debug("Could not save martingale state: %s", exc)
+
+    def _load_state(self):
+        try:
+            with open(self.STATE_FILE, "r") as fh:
+                state = json.load(fh)
+            self.current_bet = float(state.get("current_bet", self.start_bet))
+            self.consecutive_losses = int(state.get("consecutive_losses", 0))
+            self.session_pnl = float(state.get("session_pnl", 0.0))
+            self.direction = state.get("direction", self.direction)
+            self._active_bet = state.get("active_bet")
+            self._last_window_ts = int(state.get("last_window_ts", 0))
+            self.logger.info(
+                "Loaded martingale state: bet=$%.2f, streak=%d, pnl=$%.4f, dir=%s",
+                self.current_bet, self.consecutive_losses,
+                self.session_pnl, self.direction,
+            )
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            pass
+
+    # -- slug / timing helpers ----------------------------------------------
+
+    @staticmethod
+    def _get_window_ts(window):
+        """Return the current window-start unix timestamp."""
+        window = max(int(window), 30)
+        now = int(time.time())
+        return now - (now % window)
+
+    def _generate_slug(self):
+        base = self.cfg.get("martingale_slug_base", "btc-updown-5m")
+        window = int(self.cfg.get("martingale_window", 300))
+        window_ts = self._get_window_ts(window)
+        return f"{base}-{window_ts}"
+
+    def _get_window_end(self):
+        window = int(self.cfg.get("martingale_window", 300))
+        return self._get_window_ts(window) + window
+
+    # -- market fetching ----------------------------------------------------
+
+    def _fetch_market(self, slug):
+        """Fetch a binary market from the Gamma API by event slug."""
+        try:
+            url = f"{GAMMA_API_BASE}/events"
+            data = self.clob_client._get_public(url, params={"slug": slug})
+
+            event = None
+            if isinstance(data, list) and data:
+                event = data[0]
+            elif isinstance(data, dict):
+                event = data
+
+            if not event:
+                return None
+
+            markets = event.get("markets") or []
+            if not markets:
+                return None
+
+            market = markets[0]
+            cid = market.get("condition_id")
+
+            # Parse token IDs
+            token_ids = []
+            raw_clob = market.get("clobTokenIds")
+            if isinstance(raw_clob, str):
+                try:
+                    token_ids = json.loads(raw_clob)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            elif isinstance(raw_clob, list):
+                token_ids = raw_clob
+
+            # Parse outcomes
+            outcomes = []
+            raw_out = market.get("outcomes")
+            if isinstance(raw_out, str):
+                try:
+                    outcomes = json.loads(raw_out)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            elif isinstance(raw_out, list):
+                outcomes = raw_out
+
+            # Fallback: tokens array
+            if len(token_ids) < 2:
+                tokens = market.get("tokens") or []
+                if len(tokens) >= 2:
+                    token_ids = [
+                        t.get("token_id") or t.get("tokenId") for t in tokens
+                    ]
+                    if not outcomes:
+                        outcomes = [t.get("outcome") for t in tokens]
+
+            if len(token_ids) < 2 or len(outcomes) < 2:
+                return None
+
+            # Map Up/Down to indices — default to first=Up, second=Down
+            up_idx, down_idx = 0, 1
+            for i, o in enumerate(outcomes):
+                if o and str(o).lower() == "up":
+                    up_idx = i
+                elif o and str(o).lower() == "down":
+                    down_idx = i
+
+            return {
+                "condition_id": cid,
+                "up_token": token_ids[up_idx],
+                "down_token": token_ids[down_idx],
+                "question": market.get("question", slug),
+            }
+        except Exception as exc:
+            self.logger.warning("Failed to fetch market '%s': %s", slug, exc)
+            return None
+
+    def _get_best_ask(self, token_id):
+        """Return (price, size) of the best ask for *token_id*."""
+        try:
+            book = self.clob_client.get_order_book(token_id)
+            asks = book.get("asks") or []
+            if not asks:
+                return None, 0.0
+            asks = sorted(asks, key=lambda e: float(e.get("price", "0")))
+            return float(asks[0]["price"]), float(asks[0].get("size", 0))
+        except Exception:
+            return None, 0.0
+
+    # -- resolution detection -----------------------------------------------
+
+    def _check_resolution(self, condition_id, direction):
+        """Poll Gamma API to see if a market has resolved.
+
+        Returns ``(resolved, won)`` where *won* is ``True`` if our
+        direction won, ``False`` if it lost, or ``None`` if not yet resolved.
+        """
+        try:
+            url = f"{GAMMA_API_BASE}/markets"
+            data = self.clob_client._get_public(
+                url, params={"condition_id": condition_id},
+            )
+            market = None
+            if isinstance(data, list) and data:
+                market = data[0]
+            elif isinstance(data, dict):
+                market = data
+
+            if not market:
+                return False, None
+
+            # Check closure flag
+            closed = market.get("closed", False)
+            active = market.get("active", True)
+            if not closed and active:
+                return False, None
+
+            # Parse outcome prices
+            raw_prices = market.get("outcomePrices")
+            raw_outcomes = market.get("outcomes")
+            if not raw_prices:
+                return False, None
+
+            if isinstance(raw_prices, str):
+                try:
+                    outcome_prices = json.loads(raw_prices)
+                except (json.JSONDecodeError, TypeError):
+                    outcome_prices = [
+                        float(x.strip()) for x in raw_prices.split(",")
+                    ]
+            elif isinstance(raw_prices, list):
+                outcome_prices = [float(x) for x in raw_prices]
+            else:
+                return False, None
+
+            if isinstance(raw_outcomes, str):
+                try:
+                    outcomes = json.loads(raw_outcomes)
+                except (json.JSONDecodeError, TypeError):
+                    outcomes = [x.strip() for x in raw_outcomes.split(",")]
+            elif isinstance(raw_outcomes, list):
+                outcomes = raw_outcomes
+            else:
+                outcomes = ["Up", "Down"]
+
+            if len(outcome_prices) < 2:
+                return False, None
+
+            # Need a clear winner (one price near 1.0)
+            if max(outcome_prices) < 0.9:
+                return False, None
+
+            winner_idx = outcome_prices.index(max(outcome_prices))
+            winner = outcomes[winner_idx] if winner_idx < len(outcomes) else ""
+            won = str(winner).lower() == str(direction).lower()
+
+            self.logger.info(
+                "MARTINGALE RESOLVED: winner=%s, bet=%s, won=%s",
+                winner, direction, won,
+            )
+            return True, won
+        except Exception as exc:
+            self.logger.debug("Resolution check error: %s", exc)
+            return False, None
+
+    # -- bet placement & result handling ------------------------------------
+
+    def _try_place_bet(self):
+        """Attempt to place a bet on the current window."""
+        # Safety: max streak
+        max_streak = int(self.cfg.get("martingale_max_streak", 0))
+        if max_streak > 0 and self.consecutive_losses >= max_streak:
+            self.logger.warning(
+                "MARTINGALE STOPPED: max streak of %d losses reached",
+                max_streak,
+            )
+            self.stop()
+            return
+
+        # Safety: max bet
+        max_bet = float(self.cfg.get("martingale_max_bet", 0))
+        if max_bet > 0 and self.current_bet > max_bet:
+            self.logger.warning(
+                "MARTINGALE STOPPED: bet $%.2f exceeds max $%.2f",
+                self.current_bet, max_bet,
+            )
+            self.stop()
+            return
+
+        # Generate slug and avoid re-betting the same window
+        slug = self._generate_slug()
+        window = int(self.cfg.get("martingale_window", 300))
+        current_window_ts = self._get_window_ts(window)
+        if current_window_ts == self._last_window_ts:
+            return  # already bet on this window
+
+        market = self._fetch_market(slug)
+        if not market:
+            return
+
+        # Allow runtime direction toggle via config
+        direction = self.cfg.get("martingale_direction", self.direction)
+        self.direction = direction
+
+        token_id = (
+            market["up_token"] if direction == "Up" else market["down_token"]
+        )
+        ask_price, ask_size = self._get_best_ask(token_id)
+        if not ask_price or ask_price <= 0:
+            self.logger.debug("No asks available for %s token", direction)
+            return
+
+        target_shares = self.current_bet / ask_price
+        if target_shares > ask_size:
+            self.logger.warning(
+                "MARTINGALE: insufficient liquidity (need %.1f, have %.1f)",
+                target_shares, ask_size,
+            )
+            return
+
+        # Dry run guard
+        if self.cfg.get("dry_run", False):
+            self.logger.info(
+                "MARTINGALE DRY RUN: would buy %s @ $%.4f, $%.2f",
+                direction, ask_price, self.current_bet,
+            )
+            self._last_window_ts = current_window_ts
+            return
+
+        result = self.clob_client.place_order(
+            token_id=token_id,
+            side="BUY",
+            size_usdc=self.current_bet,
+            price=ask_price,
+            use_fok=True,
+        )
+
+        if isinstance(result, dict) and (
+            result.get("status") == "fok_rejected" or result.get("error")
+        ):
+            self.logger.warning("MARTINGALE: FOK rejected for %s", direction)
+            return
+
+        if not result:
+            self.logger.warning("MARTINGALE: order failed for %s", direction)
+            return
+
+        actual_shares = float(result.get("takingAmount", 0)) or target_shares
+        actual_cost = float(result.get("makingAmount", 0)) or self.current_bet
+
+        self._active_bet = {
+            "slug": slug,
+            "condition_id": market["condition_id"],
+            "token_id": token_id,
+            "direction": direction,
+            "bet_size": self.current_bet,
+            "price": ask_price,
+            "shares": actual_shares,
+            "cost": actual_cost,
+            "question": market["question"],
+            "window_end": self._get_window_end(),
+            "ts": datetime.now().isoformat(),
+        }
+        self._last_window_ts = current_window_ts
+        self._save_state()
+
+        self.logger.info(
+            "MARTINGALE BET: %s $%.2f @ $%.4f (%.1f shares) — streak: %d",
+            direction, actual_cost, ask_price, actual_shares,
+            self.consecutive_losses,
+        )
+        if self.notify_callback:
+            self.notify_callback(
+                f"MARTINGALE BET: {direction} ${actual_cost:.2f} "
+                f"@ ${ask_price:.4f} ({actual_shares:.1f} shares) — "
+                f"streak: {self.consecutive_losses}"
+            )
+
+    def _handle_win(self, bet):
+        profit = bet["shares"] - bet["cost"]
+        self.session_pnl += profit
+
+        self.logger.info(
+            "MARTINGALE WIN: %s +$%.4f (shares=%.1f, cost=$%.2f) — "
+            "resetting to $%.2f | session P&L: $%.4f",
+            bet["direction"], profit, bet["shares"], bet["cost"],
+            self.start_bet, self.session_pnl,
+        )
+
+        self._log_bet(bet, won=True, profit=profit)
+        if self.notify_callback:
+            self.notify_callback(
+                f"MARTINGALE WIN: {bet['direction']} +${profit:.4f} — "
+                f"resetting to ${self.start_bet:.2f}"
+            )
+
+        self.current_bet = self.start_bet
+        self.consecutive_losses = 0
+        self._active_bet = None
+        self._save_state()
+
+    def _handle_loss(self, bet):
+        loss = bet["cost"]
+        self.session_pnl -= loss
+        self.consecutive_losses += 1
+        self.current_bet = round(bet["bet_size"] * 2, 2)
+
+        max_bet = float(self.cfg.get("martingale_max_bet", 0))
+        if max_bet > 0 and self.current_bet > max_bet:
+            self.current_bet = max_bet
+            self.logger.warning(
+                "MARTINGALE: bet capped at max $%.2f", max_bet,
+            )
+
+        self.logger.info(
+            "MARTINGALE LOSS: %s -$%.2f — doubling to $%.2f, "
+            "streak: %d | session P&L: $%.4f",
+            bet["direction"], loss, self.current_bet,
+            self.consecutive_losses, self.session_pnl,
+        )
+
+        self._log_bet(bet, won=False, profit=-loss)
+        if self.notify_callback:
+            self.notify_callback(
+                f"MARTINGALE LOSS: {bet['direction']} -${loss:.2f} — "
+                f"doubling to ${self.current_bet:.2f} "
+                f"(streak: {self.consecutive_losses})"
+            )
+
+        self._active_bet = None
+        self._save_state()
+
+    def _log_bet(self, bet, won, profit):
+        if not self.log_trade_callback:
+            return
+        record = {
+            "closed_at": datetime.now().isoformat(),
+            "token_id": bet["token_id"],
+            "market": bet["question"],
+            "shares": bet["shares"],
+            "entry_price": round(bet["cost"] / bet["shares"], 6) if bet["shares"] > 0 else 0,
+            "exit_price": 1.0 if won else 0.0,
+            "cost_basis_usdc": round(bet["cost"], 6),
+            "proceeds_usdc": round(bet["shares"], 6) if won else 0.0,
+            "pnl_usdc": round(profit, 6),
+            "outcome": "win" if won else "loss",
+            "reason": "martingale",
+            "martingale_details": {
+                "direction": bet["direction"],
+                "bet_size": bet["bet_size"],
+                "streak": self.consecutive_losses,
+                "session_pnl": round(self.session_pnl, 6),
+            },
+        }
+        try:
+            self.log_trade_callback(record)
+        except Exception as exc:
+            self.logger.debug("Failed to log martingale trade: %s", exc)
+
+    # -- main loop ----------------------------------------------------------
+
+    def _cycle(self):
+        """One tick of the martingale state machine."""
+        if self._active_bet:
+            bet = self._active_bet
+            # Wait until window has ended + buffer before checking resolution
+            now = int(time.time())
+            if now < bet["window_end"] + 30:
+                return
+
+            resolved, won = self._check_resolution(
+                bet["condition_id"], bet["direction"],
+            )
+            if not resolved:
+                # Timeout: if 10 min past window end, give up
+                if now > bet["window_end"] + 600:
+                    self.logger.warning(
+                        "MARTINGALE: resolution timeout for %s, treating as loss",
+                        bet["slug"],
+                    )
+                    self._handle_loss(bet)
+                return
+
+            if won:
+                self._handle_win(bet)
+            else:
+                self._handle_loss(bet)
+        else:
+            self._try_place_bet()
+
+    def run(self):
+        self.logger.info(
+            "Martingale bot started — direction=%s, bet=$%.2f, streak=%d",
+            self.direction, self.current_bet, self.consecutive_losses,
+        )
+
+        poll = max(float(self.cfg.get("martingale_poll_seconds", 10)), 1)
+        while not self._stop_event.is_set():
+            try:
+                self._cycle()
+            except Exception as exc:
+                self.logger.error("Martingale error: %s", exc, exc_info=True)
+            self._stop_event.wait(timeout=poll)
+
+        self.logger.info("Martingale bot stopped")
+
+    def stop(self):
+        self._stop_event.set()
+
+    def get_status_summary(self):
+        """One-line status string for the dashboard."""
+        status = (
+            f"Direction: {self.direction} | Bet: ${self.current_bet:.2f} | "
+            f"Streak: {self.consecutive_losses} | P&L: ${self.session_pnl:+.4f}"
+        )
+        if self._active_bet:
+            status += f" | Active: {self._active_bet['slug']}"
+        return status
 
 
 # ---------------------------------------------------------------------------
@@ -5811,6 +6338,7 @@ class CopyTraderBot:
         self._ws_monitor = None
         self._ws_wake = threading.Event()
         self._arb_monitor = None
+        self._martingale_bot = None
         self.executor = None
         self.clob_client = None
 
@@ -6015,6 +6543,9 @@ class CopyTraderBot:
         # Stop Arbitrage monitor if running
         if self._arb_monitor:
             self._arb_monitor.stop()
+        # Stop Martingale bot if running
+        if self._martingale_bot:
+            self._martingale_bot.stop()
         # Wake the main loop so it exits the Event.wait() immediately
         if hasattr(self, '_ws_wake'):
             self._ws_wake.set()
@@ -6104,6 +6635,24 @@ class CopyTraderBot:
                     "arb_enabled=True but no arb_condition_ids or "
                     "arb_dynamic_slugs configured"
                 )
+
+        # ---- Start Martingale Bot (independent of copy trading) ----
+        if self.cfg.get("martingale_enabled") and self.clob_client:
+            self._martingale_bot = MartingaleBot(
+                self.clob_client, self.cfg, self.logger,
+            )
+            self._martingale_bot.notify_callback = self._notify
+            self._martingale_bot.log_trade_callback = self._append_trade_history
+            self._martingale_bot.start()
+            self.logger.info(
+                "Martingale bot enabled — direction=%s, start=$%.2f, "
+                "max=$%.0f, slug=%s, window=%ds",
+                self.cfg.get("martingale_direction", "Up"),
+                self.cfg.get("martingale_start_bet", 5.0),
+                self.cfg.get("martingale_max_bet", 0),
+                self.cfg.get("martingale_slug_base", "btc-updown-5m"),
+                self.cfg.get("martingale_window", 300),
+            )
 
         if web3_ok:
             # ---- Backfill market names for legacy positions ----
@@ -6680,7 +7229,12 @@ class CopyTraderGUI:
         notebook.add(arb_frame, text="Arbitrage")
         self._build_arb_tab(arb_frame)
 
-        # Tab 5: Trade History
+        # Tab 5: Martingale
+        mart_frame = ttk.Frame(notebook, padding=10)
+        notebook.add(mart_frame, text="Martingale")
+        self._build_martingale_tab(mart_frame)
+
+        # Tab 6: Trade History
         history_frame = ttk.Frame(notebook, padding=10)
         notebook.add(history_frame, text="Trade History")
         self._build_history_tab(history_frame)
@@ -6967,9 +7521,34 @@ class CopyTraderGUI:
                     arb_time,
                 ))
 
-        # Totals (include arb positions)
-        total_float_pnl = total_value - total_cost + arb_total_profit
-        total_positions = len(positions) + n_arb_positions
+        # --- Martingale active bet ---
+        mart_bot = getattr(self.bot, "_martingale_bot", None)
+        mart_pnl = Decimal("0")
+        mart_cost = Decimal("0")
+        if mart_bot and mart_bot._active_bet:
+            mb = mart_bot._active_bet
+            m_cost = Decimal(str(mb.get("cost", 0)))
+            m_shares = Decimal(str(mb.get("shares", 0)))
+            mart_cost += m_cost
+            # Active bet: show cost as current value (unknown until resolved)
+            self.dash_tree.insert("", tk.END, values=(
+                f"MART-{mb.get('direction', '?')}",
+                mb.get("question", "?")[:45],
+                f"{m_shares:.2f}",
+                f"${m_cost / m_shares if m_shares > 0 else 0:.4f}",
+                "pending",
+                f"${m_cost:.2f}",
+                "pending",
+                "--",
+                f"bet #{mart_bot.consecutive_losses + 1}",
+                "--",
+            ))
+        if mart_bot:
+            mart_pnl = Decimal(str(mart_bot.session_pnl))
+
+        # Totals (include arb + martingale positions)
+        total_float_pnl = total_value - total_cost + arb_total_profit + mart_pnl
+        total_positions = len(positions) + n_arb_positions + (1 if mart_bot and mart_bot._active_bet else 0)
         self.dash_positions_var.set(f"Open Positions: {total_positions}")
         self.dash_total_pnl_var.set(
             f"Floating P/L: {'+'if total_float_pnl >= 0 else ''}${total_float_pnl:.2f}"
@@ -6981,17 +7560,31 @@ class CopyTraderGUI:
                 f"cost ${arb_total_cost:.2f}, "
                 f"locked +${arb_total_profit:.4f}"
             )
+        mart_summary = ""
+        if mart_bot:
+            mart_summary = (
+                f"  |  Martingale: bet ${mart_bot.current_bet:.2f}, "
+                f"streak {mart_bot.consecutive_losses}, "
+                f"P&L ${mart_bot.session_pnl:+.4f}"
+            )
         self.dash_summary_var.set(
-            f"Total Cost Basis: ${total_cost + arb_total_cost:.2f}  |  "
+            f"Total Cost Basis: ${total_cost + arb_total_cost + mart_cost:.2f}  |  "
             f"Total Current Value: ${total_value + Decimal(str(arb_total_profit)):.2f}  |  "
             f"Net: {'+'if total_float_pnl >= 0 else ''}${total_float_pnl:.2f}"
-            f"{arb_summary}"
+            f"{arb_summary}{mart_summary}"
         )
 
         # Update arb status label if monitor is running
         if arb_mon and hasattr(self, 'arb_status_var'):
             try:
                 self.arb_status_var.set("Arbitrage: " + arb_mon.get_status_summary())
+            except Exception:
+                pass
+
+        # Update martingale status label if bot is running
+        if mart_bot and hasattr(self, 'mart_status_var'):
+            try:
+                self.mart_status_var.set("Martingale: " + mart_bot.get_status_summary())
             except Exception:
                 pass
 
@@ -7504,6 +8097,93 @@ class CopyTraderGUI:
             f"|  {entry.get('format', 'timestamp')}"
         )
 
+    # ---- Martingale tab ----
+
+    def _build_martingale_tab(self, parent):
+        # Enable checkbox
+        self.mart_enabled_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            parent, text="Enable Martingale Mode",
+            variable=self.mart_enabled_var,
+        ).pack(anchor=tk.W, pady=(0, 5))
+
+        ttk.Label(
+            parent,
+            text=(
+                "Double-on-loss strategy: bet on BTC Up or Down each window.\n"
+                "If the bet loses, the next bet is doubled. "
+                "A win resets to the starting bet."
+            ),
+            wraplength=500, justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(0, 10))
+
+        # Direction toggle
+        dir_frame = ttk.LabelFrame(parent, text="Direction", padding=5)
+        dir_frame.pack(fill=tk.X, pady=(0, 5))
+
+        self.mart_direction_var = tk.StringVar(value="Up")
+        ttk.Radiobutton(
+            dir_frame, text="Up (BTC goes up)", value="Up",
+            variable=self.mart_direction_var,
+        ).pack(side=tk.LEFT, padx=(0, 20))
+        ttk.Radiobutton(
+            dir_frame, text="Down (BTC goes down)", value="Down",
+            variable=self.mart_direction_var,
+        ).pack(side=tk.LEFT)
+
+        # Settings
+        settings_frame = ttk.LabelFrame(parent, text="Settings", padding=5)
+        settings_frame.pack(fill=tk.X, pady=(0, 5))
+
+        row = 0
+        ttk.Label(settings_frame, text="Starting Bet (USDC):").grid(
+            row=row, column=0, sticky=tk.W, padx=2, pady=2,
+        )
+        self.mart_start_bet_entry = ttk.Entry(settings_frame, width=10)
+        self.mart_start_bet_entry.grid(row=row, column=1, padx=2, pady=2)
+
+        row += 1
+        ttk.Label(settings_frame, text="Max Bet (USDC, 0=no limit):").grid(
+            row=row, column=0, sticky=tk.W, padx=2, pady=2,
+        )
+        self.mart_max_bet_entry = ttk.Entry(settings_frame, width=10)
+        self.mart_max_bet_entry.grid(row=row, column=1, padx=2, pady=2)
+
+        row += 1
+        ttk.Label(settings_frame, text="Max Streak (0=no limit):").grid(
+            row=row, column=0, sticky=tk.W, padx=2, pady=2,
+        )
+        self.mart_max_streak_entry = ttk.Entry(settings_frame, width=10)
+        self.mart_max_streak_entry.grid(row=row, column=1, padx=2, pady=2)
+
+        row += 1
+        ttk.Label(settings_frame, text="Slug Base:").grid(
+            row=row, column=0, sticky=tk.W, padx=2, pady=2,
+        )
+        self.mart_slug_entry = ttk.Entry(settings_frame, width=25)
+        self.mart_slug_entry.grid(row=row, column=1, padx=2, pady=2)
+
+        row += 1
+        ttk.Label(settings_frame, text="Window (seconds):").grid(
+            row=row, column=0, sticky=tk.W, padx=2, pady=2,
+        )
+        self.mart_window_entry = ttk.Entry(settings_frame, width=10)
+        self.mart_window_entry.grid(row=row, column=1, padx=2, pady=2)
+
+        row += 1
+        ttk.Label(settings_frame, text="Poll Interval (seconds):").grid(
+            row=row, column=0, sticky=tk.W, padx=2, pady=2,
+        )
+        self.mart_poll_entry = ttk.Entry(settings_frame, width=10)
+        self.mart_poll_entry.grid(row=row, column=1, padx=2, pady=2)
+
+        # Status label
+        self.mart_status_var = tk.StringVar(value="Martingale: idle")
+        ttk.Label(
+            parent, textvariable=self.mart_status_var,
+            font=("Courier", 10, "bold"),
+        ).pack(anchor=tk.W, pady=(10, 0))
+
     def _build_log_tab(self, parent):
         self.log_area = scrolledtext.ScrolledText(
             parent, state="disabled", wrap=tk.WORD, font=("Courier", 9), height=25
@@ -7735,6 +8415,15 @@ class CopyTraderGUI:
                 self.arb_slugs_listbox.insert(
                     tk.END, self._format_slug_display(entry),
                 )
+        # Martingale fields
+        self.mart_enabled_var.set(self.cfg.get("martingale_enabled", False))
+        self.mart_direction_var.set(self.cfg.get("martingale_direction", "Up"))
+        self.mart_start_bet_entry.insert(0, str(self.cfg.get("martingale_start_bet", 5.0)))
+        self.mart_max_bet_entry.insert(0, str(self.cfg.get("martingale_max_bet", 0)))
+        self.mart_max_streak_entry.insert(0, str(self.cfg.get("martingale_max_streak", 0)))
+        self.mart_slug_entry.insert(0, self.cfg.get("martingale_slug_base", "btc-updown-5m"))
+        self.mart_window_entry.insert(0, str(self.cfg.get("martingale_window", 300)))
+        self.mart_poll_entry.insert(0, str(self.cfg.get("martingale_poll_seconds", 10)))
 
     def _read_fields_to_config(self):
         self.cfg["rpc_url"] = self.rpc_entry.get().strip()
@@ -7827,6 +8516,42 @@ class CopyTraderGUI:
             val = int(self.arb_poll_entry.get().strip())
             if val >= 1:
                 self.cfg["arb_poll_seconds"] = val
+        except ValueError:
+            pass
+        # Martingale fields
+        self.cfg["martingale_enabled"] = self.mart_enabled_var.get()
+        self.cfg["martingale_direction"] = self.mart_direction_var.get()
+        try:
+            val = float(self.mart_start_bet_entry.get().strip())
+            if val > 0:
+                self.cfg["martingale_start_bet"] = val
+        except ValueError:
+            pass
+        try:
+            val = float(self.mart_max_bet_entry.get().strip())
+            if val >= 0:
+                self.cfg["martingale_max_bet"] = val
+        except ValueError:
+            pass
+        try:
+            val = int(self.mart_max_streak_entry.get().strip())
+            if val >= 0:
+                self.cfg["martingale_max_streak"] = val
+        except ValueError:
+            pass
+        slug_base = self.mart_slug_entry.get().strip()
+        if slug_base:
+            self.cfg["martingale_slug_base"] = slug_base
+        try:
+            val = int(self.mart_window_entry.get().strip())
+            if val >= 30:
+                self.cfg["martingale_window"] = val
+        except ValueError:
+            pass
+        try:
+            val = int(self.mart_poll_entry.get().strip())
+            if val >= 1:
+                self.cfg["martingale_poll_seconds"] = val
         except ValueError:
             pass
 
@@ -8077,17 +8802,34 @@ def run_headless():
         cfg["arb_max_positions"] = int(os.environ["ARB_MAX_POSITIONS"])
     if os.environ.get("ARB_POLL_SECONDS"):
         cfg["arb_poll_seconds"] = int(os.environ["ARB_POLL_SECONDS"])
+    # Martingale env vars
+    if os.environ.get("MARTINGALE_ENABLED"):
+        cfg["martingale_enabled"] = os.environ["MARTINGALE_ENABLED"].lower() in ("1", "true", "yes")
+    if os.environ.get("MARTINGALE_DIRECTION"):
+        cfg["martingale_direction"] = os.environ["MARTINGALE_DIRECTION"].strip()
+    if os.environ.get("MARTINGALE_START_BET"):
+        cfg["martingale_start_bet"] = float(os.environ["MARTINGALE_START_BET"])
+    if os.environ.get("MARTINGALE_MAX_BET"):
+        cfg["martingale_max_bet"] = float(os.environ["MARTINGALE_MAX_BET"])
+    if os.environ.get("MARTINGALE_MAX_STREAK"):
+        cfg["martingale_max_streak"] = int(os.environ["MARTINGALE_MAX_STREAK"])
+    if os.environ.get("MARTINGALE_SLUG_BASE"):
+        cfg["martingale_slug_base"] = os.environ["MARTINGALE_SLUG_BASE"].strip()
+    if os.environ.get("MARTINGALE_WINDOW"):
+        cfg["martingale_window"] = int(os.environ["MARTINGALE_WINDOW"])
+    if os.environ.get("MARTINGALE_POLL_SECONDS"):
+        cfg["martingale_poll_seconds"] = int(os.environ["MARTINGALE_POLL_SECONDS"])
 
     arb_mode = cfg.get("arb_enabled") and (
         cfg.get("arb_condition_ids")
         or cfg.get("arb_dynamic_slugs")
         or cfg.get("arb_dynamic_slug")
     )
-    if not cfg.get("watched_addresses") and not arb_mode:
+    martingale_mode = cfg.get("martingale_enabled")
+    if not cfg.get("watched_addresses") and not arb_mode and not martingale_mode:
         logger.error(
-            "No watched addresses or arb markets configured. "
-            "Set WATCHED_ADDRESSES (comma-separated) or "
-            "ARB_ENABLED=1 + ARB_CONDITION_IDS or ARB_DYNAMIC_SLUGS."
+            "No watched addresses, arb markets, or martingale configured. "
+            "Set WATCHED_ADDRESSES, ARB_ENABLED=1, or MARTINGALE_ENABLED=1."
         )
         sys.exit(1)
 
@@ -8127,6 +8869,16 @@ def run_headless():
                         len(cfg.get("arb_condition_ids", [])),
                         cfg.get("arb_min_edge_pct", 1.0),
                         cfg.get("arb_size_usdc", 10.0))
+    if cfg.get("martingale_enabled"):
+        logger.info(
+            "Martingale: ENABLED | Direction: %s | Start bet: $%s | "
+            "Max bet: $%s | Slug: %s (window %ds)",
+            cfg.get("martingale_direction", "Up"),
+            cfg.get("martingale_start_bet", 5.0),
+            cfg.get("martingale_max_bet", 0),
+            cfg.get("martingale_slug_base", "btc-updown-5m"),
+            cfg.get("martingale_window", 300),
+        )
 
     # Persist merged config so next restart picks up everything.
     save_user_config(cfg)
