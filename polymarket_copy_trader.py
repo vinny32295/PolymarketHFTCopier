@@ -5090,7 +5090,7 @@ class TradeExecutor:
                                 "Discovered active position (no price available): %s "
                                 "(%.2f tokens, balance=%d, neg_risk=%s, question=%s)",
                                 token_id[:16] + "...", tokens, ct_balance, neg_risk,
-                                market.get("question", "?")[:50],
+                                (market.get("question", "?") if market else "?")[:50],
                             )
                     continue
 
@@ -5098,7 +5098,9 @@ class TradeExecutor:
                 #    Use resolved_cid (may differ from the API's condition_id
                 #    if the API returned a questionId rather than the derived
                 #    CTF conditionId).
-                question = market.get("question", "unknown")
+                question = (market.get("question", "unknown") if market
+                            else existing_pos.get("market_name") if existing_pos
+                            else "unknown")
                 self.logger.info(
                     "REDEEM: Resolved position — token %s, "
                     "question: %s, balance: %d, neg_risk: %s",
