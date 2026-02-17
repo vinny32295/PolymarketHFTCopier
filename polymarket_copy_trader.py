@@ -7933,9 +7933,26 @@ class CopyTraderGUI:
         notebook.add(dash_frame, text="Dashboard")
         self._build_dashboard_tab(dash_frame)
 
-        # Tab 2: Configuration
-        config_frame = ttk.Frame(notebook, padding=10)
-        notebook.add(config_frame, text="Configuration")
+        # Tab 2: Configuration (scrollable – many fields)
+        config_outer = ttk.Frame(notebook)
+        notebook.add(config_outer, text="Configuration")
+        config_canvas = tk.Canvas(config_outer, highlightthickness=0)
+        config_scrollbar = ttk.Scrollbar(config_outer, orient=tk.VERTICAL, command=config_canvas.yview)
+        config_frame = ttk.Frame(config_canvas, padding=10)
+        config_frame.bind(
+            "<Configure>",
+            lambda e: config_canvas.configure(scrollregion=config_canvas.bbox("all")),
+        )
+        config_canvas.create_window((0, 0), window=config_frame, anchor="nw")
+        config_canvas.configure(yscrollcommand=config_scrollbar.set)
+        config_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        config_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        # Mousewheel scrolling
+        def _on_config_mousewheel(event):
+            config_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        config_canvas.bind_all("<MouseWheel>", _on_config_mousewheel)
+        self._config_canvas = config_canvas
+        self._config_mousewheel_handler = _on_config_mousewheel
         self._build_config_tab(config_frame)
 
         # Tab 3: Watched Addresses
