@@ -724,11 +724,12 @@ class TelegramCommandBot:
     """Long-polls the Telegram Bot API for commands and replies with bot data.
 
     Supported commands:
-        /balance  — current USDC & MATIC balances
+        /balance   — current USDC & MATIC balances
         /positions — open positions with floating P&L
-        /trades   — recent trade history (last 10)
-        /status   — bot running state, session P&L, uptime
-        /help     — list available commands
+        /trades    — recent trade history (last 10)
+        /stats     — session W/L record, win %, total P&L, ROI
+        /status    — bot running state, session P&L, uptime
+        /help      — list available commands
     """
 
     def __init__(self, token, chat_id, bot_ref, logger):
@@ -794,6 +795,7 @@ class TelegramCommandBot:
             "/balance": self._cmd_balance,
             "/positions": self._cmd_positions,
             "/trades": self._cmd_trades,
+            "/stats": self._cmd_stats,
             "/status": self._cmd_status,
             "/help": self._cmd_help,
             "/start": self._cmd_help,
@@ -933,6 +935,88 @@ class TelegramCommandBot:
 
         self.send("\n".join(lines))
 
+    def _cmd_stats(self):
+        """Session statistics: bets placed, W/L, win %, total return."""
+        # Load full trade history from disk
+        history = []
+        try:
+            history_file = (
+                self.bot.cfg.get("trade_history_file", TRADE_HISTORY_FILE)
+                if self.bot else TRADE_HISTORY_FILE
+            )
+            with open(history_file, "r") as fh:
+                history = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+        if not history:
+            self.send("No trade history available.")
+            return
+
+        # Filter to current session
+        session_start = None
+        if self.bot:
+            ss = getattr(self.bot, "_session_start", None)
+            if ss:
+                session_start = ss.isoformat() if hasattr(ss, "isoformat") else str(ss)
+        if session_start:
+            history = [
+                r for r in history
+                if r.get("closed_at", "") >= session_start
+            ]
+
+        if not history:
+            self.send("No trades this session.")
+            return
+
+        # Compute stats
+        total_bets = len(history)
+        wins = sum(1 for r in history if r.get("outcome") in ("won", "win"))
+        losses = sum(1 for r in history if r.get("outcome") in ("lost", "loss"))
+        sold = sum(1 for r in history if r.get("outcome") == "sold")
+        total_decided = wins + losses
+        win_pct = (wins / total_decided * 100) if total_decided > 0 else 0
+
+        total_cost = sum(r.get("cost_basis_usdc", 0) for r in history)
+        total_proceeds = sum(r.get("proceeds_usdc", 0) for r in history)
+        total_pnl = total_proceeds - total_cost
+        roi = (total_pnl / total_cost * 100) if total_cost > 0 else 0
+
+        # Per-strategy martingale breakdown
+        mart_lines = []
+        mgr = getattr(self.bot, "_martingale_mgr", None) if self.bot else None
+        if mgr:
+            for mb in mgr.bots:
+                mart_lines.append(
+                    f"  [{mb.strategy_name}] "
+                    f"bet=${mb.current_bet:.2f}, "
+                    f"streak={mb.consecutive_losses}, "
+                    f"P/L=${mb.session_pnl:+.2f}"
+                )
+
+        lines = [
+            "SESSION STATS",
+            f"  Bets placed: {total_bets}",
+            f"  Won: {wins}",
+            f"  Lost: {losses}",
+        ]
+        if sold:
+            lines.append(f"  Sold (early exit): {sold}")
+        lines += [
+            f"  Win rate: {win_pct:.1f}%",
+            "",
+            f"  Total deployed: ${total_cost:,.2f}",
+            f"  Total returned: ${total_proceeds:,.2f}",
+            f"  Net P&L: ${total_pnl:+,.2f}",
+            f"  ROI: {roi:+.1f}%",
+        ]
+        if mart_lines:
+            lines.append("")
+            lines.append("MARTINGALE")
+            lines.extend(mart_lines)
+
+        self.send("\n".join(lines))
+
     def _cmd_status(self):
         running = self.bot.running if self.bot else False
         lines = [f"BOT STATUS: {'RUNNING' if running else 'STOPPED'}"]
@@ -980,6 +1064,7 @@ class TelegramCommandBot:
             "/balance — USDC & MATIC balances\n"
             "/positions — open positions with P/L\n"
             "/trades — recent trade history\n"
+            "/stats — session W/L, win %, P&L, ROI\n"
             "/status — bot state, uptime, session info\n"
             "/help — this message"
         )
