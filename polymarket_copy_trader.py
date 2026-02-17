@@ -4644,11 +4644,40 @@ class MartingaleBot(threading.Thread):
         # Price range check — only bet when price is within the target range
         price_min = float(self._scfg("price_min", "martingale_price_min", 0.40))
         price_max = float(self._scfg("price_max", "martingale_price_max", 0.55))
+
+        # Dynamic price_max escalation based on loss streak.
+        # At higher streaks, the bet is much larger so missing the window
+        # entirely is worse than paying a few cents more per share.
+        #
+        # Config: price_max_streak = {4: 0.60, 5: 0.65, 6: 0.70}
+        # — keys are streak thresholds, values are the new price_max.
+        # The highest matching threshold wins.
+        streak_overrides = self._scfg(
+            "price_max_streak", "martingale_price_max_streak",
+            {4: 0.60, 5: 0.65, 6: 0.70},
+        )
+        base_price_max = price_max
+        if streak_overrides and self.consecutive_losses > 0:
+            # Find the highest streak threshold that applies
+            best_threshold = 0
+            for threshold_str, cap in streak_overrides.items():
+                threshold = int(threshold_str)
+                if self.consecutive_losses >= threshold > best_threshold:
+                    best_threshold = threshold
+                    price_max = max(price_max, float(cap))
+            if price_max > base_price_max:
+                self.logger.info(
+                    "MARTINGALE [%s]: streak %d — price cap raised $%.2f → $%.2f",
+                    self.strategy_name, self.consecutive_losses,
+                    base_price_max, price_max,
+                )
+
         if ask_price < price_min or ask_price > price_max:
             self.logger.info(
                 "MARTINGALE [%s]: price $%.4f outside range [$%.2f–$%.2f] "
-                "— will retry",
+                "— will retry (streak=%d)",
                 self.strategy_name, ask_price, price_min, price_max,
+                self.consecutive_losses,
             )
             self._skip_reason = f"price ${ask_price:.4f} outside [{price_min:.2f}–{price_max:.2f}]"
             return False  # don't mark skipped — price might come back
