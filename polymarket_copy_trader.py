@@ -212,6 +212,10 @@ DATA_API_BASE = "https://data-api.polymarket.com"
 POSITIONS_FILE = "positions.json"
 TRADE_HISTORY_FILE = "trade_history.json"
 SESSION_TRADES_FILE = "session_trades.json"
+
+# Module-level lock protecting concurrent read-modify-write of
+# trade_history.json from multiple threads (executor, arb, martingale).
+_TRADE_HISTORY_LOCK = threading.Lock()
 STRATEGY_SUMMARY_FILE = "strategy_summary.json"
 USER_CONFIG_FILE = "config.json"  # persists RPC URLs, proxy address, etc.
 
@@ -3904,7 +3908,7 @@ class MartingaleBot(threading.Thread):
             "cost_basis_usdc": round(bet["cost"], 6),
             "proceeds_usdc": round(bet["shares"], 6) if won else 0.0,
             "pnl_usdc": round(profit, 6),
-            "outcome": "win" if won else "loss",
+            "outcome": "won" if won else "lost",
             "reason": "martingale",
             "martingale_details": {
                 "strategy": self.strategy_name,
@@ -4367,51 +4371,66 @@ class TradeExecutor:
             "reason": reason,
         }
 
-        history = self._load_trade_history()
-        history.append(record)
+        with _TRADE_HISTORY_LOCK:
+            history = self._load_trade_history()
 
-        # Compute running totals
-        total_cost = sum(r.get("cost_basis_usdc", 0) for r in history)
-        total_proceeds = sum(r.get("proceeds_usdc", 0) for r in history)
-        total_pnl = round(total_proceeds - total_cost, 6)
-        total_position_size = sum(
-            r.get("position_size_usdc", r.get("cost_basis_usdc", 0))
-            for r in history
-        )
+            # Deduplicate: if a martingale bet already logged a record for
+            # this token_id, skip the executor's "redeemed" duplicate.
+            if reason == "redeemed":
+                for existing in reversed(history):
+                    if (existing.get("token_id") == token_id
+                            and existing.get("reason") == "martingale"):
+                        self.logger.debug(
+                            "Skipping duplicate _log_closed_trade for %s "
+                            "(already logged by martingale)",
+                            token_id[:16] + "...",
+                        )
+                        return
 
-        # Win/loss counts
-        wins = sum(1 for r in history if r.get("outcome") == "won")
-        losses = sum(1 for r in history if r.get("outcome") == "lost")
-        total_trades = wins + losses
-        win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+            history.append(record)
 
-        try:
-            tmp = self._trade_history_file + ".tmp"
-            with open(tmp, "w") as fh:
-                json.dump(history, fh, indent=2)
-            os.replace(tmp, self._trade_history_file)
-        except Exception as exc:
-            self.logger.warning("Could not save trade history: %s", exc)
+            # Compute running totals
+            total_cost = sum(r.get("cost_basis_usdc", 0) for r in history)
+            total_proceeds = sum(r.get("proceeds_usdc", 0) for r in history)
+            total_pnl = round(total_proceeds - total_cost, 6)
+            total_position_size = sum(
+                r.get("position_size_usdc", r.get("cost_basis_usdc", 0))
+                for r in history
+            )
 
-        # --- Persist strategy summary ---
-        try:
-            summary = {
-                "updated_at": datetime.now().isoformat(),
-                "total_trades": len(history),
-                "wins": wins,
-                "losses": losses,
-                "win_rate_pct": round(win_rate, 1),
-                "lifetime_pnl_usdc": total_pnl,
-                "total_position_size_usdc": round(total_position_size, 6),
-                "lifetime_cost_basis_usdc": round(total_cost, 6),
-                "capital_returned_usdc": round(total_proceeds, 6),
-            }
-            tmp_sf = STRATEGY_SUMMARY_FILE + ".tmp"
-            with open(tmp_sf, "w") as fh:
-                json.dump(summary, fh, indent=2)
-            os.replace(tmp_sf, STRATEGY_SUMMARY_FILE)
-        except Exception as exc:
-            self.logger.debug("Could not save strategy summary: %s", exc)
+            # Win/loss counts — accept both "won"/"lost" and "win"/"loss"
+            wins = sum(1 for r in history if r.get("outcome") in ("won", "win"))
+            losses = sum(1 for r in history if r.get("outcome") in ("lost", "loss"))
+            total_trades = wins + losses
+            win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+
+            try:
+                tmp = self._trade_history_file + ".tmp"
+                with open(tmp, "w") as fh:
+                    json.dump(history, fh, indent=2)
+                os.replace(tmp, self._trade_history_file)
+            except Exception as exc:
+                self.logger.warning("Could not save trade history: %s", exc)
+
+            # --- Persist strategy summary ---
+            try:
+                summary = {
+                    "updated_at": datetime.now().isoformat(),
+                    "total_trades": len(history),
+                    "wins": wins,
+                    "losses": losses,
+                    "win_rate_pct": round(win_rate, 1),
+                    "lifetime_pnl_usdc": total_pnl,
+                    "total_position_size_usdc": round(total_position_size, 6),
+                    "lifetime_cost_basis_usdc": round(total_cost, 6),
+                    "capital_returned_usdc": round(total_proceeds, 6),
+                }
+                tmp_sf = STRATEGY_SUMMARY_FILE + ".tmp"
+                with open(tmp_sf, "w") as fh:
+                    json.dump(summary, fh, indent=2)
+                os.replace(tmp_sf, STRATEGY_SUMMARY_FILE)
+            except Exception as exc:
+                self.logger.debug("Could not save strategy summary: %s", exc)
 
         # Kill switch: stop the bot if session losses exceed threshold
         self._session_pnl += pnl
@@ -7208,22 +7227,26 @@ class CopyTraderBot:
     def _append_trade_history(self, record):
         """Append a trade record to the persistent trade_history.json.
 
-        Used by ArbitrageMonitor to log arb trades into the same history
-        file that the TradeExecutor uses for copy trades, so both appear
-        in the History tab and dashboard stats.
+        Used by ArbitrageMonitor and MartingaleBot to log trades into the
+        same history file that the TradeExecutor uses for copy trades, so
+        all trades appear in the History tab and dashboard stats.
+
+        Thread-safe: uses the module-level ``_TRADE_HISTORY_LOCK`` to
+        prevent concurrent read-modify-write from multiple threads.
         """
         try:
-            history_file = self.cfg.get("trade_history_file", TRADE_HISTORY_FILE)
-            try:
-                with open(history_file, "r") as fh:
-                    history = json.load(fh)
-            except (FileNotFoundError, json.JSONDecodeError):
-                history = []
-            history.append(record)
-            tmp = history_file + ".tmp"
-            with open(tmp, "w") as fh:
-                json.dump(history, fh, indent=2, default=str)
-            os.replace(tmp, history_file)
+            with _TRADE_HISTORY_LOCK:
+                history_file = self.cfg.get("trade_history_file", TRADE_HISTORY_FILE)
+                try:
+                    with open(history_file, "r") as fh:
+                        history = json.load(fh)
+                except (FileNotFoundError, json.JSONDecodeError):
+                    history = []
+                history.append(record)
+                tmp = history_file + ".tmp"
+                with open(tmp, "w") as fh:
+                    json.dump(history, fh, indent=2, default=str)
+                os.replace(tmp, history_file)
         except Exception as exc:
             self.logger.debug("Could not append trade history: %s", exc)
 
@@ -9227,6 +9250,10 @@ class CopyTraderGUI:
         except (FileNotFoundError, json.JSONDecodeError):
             history = []
 
+        # Sort by timestamp so display is always chronological, even if
+        # records were written out of order by concurrent threads.
+        history.sort(key=lambda r: r.get("closed_at", ""))
+
         # Filter to current session if the toggle is checked
         session_filter = getattr(self, "history_session_only_var", None)
         if session_filter and session_filter.get():
@@ -9249,9 +9276,9 @@ class CopyTraderGUI:
             total_cost += rec.get("cost_basis_usdc", 0)
             total_proceeds += rec.get("proceeds_usdc", 0)
             outcome = rec.get("outcome", "")
-            if outcome == "won":
+            if outcome in ("won", "win"):
                 wins += 1
-            elif outcome == "lost":
+            elif outcome in ("lost", "loss"):
                 losses += 1
             closed_at = rec.get("closed_at", "")
             # Shorten the ISO timestamp for display
