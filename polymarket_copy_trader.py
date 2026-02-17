@@ -744,9 +744,55 @@ class TelegramCommandBot:
         self._last_update_id = 0
 
     def start(self):
+        self._register_commands()
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
         self.logger.info("Telegram command bot started (chat_id=%s)", self.chat_id)
+
+    def _register_commands(self):
+        """Register all commands with Telegram via setMyCommands so they
+        appear in the '/' command menu and are recognized by the client."""
+        commands = [
+            ("balance", "Current USDC & MATIC balances"),
+            ("positions", "Open positions with floating P&L"),
+            ("trades", "Recent trade history (last 10)"),
+            ("stats", "Session W/L, win %, total P&L, ROI"),
+            ("strategies", "Martingale strategy status"),
+            ("status", "Bot state, session P&L, uptime"),
+            ("stop", "Stop the bot gracefully"),
+            ("pause", "Pause trading (keep monitoring)"),
+            ("resume", "Resume trading after pause"),
+            ("kill", "Emergency kill switch"),
+            ("toggle_arb", "Toggle arb mode on/off"),
+            ("toggle_martingale", "Toggle martingale on/off"),
+            ("toggle_copy", "Toggle copy trading on/off"),
+            ("dry_run", "Toggle dry run mode on/off"),
+            ("set_max_bet", "Set max bet size in USDC"),
+            ("set_copy_pct", "Set copy percentage (0-100)"),
+            ("set_max_trade", "Set max trade size in USDC"),
+            ("set_min_edge", "Set minimum arb edge %"),
+            ("set_max_loss", "Set max loss threshold in USDC"),
+            ("set_exit", "Set exit strategy (whale|auto)"),
+            ("sell", "Force sell position(s)"),
+            ("reset_martingale", "Reset streak & bet size"),
+            ("redeem", "Scan & redeem resolved positions"),
+            ("help", "List available commands"),
+        ]
+        try:
+            url = TELEGRAM_API.format(token=self.token) + "/setMyCommands"
+            payload = {
+                "commands": [
+                    {"command": cmd, "description": desc}
+                    for cmd, desc in commands
+                ]
+            }
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.status_code == 200 and resp.json().get("ok"):
+                self.logger.info("Telegram commands registered (%d commands)", len(commands))
+            else:
+                self.logger.warning("Failed to register Telegram commands: %s", resp.text)
+        except Exception as exc:
+            self.logger.warning("Could not register Telegram commands: %s", exc)
 
     def stop(self):
         self._stop_event.set()
