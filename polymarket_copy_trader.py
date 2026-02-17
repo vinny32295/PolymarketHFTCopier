@@ -4100,15 +4100,17 @@ class MartingaleBot(threading.Thread):
         profit = bet["shares"] - bet["cost"]
         self.session_pnl += profit
 
-        # Slippage impact: how much profit was lost to paying above fair ($0.50)
+        # Slippage impact relative to fair value ($0.50).
+        # Negative = favorable (bought below fair, extra edge gained).
+        # Positive = unfavorable (bought above fair, edge lost).
         slip_fair = bet.get("slippage_vs_fair", 0)
-        slip_usdc = bet.get("slippage_usdc", 0)
         slip_info = ""
         if abs(slip_fair) >= 0.0001:
-            lost_to_slip = slip_fair * bet["shares"]
+            edge_usdc = slip_fair * bet["shares"]
+            tag = "edge lost" if slip_fair > 0 else "edge gained"
             slip_info = (
-                f" | slippage: fill ${bet.get('fill_price', 0):.4f} vs "
-                f"fair $0.50 = ${lost_to_slip:+.4f} impact"
+                f" | fill ${bet.get('fill_price', 0):.4f} vs "
+                f"$0.50 fair → ${abs(edge_usdc):.4f} {tag}"
             )
 
         self.logger.info(
@@ -4161,10 +4163,12 @@ class MartingaleBot(threading.Thread):
                 "MARTINGALE [%s]: bet capped at max $%.2f", self.strategy_name, max_bet,
             )
 
-        slip_usdc = bet.get("slippage_usdc", 0)
+        slip_fair = bet.get("slippage_vs_fair", 0)
         slip_info = ""
-        if abs(slip_usdc) >= 0.0001:
-            slip_info = f" | exec slippage: ${slip_usdc:+.4f}"
+        if abs(slip_fair) >= 0.0001:
+            extra = slip_fair * bet["shares"]
+            tag = "overpaid" if slip_fair > 0 else "underpaid"
+            slip_info = f" | {tag} ${abs(extra):.4f} vs $0.50 fair"
 
         self.logger.info(
             "MARTINGALE LOSS: %s -$%.2f (fill $%.4f) — next bet $%.2f "
@@ -4231,28 +4235,59 @@ class MartingaleBot(threading.Thread):
 
     @staticmethod
     def _aggregate_slippage(records):
-        """Compute slippage stats from a list of trade records."""
+        """Compute slippage stats from a list of trade records.
+
+        Splits into favorable (bought below $0.50 fair) and unfavorable
+        (bought above $0.50 fair) so you can see exactly how much edge
+        you're gaining or losing to price execution.
+        """
         slips_vs_ask = []
         slips_vs_fair = []
         total_slip_usdc = 0.0
         fill_prices = []
+        favorable_usdc = 0.0     # total $ saved by buying below fair
+        unfavorable_usdc = 0.0   # total $ lost by buying above fair
+        favorable_count = 0
+        unfavorable_count = 0
         for r in records:
             s = r.get("slippage") or {}
             if s:
-                slips_vs_ask.append(s.get("vs_ask", 0))
-                slips_vs_fair.append(s.get("vs_fair", 0))
-                total_slip_usdc += s.get("total_usdc", 0)
+                vs_ask = s.get("vs_ask", 0)
+                vs_fair = s.get("vs_fair", 0)
+                slip_usdc = s.get("total_usdc", 0)
+                slips_vs_ask.append(vs_ask)
+                slips_vs_fair.append(vs_fair)
+                total_slip_usdc += slip_usdc
                 if s.get("fill_price"):
                     fill_prices.append(s["fill_price"])
+                    shares = r.get("shares", 0)
+                    edge_usdc = vs_fair * shares
+                    if vs_fair < 0:
+                        favorable_usdc += abs(edge_usdc)
+                        favorable_count += 1
+                    elif vs_fair > 0:
+                        unfavorable_usdc += edge_usdc
+                        unfavorable_count += 1
         n = len(slips_vs_ask) or 1
+        net_edge = favorable_usdc - unfavorable_usdc
         return {
-            "total_slippage_usdc": round(total_slip_usdc, 6),
+            "total_exec_slippage_usdc": round(total_slip_usdc, 6),
             "avg_slippage_vs_ask": round(sum(slips_vs_ask) / n, 6) if slips_vs_ask else 0,
-            "avg_slippage_vs_fair": round(sum(slips_vs_fair) / n, 6) if slips_vs_fair else 0,
-            "max_slippage_vs_ask": round(max(slips_vs_ask), 6) if slips_vs_ask else 0,
             "avg_fill_price": round(sum(fill_prices) / len(fill_prices), 6) if fill_prices else 0,
+            "avg_slippage_vs_fair": round(sum(slips_vs_fair) / n, 6) if slips_vs_fair else 0,
+            "max_overpay_vs_ask": round(max(slips_vs_ask), 6) if slips_vs_ask else 0,
+            "best_underpay_vs_ask": round(min(slips_vs_ask), 6) if slips_vs_ask else 0,
+            "favorable_fills": {
+                "count": favorable_count,
+                "total_edge_gained_usdc": round(favorable_usdc, 6),
+            },
+            "unfavorable_fills": {
+                "count": unfavorable_count,
+                "total_edge_lost_usdc": round(unfavorable_usdc, 6),
+            },
+            "net_edge_usdc": round(net_edge, 6),
+            "net_verdict": "favorable" if net_edge > 0 else ("unfavorable" if net_edge < 0 else "neutral"),
             "bets_with_slippage_data": len(slips_vs_ask),
-            "net_direction": "positive" if total_slip_usdc > 0 else ("negative" if total_slip_usdc < 0 else "zero"),
         }
 
     def _persist_martingale_record(self, record):
@@ -9079,7 +9114,7 @@ class CopyTraderGUI:
             f"Lifetime P/L: {lifetime_dir} ${lifetime_pnl:+,.2f}"
         )
 
-        # -- Martingale-specific stats --
+        # -- Martingale-specific stats with slippage --
         mart_label = ""
         try:
             with open(MARTINGALE_SUMMARY_FILE, "r") as fh:
@@ -9090,9 +9125,18 @@ class CopyTraderGUI:
                 m_losses = ms.get("losses", 0)
                 m_pnl = ms.get("lifetime_pnl_usdc", 0)
                 m_wr = ms.get("win_rate_pct", 0)
+                slip = ms.get("slippage") or {}
+                net_edge = slip.get("net_edge_usdc", 0)
+                avg_fill = slip.get("avg_fill_price", 0)
+                edge_tag = ""
+                if avg_fill > 0:
+                    edge_tag = (
+                        f" avg ${avg_fill:.3f}"
+                        f" edge ${net_edge:+,.2f}"
+                    )
                 mart_label = (
                     f"  |  Mart: W/L {m_wins}/{m_losses} "
-                    f"({m_wr:.0f}%) P&L ${m_pnl:+,.2f}"
+                    f"({m_wr:.0f}%) P&L ${m_pnl:+,.2f}{edge_tag}"
                 )
         except (FileNotFoundError, json.JSONDecodeError):
             pass
