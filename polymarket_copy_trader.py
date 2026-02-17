@@ -9033,14 +9033,19 @@ class CopyTraderGUI:
             save_private_key(pk, self.cfg)
 
         arb_mode = self.cfg.get("arb_enabled") and (
-            self.cfg.get("arb_condition_ids") or self.cfg.get("arb_dynamic_slug")
+            self.cfg.get("arb_condition_ids")
+            or self.cfg.get("arb_dynamic_slug")
+            or self.cfg.get("arb_dynamic_slugs")
         )
-        if not self.cfg.get("watched_addresses") and not arb_mode:
+        martingale_mode = self.cfg.get("martingale_enabled")
+        if (not self.cfg.get("watched_addresses")
+                and not arb_mode and not martingale_mode):
             messagebox.showwarning(
-                "No Addresses",
-                "Add at least one trader address to watch, "
-                "or enable arbitrage mode with market condition IDs "
-                "or a dynamic slug.",
+                "No Mode Selected",
+                "Enable at least one trading mode:\n"
+                "• Add a watched address for copy trading\n"
+                "• Enable arbitrage mode with market IDs or slugs\n"
+                "• Enable martingale mode",
             )
             return
         if not self.cfg.get("rpc_url") and not self.cfg.get("ws_rpc_url"):
