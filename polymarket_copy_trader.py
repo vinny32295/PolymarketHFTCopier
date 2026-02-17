@@ -1006,29 +1006,36 @@ class TelegramCommandBot:
             f"  ROI: {t['roi']:+.1f}%",
         ]
 
-        # -- Split by source: copy/redeemed, arb, martingale --
-        copy_trades = [r for r in history if r.get("reason") not in ("martingale", "arb")]
-        arb_trades = [r for r in history if r.get("reason") == "arb"]
+        # -- Split by source: positions, arb, martingale --
         mart_trades = [r for r in history if r.get("reason") == "martingale"]
+        arb_trades = [r for r in history
+                      if r.get("reason", "").startswith("arb")]
+        pos_trades = [r for r in history
+                      if r.get("reason") != "martingale"
+                      and not r.get("reason", "").startswith("arb")]
 
-        # Show per-source summary only if more than one source is active
-        sources_active = sum(1 for bucket in (copy_trades, arb_trades, mart_trades) if bucket)
-        if sources_active > 1:
-            if copy_trades:
-                c = self._bucket_stats(copy_trades)
-                lines += [
-                    "",
-                    "COPY TRADING",
-                    f"  {c['n']} trades  |  W/L {c['wins']}/{c['losses']}"
-                    f" ({c['win_pct']:.0f}%)  |  P&L ${c['pnl']:+,.2f}",
-                ]
-            if arb_trades:
-                a = self._bucket_stats(arb_trades)
-                lines += [
-                    "",
-                    "ARBITRAGE",
-                    f"  {a['n']} trades  |  P&L ${a['pnl']:+,.2f}",
-                ]
+        # Determine label: only say "COPY TRADING" if copy trading is on
+        copy_active = bool(
+            self.bot and self.bot.cfg.get("watched_addresses")
+        )
+        pos_label = "COPY TRADING" if copy_active else "POSITIONS"
+
+        # Always show per-source breakdown so users can see what drove P&L
+        if pos_trades:
+            c = self._bucket_stats(pos_trades)
+            lines += [
+                "",
+                pos_label,
+                f"  {c['n']} trades  |  W/L {c['wins']}/{c['losses']}"
+                f" ({c['win_pct']:.0f}%)  |  P&L ${c['pnl']:+,.2f}",
+            ]
+        if arb_trades:
+            a = self._bucket_stats(arb_trades)
+            lines += [
+                "",
+                "ARBITRAGE",
+                f"  {a['n']} trades  |  P&L ${a['pnl']:+,.2f}",
+            ]
 
         # -- Per-strategy martingale breakdown --
         if mart_trades:
@@ -1062,6 +1069,24 @@ class TelegramCommandBot:
                         f"streak={mb.consecutive_losses}  |  "
                         f"{active}"
                     )
+
+        # -- Slippage summary for session --
+        slippage_records = [r for r in history if r.get("slippage")]
+        if slippage_records:
+            sl = MartingaleBot._aggregate_slippage(slippage_records)
+            lines += [
+                "",
+                "SLIPPAGE",
+                f"  Bets tracked: {sl['bets_with_slippage_data']}",
+                f"  Total exec slippage: ${sl['total_exec_slippage_usdc']:+,.4f}",
+                f"  Avg slippage vs ask: ${sl['avg_slippage_vs_ask']:+.4f}/sh",
+                f"  Avg fill price: ${sl['avg_fill_price']:.4f}",
+                f"  Favorable fills: {sl['favorable_fills']['count']}"
+                f"  (${sl['favorable_fills']['total_edge_gained_usdc']:,.4f} saved)",
+                f"  Unfavorable fills: {sl['unfavorable_fills']['count']}"
+                f"  (${sl['unfavorable_fills']['total_edge_lost_usdc']:,.4f} lost)",
+                f"  Net edge: ${sl['net_edge_usdc']:+,.4f} ({sl['net_verdict']})",
+            ]
 
         self.send("\n".join(lines))
 
