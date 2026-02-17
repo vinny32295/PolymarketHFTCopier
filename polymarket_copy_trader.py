@@ -935,9 +935,26 @@ class TelegramCommandBot:
 
         self.send("\n".join(lines))
 
-    def _cmd_stats(self):
-        """Session statistics: bets placed, W/L, win %, total return."""
-        # Load full trade history from disk
+    @staticmethod
+    def _bucket_stats(records):
+        """Compute W/L/sold/cost/proceeds/pnl for a list of trade records."""
+        wins = sum(1 for r in records if r.get("outcome") in ("won", "win"))
+        losses = sum(1 for r in records if r.get("outcome") in ("lost", "loss"))
+        sold = sum(1 for r in records if r.get("outcome") == "sold")
+        cost = sum(r.get("cost_basis_usdc", 0) for r in records)
+        proceeds = sum(r.get("proceeds_usdc", 0) for r in records)
+        pnl = proceeds - cost
+        decided = wins + losses
+        win_pct = (wins / decided * 100) if decided > 0 else 0
+        roi = (pnl / cost * 100) if cost > 0 else 0
+        return {
+            "n": len(records), "wins": wins, "losses": losses, "sold": sold,
+            "cost": cost, "proceeds": proceeds, "pnl": pnl,
+            "win_pct": win_pct, "roi": roi,
+        }
+
+    def _load_session_history(self):
+        """Load trade_history.json filtered to the current session."""
         history = []
         try:
             history_file = (
@@ -948,12 +965,6 @@ class TelegramCommandBot:
                 history = json.load(fh)
         except (FileNotFoundError, json.JSONDecodeError):
             pass
-
-        if not history:
-            self.send("No trade history available.")
-            return
-
-        # Filter to current session
         session_start = None
         if self.bot:
             ss = getattr(self.bot, "_session_start", None)
@@ -964,56 +975,88 @@ class TelegramCommandBot:
                 r for r in history
                 if r.get("closed_at", "") >= session_start
             ]
+        return history
+
+    def _cmd_stats(self):
+        """Session statistics: bets placed, W/L, win %, total return,
+        plus per-strategy breakdown for martingale."""
+        history = self._load_session_history()
 
         if not history:
             self.send("No trades this session.")
             return
 
-        # Compute stats
-        total_bets = len(history)
-        wins = sum(1 for r in history if r.get("outcome") in ("won", "win"))
-        losses = sum(1 for r in history if r.get("outcome") in ("lost", "loss"))
-        sold = sum(1 for r in history if r.get("outcome") == "sold")
-        total_decided = wins + losses
-        win_pct = (wins / total_decided * 100) if total_decided > 0 else 0
-
-        total_cost = sum(r.get("cost_basis_usdc", 0) for r in history)
-        total_proceeds = sum(r.get("proceeds_usdc", 0) for r in history)
-        total_pnl = total_proceeds - total_cost
-        roi = (total_pnl / total_cost * 100) if total_cost > 0 else 0
-
-        # Per-strategy martingale breakdown
-        mart_lines = []
-        mgr = getattr(self.bot, "_martingale_mgr", None) if self.bot else None
-        if mgr:
-            for mb in mgr.bots:
-                mart_lines.append(
-                    f"  [{mb.strategy_name}] "
-                    f"bet=${mb.current_bet:.2f}, "
-                    f"streak={mb.consecutive_losses}, "
-                    f"P/L=${mb.session_pnl:+.2f}"
-                )
-
+        # -- Overall totals --
+        t = self._bucket_stats(history)
         lines = [
             "SESSION STATS",
-            f"  Bets placed: {total_bets}",
-            f"  Won: {wins}",
-            f"  Lost: {losses}",
-        ]
-        if sold:
-            lines.append(f"  Sold (early exit): {sold}")
-        lines += [
-            f"  Win rate: {win_pct:.1f}%",
+            f"  Bets placed: {t['n']}",
+            f"  Won: {t['wins']}  |  Lost: {t['losses']}"
+            + (f"  |  Sold: {t['sold']}" if t["sold"] else ""),
+            f"  Win rate: {t['win_pct']:.1f}%",
             "",
-            f"  Total deployed: ${total_cost:,.2f}",
-            f"  Total returned: ${total_proceeds:,.2f}",
-            f"  Net P&L: ${total_pnl:+,.2f}",
-            f"  ROI: {roi:+.1f}%",
+            f"  Deployed: ${t['cost']:,.2f}",
+            f"  Returned: ${t['proceeds']:,.2f}",
+            f"  Net P&L: ${t['pnl']:+,.2f}",
+            f"  ROI: {t['roi']:+.1f}%",
         ]
-        if mart_lines:
-            lines.append("")
-            lines.append("MARTINGALE")
-            lines.extend(mart_lines)
+
+        # -- Split by source: copy/redeemed, arb, martingale --
+        copy_trades = [r for r in history if r.get("reason") not in ("martingale", "arb")]
+        arb_trades = [r for r in history if r.get("reason") == "arb"]
+        mart_trades = [r for r in history if r.get("reason") == "martingale"]
+
+        # Show per-source summary only if more than one source is active
+        sources_active = sum(1 for bucket in (copy_trades, arb_trades, mart_trades) if bucket)
+        if sources_active > 1:
+            if copy_trades:
+                c = self._bucket_stats(copy_trades)
+                lines += [
+                    "",
+                    "COPY TRADING",
+                    f"  {c['n']} trades  |  W/L {c['wins']}/{c['losses']}"
+                    f" ({c['win_pct']:.0f}%)  |  P&L ${c['pnl']:+,.2f}",
+                ]
+            if arb_trades:
+                a = self._bucket_stats(arb_trades)
+                lines += [
+                    "",
+                    "ARBITRAGE",
+                    f"  {a['n']} trades  |  P&L ${a['pnl']:+,.2f}",
+                ]
+
+        # -- Per-strategy martingale breakdown --
+        if mart_trades:
+            # Group by strategy name from trade records
+            strat_buckets = {}
+            for r in mart_trades:
+                details = r.get("martingale_details") or {}
+                name = details.get("strategy", "default")
+                strat_buckets.setdefault(name, []).append(r)
+
+            lines += ["", "MARTINGALE"]
+            for name, records in strat_buckets.items():
+                s = self._bucket_stats(records)
+                lines.append(
+                    f"  [{name}]  {s['n']} bets  |  "
+                    f"W/L {s['wins']}/{s['losses']} ({s['win_pct']:.0f}%)  |  "
+                    f"P&L ${s['pnl']:+,.2f}  |  "
+                    f"deployed ${s['cost']:,.2f}"
+                )
+
+            # Live bot state (current bet, streak)
+            mgr = getattr(self.bot, "_martingale_mgr", None) if self.bot else None
+            if mgr:
+                lines.append("")
+                lines.append("LIVE STATE")
+                for mb in mgr.bots:
+                    active = "ACTIVE" if mb._active_bet else "waiting"
+                    lines.append(
+                        f"  [{mb.strategy_name}] "
+                        f"next=${mb.current_bet:.2f}  |  "
+                        f"streak={mb.consecutive_losses}  |  "
+                        f"{active}"
+                    )
 
         self.send("\n".join(lines))
 
