@@ -503,7 +503,8 @@ DEFAULT_CONFIG = {
     "martingale_slug_base": "btc-updown-5m",  # slug prefix for the market
     "martingale_window": 300,          # window size in seconds (300 = 5 min)
     "martingale_poll_seconds": 10,     # how often to check for resolution
-    "martingale_max_slippage": 0.10,   # max deviation from $0.50 (e.g. 0.10 = $0.40–$0.60)
+    "martingale_price_min": 0.40,      # min ask price to accept (lower bound of buy range)
+    "martingale_price_max": 0.55,      # max ask price to accept (upper bound of buy range)
     "martingale_max_entry_seconds": 60, # only bet in the first N seconds of a window
 }
 
@@ -524,7 +525,7 @@ _PERSISTENT_CONFIG_KEYS = [
     "martingale_enabled", "martingale_direction", "martingale_start_bet",
     "martingale_max_bet", "martingale_max_streak",
     "martingale_slug_base", "martingale_window", "martingale_poll_seconds",
-    "martingale_max_slippage", "martingale_max_entry_seconds",
+    "martingale_price_min", "martingale_price_max", "martingale_max_entry_seconds",
 ]
 
 
@@ -2855,9 +2856,10 @@ class MartingaleBot(threading.Thread):
             self._active_bet = state.get("active_bet")
             self._last_window_ts = int(state.get("last_window_ts", 0))
             self.logger.info(
-                "Loaded martingale state: bet=$%.2f, streak=%d, pnl=$%.4f, dir=%s",
+                "Loaded martingale state: bet=$%.2f, streak=%d, pnl=$%.4f, "
+                "dir=%s, last_window_ts=%d",
                 self.current_bet, self.consecutive_losses,
-                self.session_pnl, self.direction,
+                self.session_pnl, self.direction, self._last_window_ts,
             )
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             pass
@@ -3118,13 +3120,14 @@ class MartingaleBot(threading.Thread):
             )
             return False
 
-        # Slippage check — only bet when price is near $0.50
-        max_slippage = float(self.cfg.get("martingale_max_slippage", 0.10))
-        if abs(ask_price - 0.50) > max_slippage:
+        # Price range check — only bet when price is within the target range
+        price_min = float(self.cfg.get("martingale_price_min", 0.40))
+        price_max = float(self.cfg.get("martingale_price_max", 0.55))
+        if ask_price < price_min or ask_price > price_max:
             self.logger.info(
-                "MARTINGALE: price $%.4f too far from $0.50 "
-                "(slippage %.2f > max %.2f) — will retry",
-                ask_price, abs(ask_price - 0.50), max_slippage,
+                "MARTINGALE: price $%.4f outside range [$%.2f–$%.2f] "
+                "— will retry",
+                ask_price, price_min, price_max,
             )
             return False  # don't mark skipped — price might come back
 
@@ -8243,11 +8246,18 @@ class CopyTraderGUI:
         self.mart_poll_entry.grid(row=row, column=1, padx=2, pady=2)
 
         row += 1
-        ttk.Label(settings_frame, text="Max Slippage from $0.50:").grid(
+        ttk.Label(settings_frame, text="Buy Price Min:").grid(
             row=row, column=0, sticky=tk.W, padx=2, pady=2,
         )
-        self.mart_slippage_entry = ttk.Entry(settings_frame, width=10)
-        self.mart_slippage_entry.grid(row=row, column=1, padx=2, pady=2)
+        self.mart_price_min_entry = ttk.Entry(settings_frame, width=10)
+        self.mart_price_min_entry.grid(row=row, column=1, padx=2, pady=2)
+
+        row += 1
+        ttk.Label(settings_frame, text="Buy Price Max:").grid(
+            row=row, column=0, sticky=tk.W, padx=2, pady=2,
+        )
+        self.mart_price_max_entry = ttk.Entry(settings_frame, width=10)
+        self.mart_price_max_entry.grid(row=row, column=1, padx=2, pady=2)
 
         row += 1
         ttk.Label(settings_frame, text="Max Entry (seconds into window):").grid(
@@ -8503,7 +8513,8 @@ class CopyTraderGUI:
         self.mart_slug_entry.insert(0, self.cfg.get("martingale_slug_base", "btc-updown-5m"))
         self.mart_window_entry.insert(0, str(self.cfg.get("martingale_window", 300)))
         self.mart_poll_entry.insert(0, str(self.cfg.get("martingale_poll_seconds", 10)))
-        self.mart_slippage_entry.insert(0, str(self.cfg.get("martingale_max_slippage", 0.10)))
+        self.mart_price_min_entry.insert(0, str(self.cfg.get("martingale_price_min", 0.40)))
+        self.mart_price_max_entry.insert(0, str(self.cfg.get("martingale_price_max", 0.55)))
         self.mart_max_entry_entry.insert(0, str(self.cfg.get("martingale_max_entry_seconds", 60)))
 
     def _read_fields_to_config(self):
@@ -8636,9 +8647,15 @@ class CopyTraderGUI:
         except ValueError:
             pass
         try:
-            val = float(self.mart_slippage_entry.get().strip())
-            if 0 < val <= 0.50:
-                self.cfg["martingale_max_slippage"] = val
+            val = float(self.mart_price_min_entry.get().strip())
+            if 0 <= val < 1.0:
+                self.cfg["martingale_price_min"] = val
+        except ValueError:
+            pass
+        try:
+            val = float(self.mart_price_max_entry.get().strip())
+            if 0 < val <= 1.0:
+                self.cfg["martingale_price_max"] = val
         except ValueError:
             pass
         try:
@@ -8912,8 +8929,10 @@ def run_headless():
         cfg["martingale_window"] = int(os.environ["MARTINGALE_WINDOW"])
     if os.environ.get("MARTINGALE_POLL_SECONDS"):
         cfg["martingale_poll_seconds"] = int(os.environ["MARTINGALE_POLL_SECONDS"])
-    if os.environ.get("MARTINGALE_MAX_SLIPPAGE"):
-        cfg["martingale_max_slippage"] = float(os.environ["MARTINGALE_MAX_SLIPPAGE"])
+    if os.environ.get("MARTINGALE_PRICE_MIN"):
+        cfg["martingale_price_min"] = float(os.environ["MARTINGALE_PRICE_MIN"])
+    if os.environ.get("MARTINGALE_PRICE_MAX"):
+        cfg["martingale_price_max"] = float(os.environ["MARTINGALE_PRICE_MAX"])
     if os.environ.get("MARTINGALE_MAX_ENTRY_SECONDS"):
         cfg["martingale_max_entry_seconds"] = int(os.environ["MARTINGALE_MAX_ENTRY_SECONDS"])
 

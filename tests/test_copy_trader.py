@@ -3009,7 +3009,8 @@ class TestMartingaleBot(unittest.TestCase):
         cfg["martingale_slug_base"] = "btc-updown-5m"
         cfg["martingale_window"] = 300
         cfg["martingale_poll_seconds"] = 10
-        cfg["martingale_max_slippage"] = 0.50  # wide for tests
+        cfg["martingale_price_min"] = 0.01  # wide range for tests
+        cfg["martingale_price_max"] = 0.99
         cfg["martingale_max_entry_seconds"] = 9999  # disable window-start guard for tests
         if cfg_overrides:
             cfg.update(cfg_overrides)
@@ -3187,9 +3188,12 @@ class TestMartingaleBot(unittest.TestCase):
         mb._try_place_bet()
         mb._stop_event.set.assert_called_once()
 
-    def test_try_place_bet_slippage_rejected(self):
-        """Price too far from $0.50 should be rejected."""
-        mb = self._make_bot({"martingale_max_slippage": 0.05})  # tight slippage
+    def test_try_place_bet_price_too_high_rejected(self):
+        """Price above price_max should be rejected."""
+        mb = self._make_bot({
+            "martingale_price_min": 0.40,
+            "martingale_price_max": 0.55,
+        })
         mb.clob_client._get_public.return_value = [{
             "markets": [{
                 "condition_id": "cid1",
@@ -3199,7 +3203,7 @@ class TestMartingaleBot(unittest.TestCase):
             }]
         }]
         mb.clob_client.get_order_book.return_value = {
-            "asks": [{"price": "0.70", "size": "100"}],  # too far from 0.50
+            "asks": [{"price": "0.70", "size": "100"}],  # above max
         }
         result = mb._try_place_bet()
         self.assertFalse(result)
@@ -3207,9 +3211,12 @@ class TestMartingaleBot(unittest.TestCase):
         # Should NOT mark window as skipped — price might come back
         self.assertEqual(mb._last_window_ts, 0)
 
-    def test_try_place_bet_slippage_accepted(self):
-        """Price near $0.50 should be accepted."""
-        mb = self._make_bot({"martingale_max_slippage": 0.05})
+    def test_try_place_bet_price_too_low_rejected(self):
+        """Price below price_min should be rejected."""
+        mb = self._make_bot({
+            "martingale_price_min": 0.40,
+            "martingale_price_max": 0.55,
+        })
         mb.clob_client._get_public.return_value = [{
             "markets": [{
                 "condition_id": "cid1",
@@ -3219,10 +3226,32 @@ class TestMartingaleBot(unittest.TestCase):
             }]
         }]
         mb.clob_client.get_order_book.return_value = {
-            "asks": [{"price": "0.52", "size": "100"}],  # within slippage
+            "asks": [{"price": "0.30", "size": "100"}],  # below min
+        }
+        result = mb._try_place_bet()
+        self.assertFalse(result)
+        self.assertIsNone(mb._active_bet)
+        self.assertEqual(mb._last_window_ts, 0)
+
+    def test_try_place_bet_price_in_range_accepted(self):
+        """Price within [price_min, price_max] should be accepted."""
+        mb = self._make_bot({
+            "martingale_price_min": 0.40,
+            "martingale_price_max": 0.55,
+        })
+        mb.clob_client._get_public.return_value = [{
+            "markets": [{
+                "condition_id": "cid1",
+                "question": "BTC?",
+                "clobTokenIds": '["tok_up", "tok_down"]',
+                "outcomes": '["Up", "Down"]',
+            }]
+        }]
+        mb.clob_client.get_order_book.return_value = {
+            "asks": [{"price": "0.48", "size": "100"}],  # within range
         }
         mb.clob_client.place_order.return_value = {
-            "takingAmount": "9.6",
+            "takingAmount": "10.4",
             "makingAmount": "5.0",
         }
         result = mb._try_place_bet()
