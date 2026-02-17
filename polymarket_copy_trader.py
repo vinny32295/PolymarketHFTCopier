@@ -3115,24 +3115,42 @@ class MartingaleBot(threading.Thread):
                 )
                 return False, None
 
+            # Map direction to outcome index.  Gamma API outcomes are
+            # typically ["Yes","No"] while our direction is "Up"/"Down".
+            # "Up" maps to index 0 (Yes), "Down" maps to index 1 (No).
+            dir_idx = None
+            for i, o in enumerate(outcomes):
+                ol = str(o).lower()
+                dl = str(direction).lower()
+                if ol == dl or (dl == "up" and ol == "yes") or (dl == "down" and ol == "no"):
+                    dir_idx = i
+                    break
+            if dir_idx is None:
+                # Fallback: Up=0, Down=1
+                dir_idx = 0 if str(direction).lower() == "up" else 1
+
             # Need a clear winner (one price near 1.0)
             if max(outcome_prices) < 0.9:
-                # Extra check: if the market is closed/inactive AND our
-                # side's price is near zero, we can detect a loss even
-                # when the winner hasn't been priced to 1.0 yet.
-                if (not active or closed) and outcome_prices:
-                    dir_idx = None
-                    for i, o in enumerate(outcomes):
-                        if str(o).lower() == str(direction).lower():
-                            dir_idx = i
-                            break
-                    if dir_idx is not None and outcome_prices[dir_idx] <= 0.05:
+                # If the market is closed/inactive AND our side's price
+                # is near zero, detect a loss without waiting for 1.0.
+                if (not active or closed):
+                    if outcome_prices[dir_idx] <= 0.05:
                         self.logger.info(
                             "MARTINGALE RESOLVED (early): %s price=%.4f "
                             "≤ 0.05 on closed market — treating as LOSS",
                             direction, outcome_prices[dir_idx],
                         )
                         return True, False
+                    # Opposite side near zero → we won
+                    opp_idx = 1 - dir_idx
+                    if outcome_prices[opp_idx] <= 0.05 and outcome_prices[dir_idx] > 0.5:
+                        self.logger.info(
+                            "MARTINGALE RESOLVED (early): opposite price=%.4f "
+                            "≤ 0.05, %s price=%.4f — treating as WIN",
+                            outcome_prices[opp_idx], direction,
+                            outcome_prices[dir_idx],
+                        )
+                        return True, True
                 self.logger.info(
                     "MARTINGALE RESOLUTION: no clear winner yet "
                     "(prices=%s, max=%.2f < 0.9)",
@@ -3141,12 +3159,12 @@ class MartingaleBot(threading.Thread):
                 return False, None
 
             winner_idx = outcome_prices.index(max(outcome_prices))
-            winner = outcomes[winner_idx] if winner_idx < len(outcomes) else ""
-            won = str(winner).lower() == str(direction).lower()
+            won = winner_idx == dir_idx
+            winner = outcomes[winner_idx] if winner_idx < len(outcomes) else "?"
 
             self.logger.info(
-                "MARTINGALE RESOLVED: winner=%s, bet=%s, won=%s",
-                winner, direction, won,
+                "MARTINGALE RESOLVED: winner=%s (idx=%d), bet=%s (idx=%d), won=%s",
+                winner, winner_idx, direction, dir_idx, won,
             )
             return True, won
         except Exception as exc:
@@ -3154,33 +3172,92 @@ class MartingaleBot(threading.Thread):
             return False, None
 
     def _check_resolution_orderbook(self, bet):
-        """Fallback resolution via orderbook prices.
+        """Fallback resolution via orderbook + last-trade prices.
 
-        If the Gamma API is slow to mark a market as closed, we can
-        detect a clear winner by looking at the orderbook best ask.
-        A price >= $0.95 strongly indicates that side won.
+        Uses multiple signals since the orderbook often empties after
+        a 5-minute window closes:
+
+        1. Orderbook best ask on our side (original logic)
+        2. Last-trade-price on our side (persists after book empties)
+        3. Last-trade-price on the opposite side
+        4. Orderbook best ask on the opposite side
         """
         try:
             token_id = bet["token_id"]
+            opp_token_id = bet.get("opposite_token_id")
+
+            # --- 1. Our side orderbook ---
             ask_price, _ = self._get_best_ask(token_id)
-            if ask_price is None:
-                # No asks at all — might mean the market ended and
-                # the orderbook is empty.  Check the opposite side.
-                return None
-            if ask_price >= 0.95:
-                self.logger.info(
-                    "MARTINGALE ORDERBOOK RESOLUTION: %s ask=$%.4f >= $0.95 — "
-                    "treating as WIN",
-                    bet["direction"], ask_price,
-                )
-                return True
-            if ask_price <= 0.05:
-                self.logger.info(
-                    "MARTINGALE ORDERBOOK RESOLUTION: %s ask=$%.4f <= $0.05 — "
-                    "treating as LOSS",
-                    bet["direction"], ask_price,
-                )
-                return False
+            if ask_price is not None:
+                if ask_price >= 0.95:
+                    self.logger.info(
+                        "MARTINGALE ORDERBOOK RESOLUTION: %s ask=$%.4f >= $0.95 — "
+                        "treating as WIN",
+                        bet["direction"], ask_price,
+                    )
+                    return True
+                if ask_price <= 0.05:
+                    self.logger.info(
+                        "MARTINGALE ORDERBOOK RESOLUTION: %s ask=$%.4f <= $0.05 — "
+                        "treating as LOSS",
+                        bet["direction"], ask_price,
+                    )
+                    return False
+
+            # --- 2. Our side last-trade-price ---
+            our_ltp = self.clob_client.get_last_trade_price(token_id)
+            if our_ltp is not None:
+                if our_ltp >= 0.95:
+                    self.logger.info(
+                        "MARTINGALE LTP RESOLUTION: %s ltp=$%.4f >= $0.95 — "
+                        "treating as WIN",
+                        bet["direction"], our_ltp,
+                    )
+                    return True
+                if our_ltp <= 0.05:
+                    self.logger.info(
+                        "MARTINGALE LTP RESOLUTION: %s ltp=$%.4f <= $0.05 — "
+                        "treating as LOSS",
+                        bet["direction"], our_ltp,
+                    )
+                    return False
+
+            # --- 3 & 4. Opposite side (if token ID available) ---
+            if opp_token_id:
+                opp_ltp = self.clob_client.get_last_trade_price(opp_token_id)
+                if opp_ltp is not None:
+                    if opp_ltp >= 0.95:
+                        self.logger.info(
+                            "MARTINGALE OPP-LTP RESOLUTION: opposite ltp=$%.4f "
+                            ">= $0.95 — treating as LOSS",
+                            opp_ltp,
+                        )
+                        return False
+                    if opp_ltp <= 0.05:
+                        self.logger.info(
+                            "MARTINGALE OPP-LTP RESOLUTION: opposite ltp=$%.4f "
+                            "<= $0.05 — treating as WIN",
+                            opp_ltp,
+                        )
+                        return True
+
+                opp_ask, _ = self._get_best_ask(opp_token_id)
+                if opp_ask is not None:
+                    if opp_ask >= 0.95:
+                        self.logger.info(
+                            "MARTINGALE OPP-ASK RESOLUTION: opposite ask=$%.4f "
+                            ">= $0.95 — treating as LOSS",
+                            opp_ask,
+                        )
+                        return False
+                    if opp_ask <= 0.05:
+                        self.logger.info(
+                            "MARTINGALE OPP-ASK RESOLUTION: opposite ask=$%.4f "
+                            "<= $0.05 — treating as WIN",
+                            opp_ask,
+                        )
+                        return True
+
             return None  # inconclusive
         except Exception:
             return None
@@ -3368,10 +3445,15 @@ class MartingaleBot(threading.Thread):
         actual_shares = float(result.get("takingAmount", 0)) or target_shares
         actual_cost = float(result.get("makingAmount", 0)) or self.current_bet
 
+        opposite_token = (
+            market["down_token"] if direction == "Up"
+            else market["up_token"]
+        )
         self._active_bet = {
             "slug": slug,
             "condition_id": market["condition_id"],
             "token_id": token_id,
+            "opposite_token_id": opposite_token,
             "direction": direction,
             "bet_size": self.current_bet,
             "price": ask_price,
