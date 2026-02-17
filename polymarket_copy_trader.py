@@ -21,6 +21,7 @@ import os
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -492,7 +493,7 @@ DEFAULT_CONFIG = {
     "arb_min_edge_pct": 1.0,         # minimum spread % to trigger (e.g. 1.0 = 1%)
     "arb_size_usdc": 10.0,           # USDC to spend per side of each arb trade
     "arb_max_positions": 5,           # max simultaneous arb positions
-    "arb_poll_seconds": 2,            # how often to scan orderbooks
+    "arb_poll_seconds": 1,            # how often to scan orderbooks
     "arb_log_interval": 5,            # seconds between INFO-level arb scan logs
     # --- Martingale mode (double-on-loss binary market betting) ---
     "martingale_enabled": False,
@@ -2376,10 +2377,13 @@ class ArbitrageMonitor(threading.Thread):
             yes_token = mkt["yes_token"]
             no_token = mkt["no_token"]
 
-            # Fetch orderbooks for both sides
+            # Fetch orderbooks for both sides in parallel to cut latency
             try:
-                book_yes = self.clob_client.get_order_book(yes_token)
-                book_no = self.clob_client.get_order_book(no_token)
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    fut_yes = pool.submit(self.clob_client.get_order_book, yes_token)
+                    fut_no = pool.submit(self.clob_client.get_order_book, no_token)
+                    book_yes = fut_yes.result(timeout=5)
+                    book_no = fut_no.result(timeout=5)
             except Exception as exc:
                 self.logger.debug("Arb: orderbook fetch failed for %s: %s", cid[:16], exc)
                 continue
@@ -8444,6 +8448,13 @@ class CopyTraderGUI:
         ttk.Button(btn_frame, text="Export CSV", command=self._export_history_csv).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Clear History", command=self._clear_trade_history).pack(side=tk.LEFT, padx=5)
 
+        self.history_session_only_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            btn_frame, text="Current Session Only",
+            variable=self.history_session_only_var,
+            command=self._refresh_history,
+        ).pack(side=tk.LEFT, padx=10)
+
         # Load existing history on startup
         self._refresh_history()
 
@@ -8457,6 +8468,20 @@ class CopyTraderGUI:
                 history = json.load(fh)
         except (FileNotFoundError, json.JSONDecodeError):
             history = []
+
+        # Filter to current session if the toggle is checked
+        session_filter = getattr(self, "history_session_only_var", None)
+        if session_filter and session_filter.get():
+            session_start = None
+            if hasattr(self, "bot") and self.bot:
+                ss = getattr(self.bot, "_session_start", None)
+                if ss:
+                    session_start = ss.isoformat() if hasattr(ss, "isoformat") else str(ss)
+            if session_start:
+                history = [
+                    r for r in history
+                    if r.get("closed_at", "") >= session_start
+                ]
 
         total_cost = 0.0
         total_proceeds = 0.0
