@@ -760,13 +760,15 @@ class TelegramCommandBot:
         base = TELEGRAM_API.format(token=self.token)
         while not self._stop_event.is_set():
             try:
+                # Use a short long-poll so the thread can exit quickly
+                # when stop() is called (at most ~5s lag).
                 resp = requests.get(
                     base + "/getUpdates",
                     params={
                         "offset": self._last_update_id + 1,
-                        "timeout": 30,
+                        "timeout": 5,
                     },
-                    timeout=35,
+                    timeout=10,
                 )
                 if resp.status_code != 200:
                     self._stop_event.wait(5)
@@ -8136,7 +8138,10 @@ class CopyTraderBot:
             if woke_by_ws:
                 self.logger.debug("Main loop woken by WebSocket event")
 
-        self._generate_stop_report()
+        try:
+            self._generate_stop_report()
+        except Exception as exc:
+            self.logger.warning("Stop report failed (non-fatal): %s", exc)
         self.logger.info("Bot stopped")
 
     def _generate_stop_report(self):
@@ -8281,22 +8286,40 @@ class CopyTraderBot:
 # ---------------------------------------------------------------------------
 
 class TextHandler(logging.Handler):
-    """Logging handler that writes to a Tkinter ScrolledText widget."""
+    """Logging handler that writes to a Tkinter ScrolledText widget.
+
+    Safe to call from any thread — schedules the actual write via
+    ``after()``.  Also safe after the widget or root window has been
+    destroyed (silently drops the message).
+    """
 
     def __init__(self, text_widget):
         super().__init__()
         self.text_widget = text_widget
+        self._closed = False
+
+    def close(self):
+        self._closed = True
+        super().close()
 
     def emit(self, record):
+        if self._closed:
+            return
         msg = self.format(record) + "\n"
-        # Schedule GUI update on the main thread
-        self.text_widget.after(0, self._append, msg)
+        try:
+            self.text_widget.after(0, self._append, msg)
+        except Exception:
+            # Widget or root window already destroyed — silently ignore.
+            pass
 
     def _append(self, msg):
-        self.text_widget.configure(state="normal")
-        self.text_widget.insert(tk.END, msg)
-        self.text_widget.see(tk.END)
-        self.text_widget.configure(state="disabled")
+        try:
+            self.text_widget.configure(state="normal")
+            self.text_widget.insert(tk.END, msg)
+            self.text_widget.see(tk.END)
+            self.text_widget.configure(state="disabled")
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -8325,8 +8348,8 @@ class CopyTraderGUI:
         self._build_ui()
 
         # Set up logging with GUI handler
-        gui_handler = TextHandler(self.log_area)
-        self.logger = setup_logging(gui_handler)
+        self._gui_handler = TextHandler(self.log_area)
+        self.logger = setup_logging(self._gui_handler)
         self.logger.info("Polymarket Copy Trader v%s started", VERSION)
         self._load_fields_from_config()
 
@@ -10052,8 +10075,20 @@ class CopyTraderGUI:
         self._stop_dashboard_refresh()
         if self.bot:
             self.bot.stop()
-        self.start_btn.configure(state=tk.NORMAL)
         self.stop_btn.configure(state=tk.DISABLED)
+        self.status_var.set("Status: Stopping...")
+        # Poll until the bot thread actually finishes (non-blocking so
+        # the Tk event loop stays responsive).
+        self._poll_bot_thread_done()
+
+    def _poll_bot_thread_done(self):
+        """Non-blocking poll: check every 250ms if the bot thread exited."""
+        thread = self.bot._thread if self.bot else None
+        if thread and thread.is_alive():
+            self.root.after(250, self._poll_bot_thread_done)
+            return
+        # Thread is done — re-enable start button
+        self.start_btn.configure(state=tk.NORMAL)
         self.status_var.set("Status: Stopped")
 
     def run(self):
@@ -10062,8 +10097,17 @@ class CopyTraderGUI:
 
     def _on_close(self):
         self._stop_dashboard_refresh()
+        # Disable the GUI handler so background threads don't try to
+        # write to the destroyed widget.
+        if hasattr(self, "_gui_handler"):
+            self._gui_handler.close()
         if self.bot and self.bot.running:
             self.bot.stop()
+        # Give the bot thread a moment to finish — but don't block
+        # forever (daemon threads will die with the process anyway).
+        thread = self.bot._thread if self.bot else None
+        if thread and thread.is_alive():
+            thread.join(timeout=3)
         self.root.destroy()
 
 
