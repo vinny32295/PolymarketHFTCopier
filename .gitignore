@@ -25,10 +25,14 @@ bot.log
 session_*_report.json
 
 # Runtime data files
+config.json
 trade_history.json
 trade_history.csv
 positions.json
+arb_positions.json
+martingale_state.json
 whale_comparison.json
+strategy_summary.json
 session_trades.json
 
 # IDE

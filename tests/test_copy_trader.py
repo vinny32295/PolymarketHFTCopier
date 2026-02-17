@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 import unittest
 from decimal import Decimal
 from unittest.mock import MagicMock, patch, PropertyMock
@@ -2517,6 +2518,1153 @@ class TestProxyConfig(unittest.TestCase):
     def test_proxy_wallet_abi_has_execute(self):
         names = [entry.get("name") for entry in bot.PROXY_WALLET_ABI]
         self.assertIn("execute", names)
+
+
+class TestArbitrageMonitorMultiSlug(unittest.TestCase):
+    """Tests for multi-slug ArbitrageMonitor support."""
+
+    def _make_monitor(self, cfg_overrides=None):
+        cfg = dict(bot.DEFAULT_CONFIG)
+        if cfg_overrides:
+            cfg.update(cfg_overrides)
+        logger = logging.getLogger("test_arb")
+        logger.handlers = [logging.NullHandler()]
+        clob = MagicMock()
+        mon = bot.ArbitrageMonitor.__new__(bot.ArbitrageMonitor)
+        mon.clob_client = clob
+        mon.cfg = cfg
+        mon.logger = logger
+        mon._stop_event = MagicMock()
+        mon._market_lock = __import__("threading").Lock()
+        mon._markets = {}
+        mon._active_positions = {}
+        mon._slug_states = {}
+        mon._edge_log_ts = {}
+        mon._noask_log_ts = {}
+        mon.notify_callback = None
+        mon.log_trade_callback = None
+        return mon
+
+    # -- _get_effective_slugs -------------------------------------------------
+
+    def test_effective_slugs_from_new_config(self):
+        slugs = [
+            {"slug": "btc-updown-15m", "window": 900},
+            {"slug": "sol-updown-15m", "window": 900, "format": "timestamp"},
+        ]
+        mon = self._make_monitor({"arb_dynamic_slugs": slugs})
+        eff = mon._get_effective_slugs()
+        self.assertEqual(len(eff), 2)
+        self.assertEqual(eff[0]["slug"], "btc-updown-15m")
+        self.assertEqual(eff[0]["window"], 900)
+        self.assertEqual(eff[0]["format"], "timestamp")
+        self.assertEqual(eff[1]["slug"], "sol-updown-15m")
+
+    def test_effective_slugs_backward_compat(self):
+        mon = self._make_monitor({
+            "arb_dynamic_slug": "btc-updown-5m",
+            "arb_dynamic_window": 300,
+        })
+        eff = mon._get_effective_slugs()
+        self.assertEqual(len(eff), 1)
+        self.assertEqual(eff[0]["slug"], "btc-updown-5m")
+        self.assertEqual(eff[0]["window"], 300)
+        self.assertEqual(eff[0]["format"], "timestamp")
+
+    def test_effective_slugs_new_takes_precedence(self):
+        mon = self._make_monitor({
+            "arb_dynamic_slug": "old-slug",
+            "arb_dynamic_slugs": [{"slug": "new-slug", "window": 600}],
+        })
+        eff = mon._get_effective_slugs()
+        self.assertEqual(len(eff), 1)
+        self.assertEqual(eff[0]["slug"], "new-slug")
+
+    def test_effective_slugs_empty(self):
+        mon = self._make_monitor()
+        eff = mon._get_effective_slugs()
+        self.assertEqual(eff, [])
+
+    def test_effective_slugs_string_entries(self):
+        """Entries that are plain strings get normalised."""
+        mon = self._make_monitor({
+            "arb_dynamic_slugs": ["btc-updown-15m"],
+        })
+        eff = mon._get_effective_slugs()
+        self.assertEqual(len(eff), 1)
+        self.assertEqual(eff[0]["slug"], "btc-updown-15m")
+        self.assertEqual(eff[0]["window"], 300)  # default
+        self.assertEqual(eff[0]["format"], "timestamp")
+
+    # -- _generate_slug -------------------------------------------------------
+
+    def test_generate_slug_timestamp(self):
+        mon = self._make_monitor()
+        entry = {"slug": "btc-updown-15m", "window": 900, "format": "timestamp"}
+        slug = mon._generate_slug(entry)
+        self.assertTrue(slug.startswith("btc-updown-15m-"))
+        # Suffix should be a valid integer
+        ts_part = slug.replace("btc-updown-15m-", "")
+        self.assertTrue(ts_part.isdigit())
+        # Should be aligned to 900-second boundary
+        self.assertEqual(int(ts_part) % 900, 0)
+
+    def test_generate_slug_hourly(self):
+        mon = self._make_monitor()
+        entry = {"slug": "ethereum-up-or-down", "window": 3600, "format": "hourly"}
+        slug = mon._generate_slug(entry)
+        self.assertTrue(slug.startswith("ethereum-up-or-down-"))
+        self.assertTrue(slug.endswith("-et"))
+        # Should have month-day-hourampm-et pattern
+        suffix = slug.replace("ethereum-up-or-down-", "")
+        parts = suffix.replace("-et", "").split("-")
+        self.assertEqual(len(parts), 3)
+        # parts[0] = month name, parts[1] = day, parts[2] = hourampm
+        self.assertTrue(parts[0].isalpha())
+        self.assertTrue(parts[1].isdigit())
+        self.assertTrue(parts[2].endswith("am") or parts[2].endswith("pm"))
+
+    # -- _window_key_for ------------------------------------------------------
+
+    def test_window_key_changes_with_time(self):
+        mon = self._make_monitor()
+        entry = {"slug": "btc-updown-15m", "window": 900, "format": "timestamp"}
+        key1 = mon._window_key_for(entry)
+        # Same call within the same window should return same key
+        key2 = mon._window_key_for(entry)
+        self.assertEqual(key1, key2)
+
+    # -- _fetch_and_parse_slug ------------------------------------------------
+
+    def test_fetch_and_parse_slug_success(self):
+        mon = self._make_monitor()
+        entry = {"slug": "btc-updown-15m", "window": 900, "format": "timestamp"}
+        mon.clob_client._get_public.return_value = [{
+            "title": "BTC Up or Down 15m",
+            "markets": [{
+                "condition_id": "0xabc123",
+                "clobTokenIds": '["token_up", "token_down"]',
+                "outcomes": '["Up", "Down"]',
+            }],
+        }]
+        result = mon._fetch_and_parse_slug(
+            "btc-updown-15m-123", "btc-updown-15m", entry,
+        )
+        self.assertIsNotNone(result)
+        cid, mkt = result
+        self.assertEqual(cid, "0xabc123")
+        self.assertEqual(mkt["yes_token"], "token_up")
+        self.assertEqual(mkt["no_token"], "token_down")
+        self.assertEqual(mkt["yes_label"], "Up")
+        self.assertEqual(mkt["no_label"], "Down")
+        self.assertEqual(mkt["_slug_key"], "btc-updown-15m")
+        self.assertEqual(mkt["_resolved_slug"], "btc-updown-15m-123")
+
+    def test_fetch_and_parse_slug_no_event(self):
+        mon = self._make_monitor()
+        entry = {"slug": "x", "window": 300, "format": "timestamp"}
+        mon.clob_client._get_public.return_value = []
+        result = mon._fetch_and_parse_slug("x-123", "x", entry)
+        self.assertIsNone(result)
+
+    def test_fetch_and_parse_slug_no_tokens(self):
+        mon = self._make_monitor()
+        entry = {"slug": "x", "window": 300, "format": "timestamp"}
+        mon.clob_client._get_public.return_value = [{
+            "markets": [{"condition_id": "0x1", "clobTokenIds": "[]"}],
+        }]
+        result = mon._fetch_and_parse_slug("x-123", "x", entry)
+        self.assertIsNone(result)
+
+    # -- _resolve_dynamic_slugs (integration) ---------------------------------
+
+    def test_resolve_multiple_slugs_merges_markets(self):
+        mon = self._make_monitor({
+            "arb_dynamic_slugs": [
+                {"slug": "btc-updown-15m", "window": 900},
+                {"slug": "sol-updown-15m", "window": 900},
+            ],
+        })
+
+        call_count = [0]
+        def mock_get_public(url, params=None):
+            call_count[0] += 1
+            slug = params.get("slug", "")
+            if "btc" in slug:
+                return [{"markets": [{
+                    "condition_id": "cid_btc",
+                    "clobTokenIds": '["btc_up", "btc_down"]',
+                    "outcomes": '["Up", "Down"]',
+                    "question": "BTC 15m",
+                }]}]
+            elif "sol" in slug:
+                return [{"markets": [{
+                    "condition_id": "cid_sol",
+                    "clobTokenIds": '["sol_up", "sol_down"]',
+                    "outcomes": '["Up", "Down"]',
+                    "question": "SOL 15m",
+                }]}]
+            return []
+
+        mon.clob_client._get_public.side_effect = mock_get_public
+        mon._resolve_dynamic_slugs()
+
+        self.assertEqual(len(mon._markets), 2)
+        self.assertIn("cid_btc", mon._markets)
+        self.assertIn("cid_sol", mon._markets)
+        self.assertEqual(mon._markets["cid_btc"]["yes_token"], "btc_up")
+        self.assertEqual(mon._markets["cid_sol"]["yes_token"], "sol_up")
+
+    def test_resolve_preserves_static_markets(self):
+        mon = self._make_monitor({
+            "arb_dynamic_slugs": [
+                {"slug": "btc-updown-15m", "window": 900},
+            ],
+        })
+        # Pre-populate a static market (no _slug_key)
+        mon._markets["static_cid"] = {
+            "yes_token": "t1", "no_token": "t2",
+            "yes_label": "A", "no_label": "B", "question": "Static",
+        }
+
+        mon.clob_client._get_public.return_value = [{"markets": [{
+            "condition_id": "cid_btc",
+            "clobTokenIds": '["btc_up", "btc_down"]',
+            "outcomes": '["Up", "Down"]',
+            "question": "BTC 15m",
+        }]}]
+        mon._resolve_dynamic_slugs()
+
+        self.assertIn("static_cid", mon._markets)
+        self.assertIn("cid_btc", mon._markets)
+
+    def test_resolve_failed_slug_keeps_existing(self):
+        mon = self._make_monitor({
+            "arb_dynamic_slugs": [
+                {"slug": "btc-updown-15m", "window": 900},
+                {"slug": "fail-slug", "window": 900},
+            ],
+        })
+
+        def mock_get_public(url, params=None):
+            slug = params.get("slug", "")
+            if "btc" in slug:
+                return [{"markets": [{
+                    "condition_id": "cid_btc",
+                    "clobTokenIds": '["btc_up", "btc_down"]',
+                    "outcomes": '["Up", "Down"]',
+                    "question": "BTC 15m",
+                }]}]
+            return []  # fail-slug returns nothing
+
+        mon.clob_client._get_public.side_effect = mock_get_public
+        mon._resolve_dynamic_slugs()
+
+        self.assertEqual(len(mon._markets), 1)
+        self.assertIn("cid_btc", mon._markets)
+
+    # -- _get_window_ts -------------------------------------------------------
+
+    def test_get_window_ts_alignment(self):
+        import time
+        now = int(time.time())
+        ts = bot.ArbitrageMonitor._get_window_ts(900)
+        self.assertEqual(ts % 900, 0)
+        self.assertLessEqual(ts, now)
+        self.assertGreater(ts + 900, now)
+
+    # -- _generate_hourly_slug ------------------------------------------------
+
+    def test_hourly_slug_format(self):
+        slug = bot.ArbitrageMonitor._generate_hourly_slug(
+            "xrp-up-or-down", 3600,
+        )
+        self.assertTrue(slug.startswith("xrp-up-or-down-"))
+        self.assertTrue(slug.endswith("-et"))
+        # Should be lowercase month
+        suffix = slug.replace("xrp-up-or-down-", "").replace("-et", "")
+        parts = suffix.split("-")
+        self.assertEqual(len(parts), 3)
+        self.assertTrue(parts[0][0].islower())  # month is lowercase
+
+
+class TestArbExecution(unittest.TestCase):
+    """Tests for arb execution: equal shares, retry cap, viability check."""
+
+    def _make_monitor(self, cfg_overrides=None):
+        cfg = dict(bot.DEFAULT_CONFIG)
+        cfg["arb_min_edge_pct"] = 1.0
+        cfg["arb_size_usdc"] = 10.0
+        cfg["arb_max_positions"] = 5
+        if cfg_overrides:
+            cfg.update(cfg_overrides)
+        logger = logging.getLogger("test_arb_exec")
+        logger.handlers = [logging.NullHandler()]
+        clob = MagicMock()
+        mon = bot.ArbitrageMonitor.__new__(bot.ArbitrageMonitor)
+        mon.clob_client = clob
+        mon.cfg = cfg
+        mon.logger = logger
+        mon._stop_event = MagicMock()
+        mon._market_lock = __import__("threading").Lock()
+        mon._markets = {}
+        mon._active_positions = {}
+        mon._slug_states = {}
+        mon._edge_log_ts = {}
+        mon._noask_log_ts = {}
+        mon.notify_callback = None
+        mon.log_trade_callback = None
+        return mon
+
+    def test_place_arb_leg_returns_actual_shares(self):
+        """_place_arb_leg extracts takingAmount/makingAmount from response."""
+        mon = self._make_monitor()
+        mon.clob_client.place_order.return_value = {
+            "success": True,
+            "takingAmount": "15.755",
+            "makingAmount": "7.09",
+            "status": "matched",
+        }
+        result, shares, cost = mon._place_arb_leg(
+            "tok123", 0.43, 16.5, "Up",
+        )
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(shares, 15.755, places=2)
+        self.assertAlmostEqual(cost, 7.09, places=2)
+
+    def test_place_arb_leg_computes_usdc_from_shares(self):
+        """_place_arb_leg passes shares*price as size_usdc to place_order."""
+        mon = self._make_monitor()
+        mon.clob_client.place_order.return_value = {
+            "success": True,
+            "takingAmount": "20.0",
+            "makingAmount": "10.0",
+        }
+        mon._place_arb_leg("tok", 0.50, 20.0, "Up")
+        call_args = mon.clob_client.place_order.call_args
+        # size_usdc should be round(20.0 * 0.50, 2) = 10.0
+        actual_usdc = call_args.kwargs.get("size_usdc", 0)
+        self.assertAlmostEqual(actual_usdc, 10.0, places=2)
+
+    def test_place_arb_leg_passes_max_retry_price(self):
+        """_place_arb_leg uses max_retry_price as initial FOK price."""
+        mon = self._make_monitor()
+        mon.clob_client.place_order.return_value = {
+            "success": True,
+            "takingAmount": "16.5",
+            "makingAmount": "7.09",
+        }
+        mon._place_arb_leg("tok", 0.43, 16.5, "Up", max_retry_price=0.55)
+        call_args = mon.clob_client.place_order.call_args
+        self.assertEqual(call_args.kwargs.get("max_retry_price"), 0.55)
+        # Initial FOK price should use max_retry_price for wider tolerance
+        self.assertEqual(call_args.kwargs.get("price"), 0.55)
+        # But size_usdc is still based on best ask (0.43)
+        self.assertAlmostEqual(call_args.kwargs.get("size_usdc"), round(16.5 * 0.43, 2))
+
+    def test_place_arb_leg_fok_rejected(self):
+        """_place_arb_leg returns (None, 0, 0) on FOK rejection."""
+        mon = self._make_monitor()
+        mon.clob_client.place_order.return_value = {
+            "status": "fok_rejected",
+            "reason": "test",
+        }
+        result, shares, cost = mon._place_arb_leg(
+            "tok", 0.43, 16.5, "Up",
+        )
+        self.assertIsNone(result)
+        self.assertEqual(shares, 0.0)
+        self.assertEqual(cost, 0.0)
+
+    def test_place_arb_leg_fallback_when_no_amounts(self):
+        """When response lacks takingAmount/makingAmount, use planned values."""
+        mon = self._make_monitor()
+        mon.clob_client.place_order.return_value = {
+            "success": True,
+            "orderID": "0xabc",
+        }
+        result, shares, cost = mon._place_arb_leg(
+            "tok", 0.50, 20.0, "Up",
+        )
+        self.assertIsNotNone(result)
+        # Fallback: target_shares=20, size_usdc=20*0.5=10
+        self.assertAlmostEqual(shares, 20.0)
+        self.assertAlmostEqual(cost, 10.0)
+
+    def test_scan_cycle_matches_second_leg_to_first(self):
+        """Second leg should use actual shares from first leg, not planned."""
+        mon = self._make_monitor({"arb_size_usdc": 10.0, "arb_min_edge_pct": 1.0})
+        mon._markets = {
+            "cid1": {
+                "yes_token": "tok_up", "no_token": "tok_down",
+                "yes_label": "Up", "no_label": "Down",
+                "question": "Test market",
+            },
+        }
+
+        # Orderbook: Up=0.43, Down=0.55, combined=0.98 → 2% edge
+        def mock_orderbook(token_id):
+            if token_id == "tok_up":
+                return {"asks": [{"price": "0.43", "size": "50"}]}
+            return {"asks": [{"price": "0.55", "size": "50"}]}
+
+        mon.clob_client.get_order_book.side_effect = mock_orderbook
+
+        # First leg fills with fewer shares than planned
+        call_count = [0]
+        def mock_place_order(**kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # First leg: we requested ~18 shares at $0.43 but got 15.76
+                return {
+                    "success": True,
+                    "takingAmount": "15.76",
+                    "makingAmount": "6.78",
+                    "status": "matched",
+                }
+            else:
+                # Second leg: should request ~15.76 shares to match
+                size_usdc = kwargs.get("size_usdc", 0)
+                price = kwargs.get("price", 0.55)
+                shares = round(size_usdc / price, 2) if price > 0 else 0
+                return {
+                    "success": True,
+                    "takingAmount": str(round(shares, 4)),
+                    "makingAmount": str(round(size_usdc, 4)),
+                    "status": "matched",
+                }
+
+        mon.clob_client.place_order.side_effect = mock_place_order
+        mon._save_positions = MagicMock()
+
+        mon._scan_cycle()
+
+        # Should have executed an arb
+        self.assertIn("cid1", mon._active_positions)
+        pos = mon._active_positions["cid1"]
+        # First leg got 15.76 shares
+        self.assertAlmostEqual(pos["yes_shares"], 15.76, places=1)
+        # Second leg should approximately match first leg shares
+        self.assertAlmostEqual(pos["no_shares"], pos["yes_shares"], delta=1.0)
+        # Should NOT be marked as partial
+        self.assertNotIn("partial", pos)
+
+    def test_scan_cycle_aborts_when_no_longer_profitable(self):
+        """If combined cost >= $1 after first leg, abort second leg."""
+        mon = self._make_monitor({"arb_size_usdc": 10.0, "arb_min_edge_pct": 1.0})
+        mon._markets = {
+            "cid1": {
+                "yes_token": "tok_up", "no_token": "tok_down",
+                "yes_label": "Up", "no_label": "Down",
+                "question": "Test market",
+            },
+        }
+
+        # Orderbook calls:
+        # 1) Initial scan: Up=0.43, Down=0.55 → combined=0.98 → 2% edge
+        # 2) After first leg: fresh Down check returns 0.60 (price moved)
+        ob_call_count = [0]
+        def mock_orderbook(token_id):
+            ob_call_count[0] += 1
+            if token_id == "tok_up":
+                return {"asks": [{"price": "0.43", "size": "50"}]}
+            # First call for Down (initial scan) = 0.55
+            # Second call for Down (viability re-check) = 0.60
+            if ob_call_count[0] <= 2:
+                return {"asks": [{"price": "0.55", "size": "50"}]}
+            return {"asks": [{"price": "0.60", "size": "50"}]}
+
+        mon.clob_client.get_order_book.side_effect = mock_orderbook
+
+        # First leg fills at a worse effective price ($0.45)
+        mon.clob_client.place_order.return_value = {
+            "success": True,
+            "takingAmount": "15.0",
+            "makingAmount": "6.75",  # eff price = 6.75/15 = $0.45
+            "status": "matched",
+        }
+        mon._save_positions = MagicMock()
+
+        mon._scan_cycle()
+
+        # Should abort — combined = $0.45 + $0.60 = $1.05 > $1.00
+        self.assertIn("cid1", mon._active_positions)
+        pos = mon._active_positions["cid1"]
+        self.assertTrue(pos.get("partial", False))
+        self.assertIsNone(pos.get("no_fill"))
+        # place_order should only be called ONCE (first leg only)
+        self.assertEqual(mon.clob_client.place_order.call_count, 1)
+
+
+class TestMartingaleBot(unittest.TestCase):
+    """Tests for the MartingaleBot class."""
+
+    def _make_bot(self, cfg_overrides=None):
+        cfg = dict(bot.DEFAULT_CONFIG)
+        cfg["martingale_enabled"] = True
+        cfg["martingale_direction"] = "Up"
+        cfg["martingale_start_bet"] = 5.0
+        cfg["martingale_max_bet"] = 0
+        cfg["martingale_max_streak"] = 0
+        cfg["martingale_slug_base"] = "btc-updown-5m"
+        cfg["martingale_window"] = 300
+        cfg["martingale_poll_seconds"] = 10
+        cfg["martingale_price_min"] = 0.01  # wide range for tests
+        cfg["martingale_price_max"] = 0.99
+        cfg["martingale_max_entry_seconds"] = 9999  # disable window-start guard for tests
+        if cfg_overrides:
+            cfg.update(cfg_overrides)
+        logger = logging.getLogger("test_martingale")
+        logger.handlers = [logging.NullHandler()]
+        clob = MagicMock()
+        mb = bot.MartingaleBot.__new__(bot.MartingaleBot)
+        mb.clob_client = clob
+        mb.cfg = cfg
+        mb.logger = logger
+        mb._stop_event = MagicMock()
+        mb.strategy = cfg_overrides or {}
+        mb.strategy_name = mb.strategy.get("name", "default")
+        mb.start_bet = cfg["martingale_start_bet"]
+        mb.current_bet = cfg["martingale_start_bet"]
+        mb.direction = cfg["martingale_direction"]
+        mb.consecutive_losses = 0
+        mb.session_pnl = 0.0
+        mb._active_bet = None
+        mb._bet_history = []
+        mb._last_window_ts = 0
+        mb._next_window_cache = None
+        mb._skip_reason = None
+        mb._windows_attempted = 0
+        mb._windows_no_market = 0
+        mb.notify_callback = None
+        mb.log_trade_callback = None
+        return mb
+
+    # -- slug generation --
+
+    def test_generate_slug(self):
+        mb = self._make_bot()
+        slug = mb._generate_slug()
+        self.assertTrue(slug.startswith("btc-updown-5m-"))
+        ts_part = slug.split("-")[-1]
+        self.assertTrue(ts_part.isdigit())
+        # Should be aligned to 300s boundary
+        self.assertEqual(int(ts_part) % 300, 0)
+
+    def test_generate_slug_custom_base(self):
+        mb = self._make_bot({"martingale_slug_base": "eth-updown-5m"})
+        slug = mb._generate_slug()
+        self.assertTrue(slug.startswith("eth-updown-5m-"))
+
+    def test_get_window_ts_aligned(self):
+        ts = bot.MartingaleBot._get_window_ts(300)
+        self.assertEqual(ts % 300, 0)
+
+    def test_get_window_end(self):
+        mb = self._make_bot()
+        end = mb._get_window_end()
+        window_ts = mb._get_window_ts(300)
+        self.assertEqual(end, window_ts + 300)
+
+    # -- market fetching --
+
+    def test_fetch_market_parses_event(self):
+        mb = self._make_bot()
+        mb.clob_client._get_public.return_value = [{
+            "markets": [{
+                "condition_id": "cid123",
+                "question": "BTC Up or Down?",
+                "clobTokenIds": '["tok_up", "tok_down"]',
+                "outcomes": '["Up", "Down"]',
+            }]
+        }]
+        result = mb._fetch_market("btc-updown-5m-1000")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["condition_id"], "cid123")
+        self.assertEqual(result["up_token"], "tok_up")
+        self.assertEqual(result["down_token"], "tok_down")
+
+    def test_fetch_market_returns_none_on_empty(self):
+        mb = self._make_bot()
+        mb.clob_client._get_public.return_value = []
+        result = mb._fetch_market("nonexistent-slug")
+        self.assertIsNone(result)
+
+    def test_fetch_market_maps_down_first(self):
+        """If outcomes are ['Down', 'Up'], tokens should be correctly mapped."""
+        mb = self._make_bot()
+        mb.clob_client._get_public.return_value = [{
+            "markets": [{
+                "condition_id": "cid456",
+                "question": "BTC?",
+                "clobTokenIds": '["tok_a", "tok_b"]',
+                "outcomes": '["Down", "Up"]',
+            }]
+        }]
+        result = mb._fetch_market("test-slug")
+        self.assertEqual(result["up_token"], "tok_b")
+        self.assertEqual(result["down_token"], "tok_a")
+
+    # -- bet placement --
+
+    def test_try_place_bet_success(self):
+        mb = self._make_bot()
+        mb.clob_client._get_public.return_value = [{
+            "markets": [{
+                "condition_id": "cid1",
+                "question": "BTC Up?",
+                "clobTokenIds": '["tok_up", "tok_down"]',
+                "outcomes": '["Up", "Down"]',
+            }]
+        }]
+        mb.clob_client.get_order_book.return_value = {
+            "asks": [{"price": "0.50", "size": "100"}],
+        }
+        mb.clob_client.place_order.return_value = {
+            "takingAmount": "10.0",
+            "makingAmount": "5.0",
+        }
+        result = mb._try_place_bet()
+        self.assertTrue(result)
+        self.assertIsNotNone(mb._active_bet)
+        self.assertEqual(mb._active_bet["direction"], "Up")
+        self.assertEqual(mb._active_bet["shares"], 10.0)
+        self.assertEqual(mb._active_bet["cost"], 5.0)
+        mb.clob_client.place_order.assert_called_once()
+
+    def test_try_place_bet_down_direction(self):
+        mb = self._make_bot({"martingale_direction": "Down"})
+        mb.clob_client._get_public.return_value = [{
+            "markets": [{
+                "condition_id": "cid1",
+                "question": "BTC?",
+                "clobTokenIds": '["tok_up", "tok_down"]',
+                "outcomes": '["Up", "Down"]',
+            }]
+        }]
+        mb.clob_client.get_order_book.return_value = {
+            "asks": [{"price": "0.50", "size": "100"}],
+        }
+        mb.clob_client.place_order.return_value = {
+            "takingAmount": "10.0",
+            "makingAmount": "5.0",
+        }
+        mb._try_place_bet()
+        self.assertIsNotNone(mb._active_bet)
+        self.assertEqual(mb._active_bet["direction"], "Down")
+        # Should have used the down_token
+        call_args = mb.clob_client.place_order.call_args
+        self.assertEqual(call_args[1]["token_id"], "tok_down")
+
+    def test_try_place_bet_fok_rejected(self):
+        mb = self._make_bot()
+        mb.clob_client._get_public.return_value = [{
+            "markets": [{
+                "condition_id": "cid1",
+                "question": "BTC?",
+                "clobTokenIds": '["tok_up", "tok_down"]',
+                "outcomes": '["Up", "Down"]',
+            }]
+        }]
+        mb.clob_client.get_order_book.return_value = {
+            "asks": [{"price": "0.50", "size": "100"}],
+        }
+        mb.clob_client.place_order.return_value = {
+            "status": "fok_rejected",
+        }
+        mb._try_place_bet()
+        self.assertIsNone(mb._active_bet)
+
+    def test_try_place_bet_skips_same_window(self):
+        mb = self._make_bot()
+        mb._last_window_ts = mb._get_window_ts(300)
+        mb._try_place_bet()
+        # Should not even fetch market
+        mb.clob_client._get_public.assert_not_called()
+
+    def test_try_place_bet_max_streak_stops(self):
+        mb = self._make_bot({"martingale_max_streak": 3})
+        mb.consecutive_losses = 3
+        mb._try_place_bet()
+        mb._stop_event.set.assert_called_once()
+
+    def test_try_place_bet_max_bet_stops(self):
+        mb = self._make_bot({"martingale_max_bet": 10.0})
+        mb.current_bet = 20.0
+        mb._try_place_bet()
+        mb._stop_event.set.assert_called_once()
+
+    def test_try_place_bet_price_too_high_rejected(self):
+        """Price above price_max should be rejected."""
+        mb = self._make_bot({
+            "martingale_price_min": 0.40,
+            "martingale_price_max": 0.55,
+        })
+        mb.clob_client._get_public.return_value = [{
+            "markets": [{
+                "condition_id": "cid1",
+                "question": "BTC?",
+                "clobTokenIds": '["tok_up", "tok_down"]',
+                "outcomes": '["Up", "Down"]',
+            }]
+        }]
+        mb.clob_client.get_order_book.return_value = {
+            "asks": [{"price": "0.70", "size": "100"}],  # above max
+        }
+        result = mb._try_place_bet()
+        self.assertFalse(result)
+        self.assertIsNone(mb._active_bet)
+        # Should NOT mark window as skipped — price might come back
+        self.assertEqual(mb._last_window_ts, 0)
+
+    def test_try_place_bet_price_too_low_rejected(self):
+        """Price below price_min should be rejected."""
+        mb = self._make_bot({
+            "martingale_price_min": 0.40,
+            "martingale_price_max": 0.55,
+        })
+        mb.clob_client._get_public.return_value = [{
+            "markets": [{
+                "condition_id": "cid1",
+                "question": "BTC?",
+                "clobTokenIds": '["tok_up", "tok_down"]',
+                "outcomes": '["Up", "Down"]',
+            }]
+        }]
+        mb.clob_client.get_order_book.return_value = {
+            "asks": [{"price": "0.30", "size": "100"}],  # below min
+        }
+        result = mb._try_place_bet()
+        self.assertFalse(result)
+        self.assertIsNone(mb._active_bet)
+        self.assertEqual(mb._last_window_ts, 0)
+
+    def test_try_place_bet_price_in_range_accepted(self):
+        """Price within [price_min, price_max] should be accepted."""
+        mb = self._make_bot({
+            "martingale_price_min": 0.40,
+            "martingale_price_max": 0.55,
+        })
+        mb.clob_client._get_public.return_value = [{
+            "markets": [{
+                "condition_id": "cid1",
+                "question": "BTC?",
+                "clobTokenIds": '["tok_up", "tok_down"]',
+                "outcomes": '["Up", "Down"]',
+            }]
+        }]
+        mb.clob_client.get_order_book.return_value = {
+            "asks": [{"price": "0.48", "size": "100"}],  # within range
+        }
+        mb.clob_client.place_order.return_value = {
+            "takingAmount": "10.4",
+            "makingAmount": "5.0",
+        }
+        result = mb._try_place_bet()
+        self.assertTrue(result)
+        self.assertIsNotNone(mb._active_bet)
+
+    def test_try_place_bet_window_too_old(self):
+        """Should skip if too far into the current window."""
+        mb = self._make_bot({"martingale_max_entry_seconds": 10})
+        # Don't set _last_window_ts so the same-window check passes,
+        # but the seconds_into check should catch it (we're >10s into
+        # the current 300s window unless the test happens to run right
+        # on a boundary, so use a very small max_entry to force it).
+        result = mb._try_place_bet()
+        self.assertFalse(result)
+        # Should mark window as skipped so we don't retry
+        window_ts = mb._get_window_ts(300)
+        self.assertEqual(mb._last_window_ts, window_ts)
+
+    def test_cycle_returns_false_when_no_bet(self):
+        """_cycle returns False when no active bet and bet not placed."""
+        mb = self._make_bot({"martingale_max_entry_seconds": 0})
+        result = mb._cycle()
+        self.assertFalse(result)
+
+    def test_cycle_returns_true_when_waiting_for_resolution(self):
+        """_cycle returns True when active bet is still pending."""
+        mb = self._make_bot()
+        mb._active_bet = {
+            "slug": "test",
+            "condition_id": "cid1",
+            "direction": "Up",
+            "window_end": int(time.time()) + 300,  # still in window
+        }
+        result = mb._cycle()
+        self.assertTrue(result)  # waiting for window to end
+
+    # -- stale bet / reset --
+
+    def test_load_state_discards_stale_active_bet(self):
+        """A stale active_bet from a previous session is discarded."""
+        mb = self._make_bot()
+        window = 300
+        stale_window_end = int(time.time()) - window * 3  # 3 windows ago
+        state = {
+            "current_bet": 20.0,
+            "consecutive_losses": 2,
+            "session_pnl": -15.0,
+            "direction": "Up",
+            "active_bet": {
+                "slug": "btc-updown-5m-old",
+                "condition_id": "cid_old",
+                "direction": "Up",
+                "window_end": stale_window_end,
+                "bet_size": 10.0,
+                "cost": 10.0,
+                "shares": 20.0,
+                "token_id": "tok",
+                "question": "old",
+                "ts": "2026-01-01",
+            },
+            "last_window_ts": stale_window_end - window,
+        }
+        with open(bot.MartingaleBot.STATE_FILE, "w") as fh:
+            json.dump(state, fh)
+        try:
+            mb._load_state()
+            # Stale bet should be discarded, NOT treated as a loss
+            self.assertIsNone(mb._active_bet)
+            # But the rest of the state (streak, bet size) should be preserved
+            self.assertEqual(mb.current_bet, 20.0)
+            self.assertEqual(mb.consecutive_losses, 2)
+        finally:
+            try:
+                os.remove(bot.MartingaleBot.STATE_FILE)
+            except OSError:
+                pass
+
+    def test_reset_state_clears_everything(self):
+        """reset_state wipes bet/streak/pnl back to defaults."""
+        mb = self._make_bot()
+        mb.current_bet = 40.0
+        mb.consecutive_losses = 4
+        mb.session_pnl = -75.0
+        mb._active_bet = {"dummy": True}
+        mb._last_window_ts = 999999
+        mb.reset_state()
+        self.assertEqual(mb.current_bet, mb.start_bet)
+        self.assertEqual(mb.consecutive_losses, 0)
+        self.assertEqual(mb.session_pnl, 0.0)
+        self.assertIsNone(mb._active_bet)
+        self.assertEqual(mb._last_window_ts, 0)
+
+    # -- win/loss handling --
+
+    def test_handle_win_resets_bet(self):
+        mb = self._make_bot()
+        mb.consecutive_losses = 3
+        mb.current_bet = 40.0
+        bet = {
+            "direction": "Up",
+            "shares": 10.0,
+            "cost": 5.0,
+            "bet_size": 40.0,
+            "question": "BTC?",
+            "token_id": "tok_up",
+        }
+        mb._handle_win(bet)
+        self.assertEqual(mb.current_bet, 5.0)  # reset to start_bet
+        self.assertEqual(mb.consecutive_losses, 0)
+        self.assertAlmostEqual(mb.session_pnl, 5.0)  # 10 shares - $5 cost
+        self.assertIsNone(mb._active_bet)
+
+    def test_handle_loss_doubles_bet(self):
+        mb = self._make_bot()
+        mb.current_bet = 5.0
+        bet = {
+            "direction": "Up",
+            "shares": 10.0,
+            "cost": 5.0,
+            "bet_size": 5.0,
+            "question": "BTC?",
+            "token_id": "tok_up",
+        }
+        mb._handle_loss(bet)
+        self.assertEqual(mb.current_bet, 10.0)
+        self.assertEqual(mb.consecutive_losses, 1)
+        self.assertAlmostEqual(mb.session_pnl, -5.0)
+        self.assertIsNone(mb._active_bet)
+
+    def test_handle_loss_caps_at_max_bet(self):
+        mb = self._make_bot({"martingale_max_bet": 15.0})
+        mb.current_bet = 10.0
+        mb.consecutive_losses = 1  # simulate one prior loss
+        bet = {
+            "direction": "Up",
+            "shares": 20.0,
+            "cost": 10.0,
+            "bet_size": 10.0,
+            "question": "BTC?",
+            "token_id": "tok_up",
+        }
+        mb._handle_loss(bet)
+        # geometric: 5.0 * 2^2 = 20.0, capped at 15.0
+        self.assertEqual(mb.current_bet, 15.0)
+
+    def test_martingale_sequence(self):
+        """Simulate: lose, lose, win — verify correct bet progression."""
+        mb = self._make_bot()
+
+        # Loss 1: $5 bet
+        mb._handle_loss({
+            "direction": "Up", "shares": 10.0, "cost": 5.0,
+            "bet_size": 5.0, "question": "BTC?", "token_id": "t1",
+        })
+        self.assertEqual(mb.current_bet, 10.0)
+        self.assertEqual(mb.consecutive_losses, 1)
+
+        # Loss 2: $10 bet
+        mb._handle_loss({
+            "direction": "Up", "shares": 20.0, "cost": 10.0,
+            "bet_size": 10.0, "question": "BTC?", "token_id": "t1",
+        })
+        self.assertEqual(mb.current_bet, 20.0)
+        self.assertEqual(mb.consecutive_losses, 2)
+
+        # Win: $20 bet, 40 shares, cost $20
+        mb._handle_win({
+            "direction": "Up", "shares": 40.0, "cost": 20.0,
+            "bet_size": 20.0, "question": "BTC?", "token_id": "t1",
+        })
+        self.assertEqual(mb.current_bet, 5.0)  # reset
+        self.assertEqual(mb.consecutive_losses, 0)
+        # P&L: -5 -10 + (40-20) = +5
+        self.assertAlmostEqual(mb.session_pnl, 5.0)
+
+    def test_martingale_geometric_ignores_cost_drift(self):
+        """Bet size must follow start_bet × 2^n even when exchange bumps cost."""
+        mb = self._make_bot()
+        # start_bet = 5.0, but exchange bumped actual cost to 5.20
+        mb._handle_loss({
+            "direction": "Up", "shares": 10.0, "cost": 5.20,
+            "bet_size": 5.0, "question": "BTC?", "token_id": "t1",
+        })
+        # Should be 5.0 × 2^1 = 10.0, NOT 5.20 × 2 = 10.40
+        self.assertEqual(mb.current_bet, 10.0)
+
+        # Second loss: exchange bumps cost again
+        mb._handle_loss({
+            "direction": "Up", "shares": 20.0, "cost": 10.40,
+            "bet_size": 10.0, "question": "BTC?", "token_id": "t1",
+        })
+        # Should be 5.0 × 2^2 = 20.0, NOT 10.40 × 2 = 20.80
+        self.assertEqual(mb.current_bet, 20.0)
+
+    # -- resolution detection --
+
+    def test_check_resolution_not_closed(self):
+        mb = self._make_bot()
+        mb.clob_client._get_public.return_value = [{
+            "closed": False,
+            "active": True,
+            "outcomes": '["Up", "Down"]',
+            "outcomePrices": '[0.55, 0.45]',
+        }]
+        resolved, won = mb._check_resolution("cid1", "Up")
+        self.assertFalse(resolved)
+
+    def test_check_resolution_up_wins(self):
+        mb = self._make_bot()
+        mb.clob_client._get_public.return_value = [{
+            "closed": True,
+            "active": False,
+            "outcomes": '["Up", "Down"]',
+            "outcomePrices": '[1.0, 0.0]',
+        }]
+        resolved, won = mb._check_resolution("cid1", "Up")
+        self.assertTrue(resolved)
+        self.assertTrue(won)
+
+    def test_check_resolution_down_wins(self):
+        mb = self._make_bot()
+        mb.clob_client._get_public.return_value = [{
+            "closed": True,
+            "active": False,
+            "outcomes": '["Up", "Down"]',
+            "outcomePrices": '[0.0, 1.0]',
+        }]
+        resolved, won = mb._check_resolution("cid1", "Up")
+        self.assertTrue(resolved)
+        self.assertFalse(won)
+
+    def test_check_resolution_bet_on_down_and_down_wins(self):
+        mb = self._make_bot()
+        mb.clob_client._get_public.return_value = [{
+            "closed": True,
+            "active": False,
+            "outcomes": '["Up", "Down"]',
+            "outcomePrices": '[0.0, 1.0]',
+        }]
+        resolved, won = mb._check_resolution("cid1", "Down")
+        self.assertTrue(resolved)
+        self.assertTrue(won)
+
+    def test_check_resolution_orderbook_win(self):
+        """Orderbook fallback detects a win when ask >= 0.95."""
+        mb = self._make_bot()
+        mb.clob_client.get_order_book.return_value = {
+            "asks": [{"price": "0.97", "size": "50"}],
+        }
+        bet = {"token_id": "tok_up", "direction": "Up"}
+        result = mb._check_resolution_orderbook(bet)
+        self.assertTrue(result)
+
+    def test_check_resolution_orderbook_loss(self):
+        """Orderbook fallback detects a loss when ask <= 0.05."""
+        mb = self._make_bot()
+        mb.clob_client.get_order_book.return_value = {
+            "asks": [{"price": "0.03", "size": "50"}],
+        }
+        bet = {"token_id": "tok_up", "direction": "Up"}
+        result = mb._check_resolution_orderbook(bet)
+        self.assertFalse(result)
+
+    def test_check_resolution_orderbook_inconclusive(self):
+        """Orderbook fallback returns None for mid-range prices."""
+        mb = self._make_bot()
+        mb.clob_client.get_order_book.return_value = {
+            "asks": [{"price": "0.55", "size": "50"}],
+        }
+        bet = {"token_id": "tok_up", "direction": "Up"}
+        result = mb._check_resolution_orderbook(bet)
+        self.assertIsNone(result)
+
+    def test_cycle_uses_orderbook_fallback(self):
+        """Cycle uses orderbook fallback when API says not resolved."""
+        mb = self._make_bot()
+        # API says market not closed
+        mb.clob_client._get_public.return_value = [{
+            "closed": False,
+            "active": True,
+            "outcomes": '["Up", "Down"]',
+            "outcomePrices": '[0.55, 0.45]',
+        }]
+        # But orderbook shows Up won (ask at 0.97)
+        mb.clob_client.get_order_book.return_value = {
+            "asks": [{"price": "0.97", "size": "50"}],
+        }
+        mb._active_bet = {
+            "slug": "btc-updown-5m-test",
+            "condition_id": "cid1",
+            "token_id": "tok_up",
+            "direction": "Up",
+            "bet_size": 10.0,
+            "price": 0.50,
+            "shares": 20.0,
+            "cost": 10.0,
+            "question": "BTC?",
+            "window_end": int(time.time()) - 120,  # ended 2 min ago
+            "ts": "2026-01-01",
+        }
+        mb.log_trade_callback = MagicMock()
+        result = mb._cycle()
+        self.assertFalse(result)  # resolved, switch to fast poll
+        self.assertIsNone(mb._active_bet)
+        self.assertEqual(mb.current_bet, mb.start_bet)  # win resets bet
+
+    # -- cycle state machine --
+
+    def test_cycle_places_bet_when_no_active(self):
+        mb = self._make_bot()
+        mb.clob_client._get_public.return_value = [{
+            "markets": [{
+                "condition_id": "cid1",
+                "question": "BTC?",
+                "clobTokenIds": '["tok_up", "tok_down"]',
+                "outcomes": '["Up", "Down"]',
+            }]
+        }]
+        mb.clob_client.get_order_book.return_value = {
+            "asks": [{"price": "0.50", "size": "100"}],
+        }
+        mb.clob_client.place_order.return_value = {
+            "takingAmount": "10.0",
+            "makingAmount": "5.0",
+        }
+        mb._cycle()
+        self.assertIsNotNone(mb._active_bet)
+
+    def test_cycle_checks_resolution_when_active(self):
+        mb = self._make_bot()
+        mb._active_bet = {
+            "slug": "test-slug",
+            "condition_id": "cid1",
+            "direction": "Up",
+            "shares": 10.0,
+            "cost": 5.0,
+            "bet_size": 5.0,
+            "question": "BTC?",
+            "token_id": "tok_up",
+            "window_end": 0,  # already expired
+        }
+        # Market resolved, Up won
+        mb.clob_client._get_public.return_value = [{
+            "closed": True,
+            "active": False,
+            "outcomes": '["Up", "Down"]',
+            "outcomePrices": '[1.0, 0.0]',
+        }]
+        mb._cycle()
+        # Should have handled win: reset bet, clear active_bet
+        self.assertIsNone(mb._active_bet)
+        self.assertEqual(mb.current_bet, 5.0)
+        self.assertAlmostEqual(mb.session_pnl, 5.0)
+
+    # -- persistence --
+
+    def test_save_and_load_state(self):
+        mb = self._make_bot()
+        mb.current_bet = 20.0
+        mb.consecutive_losses = 3
+        mb.session_pnl = -15.0
+        mb.direction = "Down"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mb.STATE_FILE = os.path.join(tmpdir, "mart_state.json")
+            mb._save_state()
+            # Create a fresh bot and load
+            mb2 = self._make_bot()
+            mb2.STATE_FILE = mb.STATE_FILE
+            mb2._load_state()
+            self.assertEqual(mb2.current_bet, 20.0)
+            self.assertEqual(mb2.consecutive_losses, 3)
+            self.assertAlmostEqual(mb2.session_pnl, -15.0)
+            self.assertEqual(mb2.direction, "Down")
+
+    # -- trade logging --
+
+    def test_log_bet_calls_callback(self):
+        mb = self._make_bot()
+        callback = MagicMock()
+        mb.log_trade_callback = callback
+        bet = {
+            "direction": "Up",
+            "shares": 10.0,
+            "cost": 5.0,
+            "bet_size": 5.0,
+            "question": "BTC?",
+            "token_id": "tok_up",
+        }
+        mb._log_bet(bet, won=True, profit=5.0)
+        callback.assert_called_once()
+        record = callback.call_args[0][0]
+        self.assertEqual(record["outcome"], "won")
+        self.assertEqual(record["reason"], "martingale")
+        self.assertEqual(record["pnl_usdc"], 5.0)
+
+    # -- status summary --
+
+    def test_get_status_summary(self):
+        mb = self._make_bot()
+        mb.current_bet = 10.0
+        mb.consecutive_losses = 2
+        mb.session_pnl = -15.0
+        summary = mb.get_status_summary()
+        self.assertIn("Down" if mb.direction == "Down" else "Up", summary)
+        self.assertIn("$10.00", summary)
+        self.assertIn("Streak: 2", summary)
 
 
 if __name__ == "__main__":
