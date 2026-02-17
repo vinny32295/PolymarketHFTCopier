@@ -217,6 +217,8 @@ SESSION_TRADES_FILE = "session_trades.json"
 # trade_history.json from multiple threads (executor, arb, martingale).
 _TRADE_HISTORY_LOCK = threading.Lock()
 STRATEGY_SUMMARY_FILE = "strategy_summary.json"
+MARTINGALE_HISTORY_FILE = "martingale_history.json"
+MARTINGALE_SUMMARY_FILE = "martingale_summary.json"
 USER_CONFIG_FILE = "config.json"  # persists RPC URLs, proxy address, etc.
 
 # Polymarket Proxy Wallet Factory on Polygon
@@ -4175,6 +4177,81 @@ class MartingaleBot(threading.Thread):
         except Exception as exc:
             self.logger.debug("Failed to log martingale trade: %s", exc)
 
+        # --- Persist to dedicated martingale history & summary ---
+        self._persist_martingale_record(record)
+
+    def _persist_martingale_record(self, record):
+        """Append to martingale_history.json and update martingale_summary.json."""
+        try:
+            with _TRADE_HISTORY_LOCK:
+                # -- Append to martingale history --
+                try:
+                    with open(MARTINGALE_HISTORY_FILE, "r") as fh:
+                        m_history = json.load(fh)
+                except (FileNotFoundError, json.JSONDecodeError):
+                    m_history = []
+                m_history.append(record)
+                tmp = MARTINGALE_HISTORY_FILE + ".tmp"
+                with open(tmp, "w") as fh:
+                    json.dump(m_history, fh, indent=2, default=str)
+                os.replace(tmp, MARTINGALE_HISTORY_FILE)
+
+                # -- Compute and persist martingale summary --
+                total_cost = sum(r.get("cost_basis_usdc", 0) for r in m_history)
+                total_proceeds = sum(r.get("proceeds_usdc", 0) for r in m_history)
+                total_pnl = round(total_proceeds - total_cost, 6)
+                wins = sum(1 for r in m_history if r.get("outcome") in ("won", "win"))
+                losses = sum(1 for r in m_history if r.get("outcome") in ("lost", "loss"))
+                decided = wins + losses
+                win_rate = (wins / decided * 100) if decided > 0 else 0
+
+                # Per-strategy breakdown
+                strat_buckets = {}
+                for r in m_history:
+                    details = r.get("martingale_details") or {}
+                    name = details.get("strategy", "default")
+                    strat_buckets.setdefault(name, []).append(r)
+
+                strategies = {}
+                for name, records in strat_buckets.items():
+                    s_cost = sum(r.get("cost_basis_usdc", 0) for r in records)
+                    s_proceeds = sum(r.get("proceeds_usdc", 0) for r in records)
+                    s_wins = sum(1 for r in records if r.get("outcome") in ("won", "win"))
+                    s_losses = sum(1 for r in records if r.get("outcome") in ("lost", "loss"))
+                    s_decided = s_wins + s_losses
+                    strategies[name] = {
+                        "total_bets": len(records),
+                        "wins": s_wins,
+                        "losses": s_losses,
+                        "win_rate_pct": round((s_wins / s_decided * 100) if s_decided > 0 else 0, 1),
+                        "pnl_usdc": round(s_proceeds - s_cost, 6),
+                        "capital_deployed_usdc": round(s_cost, 6),
+                        "capital_returned_usdc": round(s_proceeds, 6),
+                        "max_streak": max(
+                            (r.get("martingale_details", {}).get("streak", 0) for r in records),
+                            default=0,
+                        ),
+                    }
+
+                summary = {
+                    "updated_at": datetime.now().isoformat(),
+                    "total_bets": len(m_history),
+                    "wins": wins,
+                    "losses": losses,
+                    "win_rate_pct": round(win_rate, 1),
+                    "lifetime_pnl_usdc": total_pnl,
+                    "capital_deployed_usdc": round(total_cost, 6),
+                    "capital_returned_usdc": round(total_proceeds, 6),
+                    "roi_pct": round((total_pnl / total_cost * 100) if total_cost > 0 else 0, 2),
+                    "strategies": strategies,
+                }
+                tmp_sf = MARTINGALE_SUMMARY_FILE + ".tmp"
+                with open(tmp_sf, "w") as fh:
+                    json.dump(summary, fh, indent=2)
+                os.replace(tmp_sf, MARTINGALE_SUMMARY_FILE)
+        except Exception as exc:
+            self.logger.debug("Could not persist martingale record: %s", exc)
+
     # -- main loop ----------------------------------------------------------
 
     def _cycle(self):
@@ -7487,6 +7564,10 @@ class CopyTraderBot:
 
         Thread-safe: uses the module-level ``_TRADE_HISTORY_LOCK`` to
         prevent concurrent read-modify-write from multiple threads.
+
+        Also updates the per-strategy summary file (strategy_summary.json)
+        with combined stats, and writes the martingale-only summary to
+        martingale_summary.json when the record is a martingale trade.
         """
         try:
             with _TRADE_HISTORY_LOCK:
@@ -7501,6 +7582,38 @@ class CopyTraderBot:
                 with open(tmp, "w") as fh:
                     json.dump(history, fh, indent=2, default=str)
                 os.replace(tmp, history_file)
+
+                # --- Update combined strategy summary ---
+                total_cost = sum(r.get("cost_basis_usdc", 0) for r in history)
+                total_proceeds = sum(r.get("proceeds_usdc", 0) for r in history)
+                total_pnl = round(total_proceeds - total_cost, 6)
+                wins = sum(1 for r in history if r.get("outcome") in ("won", "win"))
+                losses = sum(1 for r in history if r.get("outcome") in ("lost", "loss"))
+                decided = wins + losses
+                win_rate = (wins / decided * 100) if decided > 0 else 0
+                total_position_size = sum(
+                    r.get("position_size_usdc", r.get("cost_basis_usdc", 0))
+                    for r in history
+                )
+                try:
+                    summary = {
+                        "updated_at": datetime.now().isoformat(),
+                        "total_trades": len(history),
+                        "wins": wins,
+                        "losses": losses,
+                        "win_rate_pct": round(win_rate, 1),
+                        "lifetime_pnl_usdc": total_pnl,
+                        "total_position_size_usdc": round(total_position_size, 6),
+                        "lifetime_cost_basis_usdc": round(total_cost, 6),
+                        "capital_returned_usdc": round(total_proceeds, 6),
+                    }
+                    tmp_sf = STRATEGY_SUMMARY_FILE + ".tmp"
+                    with open(tmp_sf, "w") as fh:
+                        json.dump(summary, fh, indent=2)
+                    os.replace(tmp_sf, STRATEGY_SUMMARY_FILE)
+                except Exception:
+                    pass
+
         except Exception as exc:
             self.logger.debug("Could not append trade history: %s", exc)
 
@@ -8243,6 +8356,33 @@ class CopyTraderBot:
             p.get("cost_basis_usdc", 0) for p in positions.values()
         )
 
+        # ---- Martingale breakdown from dedicated history ----
+        martingale_section = {}
+        try:
+            with open(MARTINGALE_SUMMARY_FILE, "r") as fh:
+                martingale_section = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+        # Also split closed_trades into copy vs martingale for the report
+        copy_trades = [r for r in closed_trades if r.get("reason") != "martingale"]
+        mart_trades = [r for r in closed_trades if r.get("reason") == "martingale"]
+        copy_cost = sum(r.get("cost_basis_usdc", 0) for r in copy_trades)
+        copy_proceeds = sum(r.get("proceeds_usdc", 0) for r in copy_trades)
+        copy_pnl = round(copy_proceeds - copy_cost, 6)
+        copy_wins = sum(1 for r in copy_trades if r.get("outcome") in ("won", "win"))
+        copy_losses = sum(1 for r in copy_trades if r.get("outcome") in ("lost", "loss"))
+        copy_decided = copy_wins + copy_losses
+        copy_wr = (copy_wins / copy_decided * 100) if copy_decided > 0 else 0
+
+        mart_cost = sum(r.get("cost_basis_usdc", 0) for r in mart_trades)
+        mart_proceeds = sum(r.get("proceeds_usdc", 0) for r in mart_trades)
+        mart_pnl = round(mart_proceeds - mart_cost, 6)
+        mart_wins = sum(1 for r in mart_trades if r.get("outcome") in ("won", "win"))
+        mart_losses = sum(1 for r in mart_trades if r.get("outcome") in ("lost", "loss"))
+        mart_decided = mart_wins + mart_losses
+        mart_wr = (mart_wins / mart_decided * 100) if mart_decided > 0 else 0
+
         report = {
             "session_start": (
                 self._session_start.isoformat() if self._session_start else None
@@ -8263,6 +8403,25 @@ class CopyTraderBot:
             "closed_trade_count": len(closed_trades),
             "trade_history": self._trade_history,
             "open_positions": positions,
+            "copy_trading": {
+                "trades": len(copy_trades),
+                "wins": copy_wins,
+                "losses": copy_losses,
+                "win_rate_pct": round(copy_wr, 1),
+                "pnl_usdc": copy_pnl,
+                "capital_deployed_usdc": round(copy_cost, 6),
+                "capital_returned_usdc": round(copy_proceeds, 6),
+            },
+            "martingale": {
+                "trades": len(mart_trades),
+                "wins": mart_wins,
+                "losses": mart_losses,
+                "win_rate_pct": round(mart_wr, 1),
+                "pnl_usdc": mart_pnl,
+                "capital_deployed_usdc": round(mart_cost, 6),
+                "capital_returned_usdc": round(mart_proceeds, 6),
+                "lifetime_summary": martingale_section,
+            },
         }
 
         # ---- Write report JSON ----
@@ -8299,6 +8458,19 @@ class CopyTraderBot:
                 "Strategy stats: W/L %d/%d (%.0f%%) | "
                 "lifetime P&L $%+.2f",
                 wins, losses, win_rate, realized_pnl,
+            )
+        if mart_trades:
+            self.logger.info(
+                "Martingale stats: %d bets | W/L %d/%d (%.0f%%) | "
+                "P&L $%+.2f (deployed $%.2f, returned $%.2f)",
+                len(mart_trades), mart_wins, mart_losses, mart_wr,
+                mart_pnl, mart_cost, mart_proceeds,
+            )
+        if copy_trades:
+            self.logger.info(
+                "Copy trading stats: %d trades | W/L %d/%d (%.0f%%) | "
+                "P&L $%+.2f",
+                len(copy_trades), copy_wins, copy_losses, copy_wr, copy_pnl,
             )
         if positions:
             self.logger.info(
@@ -8791,7 +8963,12 @@ class CopyTraderGUI:
         self._refresh_strategy_summary()
 
     def _refresh_strategy_summary(self):
-        """Load strategy_summary.json and update the P/L labels."""
+        """Load strategy_summary.json and update the P/L labels.
+
+        Also loads martingale_summary.json and appends a separate
+        martingale stats line so the user can see martingale performance
+        independently from copy-trading.
+        """
         try:
             with open(STRATEGY_SUMMARY_FILE, "r") as fh:
                 ss = json.load(fh)
@@ -8822,8 +8999,26 @@ class CopyTraderGUI:
             f"Lifetime P/L: {lifetime_dir} ${lifetime_pnl:+,.2f}"
         )
 
+        # -- Martingale-specific stats --
+        mart_label = ""
+        try:
+            with open(MARTINGALE_SUMMARY_FILE, "r") as fh:
+                ms = json.load(fh)
+            m_bets = ms.get("total_bets", 0)
+            if m_bets > 0:
+                m_wins = ms.get("wins", 0)
+                m_losses = ms.get("losses", 0)
+                m_pnl = ms.get("lifetime_pnl_usdc", 0)
+                m_wr = ms.get("win_rate_pct", 0)
+                mart_label = (
+                    f"  |  Mart: W/L {m_wins}/{m_losses} "
+                    f"({m_wr:.0f}%) P&L ${m_pnl:+,.2f}"
+                )
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
         self.dash_winrate_var.set(
-            f"W/L: {wins}/{losses} ({win_rate:.0f}%)"
+            f"W/L: {wins}/{losses} ({win_rate:.0f}%){mart_label}"
         )
 
     def _dash_get_price(self, token_id):
