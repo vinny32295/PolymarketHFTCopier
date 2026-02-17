@@ -4202,11 +4202,22 @@ class MartingaleBot(threading.Thread):
                 elif o and str(o).lower() == "down":
                     down_idx = i
 
+            # Detect neg_risk — needed for correct exchange approval
+            neg_risk = False
+            neg = market.get("neg_risk")
+            if isinstance(neg, bool):
+                neg_risk = neg
+            elif isinstance(neg, str):
+                neg_risk = neg.lower() in ("true", "1", "yes")
+            if not neg_risk:
+                neg_risk = bool(market.get("neg_risk_market_id"))
+
             return {
                 "condition_id": cid,
                 "up_token": token_ids[up_idx],
                 "down_token": token_ids[down_idx],
                 "question": market.get("question", slug),
+                "neg_risk": neg_risk,
             }
         except Exception as exc:
             self.logger.warning("Failed to fetch market '%s': %s", slug, exc)
@@ -4635,6 +4646,32 @@ class MartingaleBot(threading.Thread):
             self._last_window_ts = current_window_ts
             return False
 
+        # Pre-trade balance check — the CLOB API rejects orders when the
+        # EOA lacks sufficient USDC or allowance.
+        try:
+            usdc_bal = float(self.clob_client.get_usdc_balance(max_age_seconds=0))
+            if usdc_bal < self.current_bet:
+                self.logger.warning(
+                    "MARTINGALE [%s]: USDC balance $%.2f < bet $%.2f — skipping",
+                    self.strategy_name, usdc_bal, self.current_bet,
+                )
+                self._skip_reason = f"low balance (${usdc_bal:.2f} < ${self.current_bet:.2f})"
+                return False
+        except Exception as exc:
+            self.logger.debug("MARTINGALE: balance check failed (%s) — proceeding", exc)
+
+        # Ensure USDC approval for the correct exchange contract
+        neg_risk = market.get("neg_risk", False)
+        try:
+            raw_amount = int(self.current_bet * 1_000_000)
+            self.clob_client.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
+            if neg_risk:
+                self.clob_client.ensure_usdc_approval(
+                    NEG_RISK_CTF_EXCHANGE_ADDRESS, raw_amount,
+                )
+        except Exception as exc:
+            self.logger.warning("MARTINGALE: approval failed (%s) — proceeding", exc)
+
         result = self.clob_client.place_order(
             token_id=token_id,
             side="BUY",
@@ -4642,6 +4679,7 @@ class MartingaleBot(threading.Thread):
             price=ask_price,
             use_fok=True,
             max_retry_price=price_max,
+            neg_risk=neg_risk,
         )
 
         if isinstance(result, dict) and (
