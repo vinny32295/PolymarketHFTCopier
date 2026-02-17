@@ -1073,10 +1073,6 @@ class TelegramCommandBot:
         for mb in mgr.bots:
             window = int(mb._scfg("window", "martingale_window", 300))
             slug_base = mb._scfg("slug_base", "martingale_slug_base", "?")
-            default_entry = min(max(window // 5, 60), 180)
-            max_entry = int(mb._scfg("max_entry_seconds",
-                                     "martingale_max_entry_seconds",
-                                     default_entry))
             now = int(time.time())
             window_ts = mb._get_window_ts(window)
             secs_in = now - window_ts
@@ -1085,9 +1081,7 @@ class TelegramCommandBot:
             lines.append("")
             lines.append(f"[{mb.strategy_name}]")
             lines.append(f"  slug: {next_slug}")
-            lines.append(
-                f"  window: {window}s  |  entry: {secs_in}s / {max_entry}s"
-            )
+            lines.append(f"  window: {window}s  |  {secs_in}s in")
             lines.append(
                 f"  dir: {mb.direction}  |  bet: ${mb.current_bet:.2f}  |  "
                 f"streak: {mb.consecutive_losses}"
@@ -1097,7 +1091,6 @@ class TelegramCommandBot:
             # Counters
             lines.append(
                 f"  windows: {mb._windows_attempted} bet  |  "
-                f"{mb._windows_skipped} skipped  |  "
                 f"{mb._windows_no_market} no-market"
             )
 
@@ -3365,7 +3358,6 @@ class MartingaleBot(threading.Thread):
         self._next_window_cache = None  # pre-fetched market for next window
         self._skip_reason = None        # last reason a window was skipped
         self._windows_attempted = 0     # windows where we tried to bet
-        self._windows_skipped = 0       # windows skipped (entry too late, etc)
         self._windows_no_market = 0     # market slug not found on Gamma API
 
         # Callbacks (wired by CopyTraderBot)
@@ -3926,23 +3918,8 @@ class MartingaleBot(threading.Thread):
         if current_window_ts == self._last_window_ts:
             return False  # already bet or skipped this window
 
-        # Check how far into the window we are — only bet in the early
-        # portion when prices are closest to $0.50.  Default scales with
-        # window size: 60s for 5-min (300s), 120s for 15-min (900s), etc.
         now = int(time.time())
         seconds_into = now - current_window_ts
-        default_entry = min(max(window // 5, 60), 180)
-        max_entry = int(self._scfg("max_entry_seconds", "martingale_max_entry_seconds", default_entry))
-        if seconds_into > max_entry:
-            self.logger.info(
-                "MARTINGALE [%s]: window %d is %ds old (max %ds) — skipping, "
-                "waiting for next window",
-                self.strategy_name, current_window_ts, seconds_into, max_entry,
-            )
-            self._last_window_ts = current_window_ts  # mark skipped
-            self._skip_reason = f"entry too late ({seconds_into}s > {max_entry}s)"
-            self._windows_skipped += 1
-            return False
 
         # Allow runtime direction toggle via config (must happen before
         # both the cached and non-cached paths so direction is always set).
@@ -4078,9 +4055,8 @@ class MartingaleBot(threading.Thread):
         )
         if self.notify_callback:
             self.notify_callback(
-                f"MARTINGALE BET: {direction} ${actual_cost:.2f} "
-                f"@ ${ask_price:.4f} ({actual_shares:.1f} shares) — "
-                f"streak: {self.consecutive_losses}"
+                f"{self.strategy_name} BET ${actual_cost:.2f} "
+                f"@ ${ask_price:.4f} | streak: {self.consecutive_losses}"
             )
         return True
 
@@ -4098,8 +4074,8 @@ class MartingaleBot(threading.Thread):
         self._log_bet(bet, won=True, profit=profit)
         if self.notify_callback:
             self.notify_callback(
-                f"MARTINGALE WIN: {bet['direction']} +${profit:.4f} — "
-                f"resetting to ${self.start_bet:.2f}"
+                f"{self.strategy_name} WIN +${profit:.4f} | "
+                f"reset to ${self.start_bet:.2f}"
             )
 
         self.current_bet = self.start_bet
@@ -4136,9 +4112,8 @@ class MartingaleBot(threading.Thread):
         self._log_bet(bet, won=False, profit=-loss)
         if self.notify_callback:
             self.notify_callback(
-                f"MARTINGALE LOSS: {bet['direction']} -${loss:.2f} — "
-                f"doubling to ${self.current_bet:.2f} "
-                f"(streak: {self.consecutive_losses})"
+                f"{self.strategy_name} LOSS -${loss:.2f} | "
+                f"next ${self.current_bet:.2f} (streak: {self.consecutive_losses})"
             )
 
         self._active_bet = None
