@@ -4205,6 +4205,7 @@ class TradeExecutor:
             "shares": num_shares,
             "entry_price": entry_p,
             "exit_price": exit_p,
+            "position_size_usdc": round(cost_basis, 6),
             "cost_basis_usdc": round(cost_basis, 6),
             "proceeds_usdc": round(proceeds, 6),
             "pnl_usdc": pnl,
@@ -4219,6 +4220,10 @@ class TradeExecutor:
         total_cost = sum(r.get("cost_basis_usdc", 0) for r in history)
         total_proceeds = sum(r.get("proceeds_usdc", 0) for r in history)
         total_pnl = round(total_proceeds - total_cost, 6)
+        total_position_size = sum(
+            r.get("position_size_usdc", r.get("cost_basis_usdc", 0))
+            for r in history
+        )
 
         # Win/loss counts
         wins = sum(1 for r in history if r.get("outcome") == "won")
@@ -4243,6 +4248,7 @@ class TradeExecutor:
                 "losses": losses,
                 "win_rate_pct": round(win_rate, 1),
                 "lifetime_pnl_usdc": total_pnl,
+                "total_position_size_usdc": round(total_position_size, 6),
                 "lifetime_cost_basis_usdc": round(total_cost, 6),
                 "capital_returned_usdc": round(total_proceeds, 6),
             }
@@ -4259,10 +4265,10 @@ class TradeExecutor:
 
         self.logger.info(
             "CLOSED TRADE [%s]: %s | %.4f shares @ entry $%.4f -> exit $%.4f | "
-            "P&L $%+.4f | session $%+.4f | "
+            "size $%.2f | P&L $%+.4f | session $%+.4f | "
             "W/L %d/%d (%.0f%%) | lifetime $%+.4f",
             outcome.upper(), record["market"], num_shares, entry_p, exit_p,
-            pnl, self._session_pnl,
+            cost_basis, pnl, self._session_pnl,
             wins, losses, win_rate,
             total_pnl,
         )
