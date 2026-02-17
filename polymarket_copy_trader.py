@@ -8588,10 +8588,12 @@ class CopyTraderGUI:
             except Exception:
                 pass
 
-        # Update martingale status label if bot is running
-        if mart_bot and hasattr(self, 'mart_status_var'):
+        # Update martingale status label if bots are running
+        if mart_mgr and hasattr(self, 'mart_status_var'):
             try:
-                self.mart_status_var.set("Martingale: " + mart_bot.get_status_summary())
+                self.mart_status_var.set(
+                    "Martingale: " + mart_mgr.get_status_summary()
+                )
             except Exception:
                 pass
 
@@ -9153,95 +9155,70 @@ class CopyTraderGUI:
         ttk.Label(
             parent,
             text=(
-                "Double-on-loss strategy: bet on BTC Up or Down each window.\n"
-                "If the bet loses, the next bet is doubled. "
-                "A win resets to the starting bet."
+                "Double-on-loss strategy: configure one or more independent "
+                "strategies with different bet sizes and market windows."
             ),
             wraplength=500, justify=tk.LEFT,
         ).pack(anchor=tk.W, pady=(0, 10))
 
-        # Direction toggle
-        dir_frame = ttk.LabelFrame(parent, text="Direction", padding=5)
-        dir_frame.pack(fill=tk.X, pady=(0, 5))
+        # In-memory list of strategy dicts (the source of truth for the UI)
+        self._mart_strategies = []
+        self._mart_selected_idx = None
 
-        self.mart_direction_var = tk.StringVar(value="Up")
-        ttk.Radiobutton(
-            dir_frame, text="Up (BTC goes up)", value="Up",
-            variable=self.mart_direction_var,
-        ).pack(side=tk.LEFT, padx=(0, 20))
-        ttk.Radiobutton(
-            dir_frame, text="Down (BTC goes down)", value="Down",
-            variable=self.mart_direction_var,
-        ).pack(side=tk.LEFT)
+        # --- Top: strategy list + buttons on the left, edit form on right ---
+        top_frame = ttk.Frame(parent)
+        top_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
 
-        # Settings
-        settings_frame = ttk.LabelFrame(parent, text="Settings", padding=5)
-        settings_frame.pack(fill=tk.X, pady=(0, 5))
+        # -- Left: strategy list --
+        list_frame = ttk.LabelFrame(top_frame, text="Strategies", padding=5)
+        list_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=(0, 5))
 
-        row = 0
-        ttk.Label(settings_frame, text="Starting Bet (USDC):").grid(
-            row=row, column=0, sticky=tk.W, padx=2, pady=2,
-        )
-        self.mart_start_bet_entry = ttk.Entry(settings_frame, width=10)
-        self.mart_start_bet_entry.grid(row=row, column=1, padx=2, pady=2)
+        self.mart_listbox = tk.Listbox(list_frame, width=30, height=10)
+        self.mart_listbox.pack(fill=tk.BOTH, expand=True)
+        self.mart_listbox.bind("<<ListboxSelect>>", self._mart_on_select)
 
-        row += 1
-        ttk.Label(settings_frame, text="Max Bet (USDC, 0=no limit):").grid(
-            row=row, column=0, sticky=tk.W, padx=2, pady=2,
-        )
-        self.mart_max_bet_entry = ttk.Entry(settings_frame, width=10)
-        self.mart_max_bet_entry.grid(row=row, column=1, padx=2, pady=2)
+        btn_row = ttk.Frame(list_frame)
+        btn_row.pack(fill=tk.X, pady=(5, 0))
+        ttk.Button(btn_row, text="Add", width=8,
+                   command=self._mart_add_strategy).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_row, text="Remove", width=8,
+                   command=self._mart_remove_strategy).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_row, text="Duplicate", width=8,
+                   command=self._mart_duplicate_strategy).pack(side=tk.LEFT, padx=2)
 
-        row += 1
-        ttk.Label(settings_frame, text="Max Streak (0=no limit):").grid(
-            row=row, column=0, sticky=tk.W, padx=2, pady=2,
-        )
-        self.mart_max_streak_entry = ttk.Entry(settings_frame, width=10)
-        self.mart_max_streak_entry.grid(row=row, column=1, padx=2, pady=2)
+        # -- Right: edit form for selected strategy --
+        edit_frame = ttk.LabelFrame(top_frame, text="Strategy Settings", padding=5)
+        edit_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        row += 1
-        ttk.Label(settings_frame, text="Slug Base:").grid(
-            row=row, column=0, sticky=tk.W, padx=2, pady=2,
-        )
-        self.mart_slug_entry = ttk.Entry(settings_frame, width=25)
-        self.mart_slug_entry.grid(row=row, column=1, padx=2, pady=2)
+        # Build the fields in a grid
+        fields = [
+            ("Name:", "mart_e_name", 20),
+            ("Slug Base:", "mart_e_slug", 25),
+            ("Window (seconds):", "mart_e_window", 10),
+            ("Direction (Up/Down):", "mart_e_direction", 10),
+            ("Starting Bet (USDC):", "mart_e_start_bet", 10),
+            ("Max Bet (0=no limit):", "mart_e_max_bet", 10),
+            ("Max Streak (0=no limit):", "mart_e_max_streak", 10),
+            ("Poll Interval (seconds):", "mart_e_poll", 10),
+            ("Buy Price Min:", "mart_e_price_min", 10),
+            ("Buy Price Max:", "mart_e_price_max", 10),
+            ("Max Entry (sec into window):", "mart_e_max_entry", 10),
+        ]
+        self._mart_entries = {}
+        for row, (label, attr, width) in enumerate(fields):
+            ttk.Label(edit_frame, text=label).grid(
+                row=row, column=0, sticky=tk.W, padx=2, pady=2,
+            )
+            entry = ttk.Entry(edit_frame, width=width)
+            entry.grid(row=row, column=1, sticky=tk.W, padx=2, pady=2)
+            self._mart_entries[attr] = entry
 
-        row += 1
-        ttk.Label(settings_frame, text="Window (seconds):").grid(
-            row=row, column=0, sticky=tk.W, padx=2, pady=2,
-        )
-        self.mart_window_entry = ttk.Entry(settings_frame, width=10)
-        self.mart_window_entry.grid(row=row, column=1, padx=2, pady=2)
+        ttk.Button(
+            edit_frame, text="Apply to Selected",
+            command=self._mart_apply_edit,
+        ).grid(row=len(fields), column=0, columnspan=2, pady=(10, 0))
 
-        row += 1
-        ttk.Label(settings_frame, text="Poll Interval (seconds):").grid(
-            row=row, column=0, sticky=tk.W, padx=2, pady=2,
-        )
-        self.mart_poll_entry = ttk.Entry(settings_frame, width=10)
-        self.mart_poll_entry.grid(row=row, column=1, padx=2, pady=2)
-
-        row += 1
-        ttk.Label(settings_frame, text="Buy Price Min:").grid(
-            row=row, column=0, sticky=tk.W, padx=2, pady=2,
-        )
-        self.mart_price_min_entry = ttk.Entry(settings_frame, width=10)
-        self.mart_price_min_entry.grid(row=row, column=1, padx=2, pady=2)
-
-        row += 1
-        ttk.Label(settings_frame, text="Buy Price Max:").grid(
-            row=row, column=0, sticky=tk.W, padx=2, pady=2,
-        )
-        self.mart_price_max_entry = ttk.Entry(settings_frame, width=10)
-        self.mart_price_max_entry.grid(row=row, column=1, padx=2, pady=2)
-
-        row += 1
-        ttk.Label(settings_frame, text="Max Entry (seconds into window):").grid(
-            row=row, column=0, sticky=tk.W, padx=2, pady=2,
-        )
-        self.mart_max_entry_entry = ttk.Entry(settings_frame, width=10)
-        self.mart_max_entry_entry.grid(row=row, column=1, padx=2, pady=2)
-
-        # Status label + reset button
+        # --- Bottom: status + reset ---
         status_frame = ttk.Frame(parent)
         status_frame.pack(fill=tk.X, pady=(10, 0))
 
@@ -9252,9 +9229,128 @@ class CopyTraderGUI:
         ).pack(side=tk.LEFT)
 
         ttk.Button(
-            status_frame, text="Reset State",
+            status_frame, text="Reset All State",
             command=self._reset_martingale_state,
         ).pack(side=tk.RIGHT, padx=5)
+
+    # -- Martingale strategy list helpers ------------------------------------
+
+    def _mart_refresh_listbox(self):
+        """Repopulate the listbox from self._mart_strategies."""
+        self.mart_listbox.delete(0, tk.END)
+        for s in self._mart_strategies:
+            name = s.get("name", "unnamed")
+            bet = s.get("start_bet", 5.0)
+            slug = s.get("slug_base", "?")
+            self.mart_listbox.insert(
+                tk.END, f"{name}  (${bet}, {slug})",
+            )
+
+    def _mart_on_select(self, event=None):
+        """Load selected strategy into the edit fields."""
+        sel = self.mart_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        self._mart_selected_idx = idx
+        s = self._mart_strategies[idx]
+        mapping = {
+            "mart_e_name": ("name", ""),
+            "mart_e_slug": ("slug_base", "btc-updown-5m"),
+            "mart_e_window": ("window", 300),
+            "mart_e_direction": ("direction", "Up"),
+            "mart_e_start_bet": ("start_bet", 5.0),
+            "mart_e_max_bet": ("max_bet", 0),
+            "mart_e_max_streak": ("max_streak", 0),
+            "mart_e_poll": ("poll_seconds", 10),
+            "mart_e_price_min": ("price_min", 0.40),
+            "mart_e_price_max": ("price_max", 0.55),
+            "mart_e_max_entry": ("max_entry_seconds", 60),
+        }
+        for attr, (key, default) in mapping.items():
+            entry = self._mart_entries[attr]
+            entry.delete(0, tk.END)
+            entry.insert(0, str(s.get(key, default)))
+
+    def _mart_apply_edit(self):
+        """Write the edit fields back into the selected strategy dict."""
+        idx = self._mart_selected_idx
+        if idx is None or idx >= len(self._mart_strategies):
+            return
+        s = self._mart_strategies[idx]
+        s["name"] = self._mart_entries["mart_e_name"].get().strip() or "unnamed"
+        s["slug_base"] = self._mart_entries["mart_e_slug"].get().strip() or "btc-updown-5m"
+        s["direction"] = self._mart_entries["mart_e_direction"].get().strip() or "Up"
+        for attr, key, conv in [
+            ("mart_e_window", "window", int),
+            ("mart_e_start_bet", "start_bet", float),
+            ("mart_e_max_bet", "max_bet", float),
+            ("mart_e_max_streak", "max_streak", int),
+            ("mart_e_poll", "poll_seconds", int),
+            ("mart_e_price_min", "price_min", float),
+            ("mart_e_price_max", "price_max", float),
+            ("mart_e_max_entry", "max_entry_seconds", int),
+        ]:
+            try:
+                s[key] = conv(self._mart_entries[attr].get().strip())
+            except (ValueError, TypeError):
+                pass
+        self._mart_refresh_listbox()
+        # Re-select the same index
+        if idx < self.mart_listbox.size():
+            self.mart_listbox.selection_set(idx)
+
+    def _mart_add_strategy(self):
+        """Add a new strategy with defaults."""
+        n = len(self._mart_strategies) + 1
+        self._mart_strategies.append({
+            "name": f"Strategy {n}",
+            "slug_base": "btc-updown-5m",
+            "window": 300,
+            "direction": "Up",
+            "start_bet": 5.0,
+            "max_bet": 0,
+            "max_streak": 0,
+            "poll_seconds": 10,
+            "price_min": 0.40,
+            "price_max": 0.55,
+            "max_entry_seconds": 60,
+        })
+        self._mart_refresh_listbox()
+        # Select the new entry
+        idx = len(self._mart_strategies) - 1
+        self.mart_listbox.selection_set(idx)
+        self._mart_selected_idx = idx
+        self._mart_on_select()
+
+    def _mart_remove_strategy(self):
+        """Remove the selected strategy."""
+        sel = self.mart_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        del self._mart_strategies[idx]
+        self._mart_selected_idx = None
+        self._mart_refresh_listbox()
+        # Clear edit fields
+        for entry in self._mart_entries.values():
+            entry.delete(0, tk.END)
+
+    def _mart_duplicate_strategy(self):
+        """Duplicate the selected strategy."""
+        sel = self.mart_listbox.curselection()
+        if not sel:
+            return
+        import copy as _copy
+        original = self._mart_strategies[sel[0]]
+        dup = _copy.deepcopy(original)
+        dup["name"] = original.get("name", "unnamed") + " (copy)"
+        self._mart_strategies.append(dup)
+        self._mart_refresh_listbox()
+        idx = len(self._mart_strategies) - 1
+        self.mart_listbox.selection_set(idx)
+        self._mart_selected_idx = idx
+        self._mart_on_select()
 
     def _build_log_tab(self, parent):
         self.log_area = scrolledtext.ScrolledText(
@@ -9517,16 +9613,29 @@ class CopyTraderGUI:
                 )
         # Martingale fields
         self.mart_enabled_var.set(self.cfg.get("martingale_enabled", False))
-        self.mart_direction_var.set(self.cfg.get("martingale_direction", "Up"))
-        self.mart_start_bet_entry.insert(0, str(self.cfg.get("martingale_start_bet", 5.0)))
-        self.mart_max_bet_entry.insert(0, str(self.cfg.get("martingale_max_bet", 0)))
-        self.mart_max_streak_entry.insert(0, str(self.cfg.get("martingale_max_streak", 0)))
-        self.mart_slug_entry.insert(0, self.cfg.get("martingale_slug_base", "btc-updown-5m"))
-        self.mart_window_entry.insert(0, str(self.cfg.get("martingale_window", 300)))
-        self.mart_poll_entry.insert(0, str(self.cfg.get("martingale_poll_seconds", 10)))
-        self.mart_price_min_entry.insert(0, str(self.cfg.get("martingale_price_min", 0.40)))
-        self.mart_price_max_entry.insert(0, str(self.cfg.get("martingale_price_max", 0.55)))
-        self.mart_max_entry_entry.insert(0, str(self.cfg.get("martingale_max_entry_seconds", 60)))
+        strategies = self.cfg.get("martingale_strategies") or []
+        if not isinstance(strategies, list) or not strategies:
+            # Backward compat: build one strategy from flat keys
+            strategies = [{
+                "name": self.cfg.get("martingale_slug_base", "btc-updown-5m"),
+                "slug_base": self.cfg.get("martingale_slug_base", "btc-updown-5m"),
+                "window": self.cfg.get("martingale_window", 300),
+                "direction": self.cfg.get("martingale_direction", "Up"),
+                "start_bet": self.cfg.get("martingale_start_bet", 5.0),
+                "max_bet": self.cfg.get("martingale_max_bet", 0),
+                "max_streak": self.cfg.get("martingale_max_streak", 0),
+                "poll_seconds": self.cfg.get("martingale_poll_seconds", 10),
+                "price_min": self.cfg.get("martingale_price_min", 0.40),
+                "price_max": self.cfg.get("martingale_price_max", 0.55),
+                "max_entry_seconds": self.cfg.get("martingale_max_entry_seconds", 60),
+            }]
+        import copy as _copy
+        self._mart_strategies = [_copy.deepcopy(s) for s in strategies]
+        self._mart_refresh_listbox()
+        if self._mart_strategies:
+            self.mart_listbox.selection_set(0)
+            self._mart_selected_idx = 0
+            self._mart_on_select()
 
     def _read_fields_to_config(self):
         self.cfg["rpc_url"] = self.rpc_entry.get().strip()
@@ -9624,75 +9733,42 @@ class CopyTraderGUI:
                 self.cfg["arb_poll_seconds"] = val
         except ValueError:
             pass
-        # Martingale fields
+        # Martingale fields — save the strategies list
         self.cfg["martingale_enabled"] = self.mart_enabled_var.get()
-        self.cfg["martingale_direction"] = self.mart_direction_var.get()
-        try:
-            val = float(self.mart_start_bet_entry.get().strip())
-            if val > 0:
-                self.cfg["martingale_start_bet"] = val
-        except ValueError:
-            pass
-        try:
-            val = float(self.mart_max_bet_entry.get().strip())
-            if val >= 0:
-                self.cfg["martingale_max_bet"] = val
-        except ValueError:
-            pass
-        try:
-            val = int(self.mart_max_streak_entry.get().strip())
-            if val >= 0:
-                self.cfg["martingale_max_streak"] = val
-        except ValueError:
-            pass
-        slug_base = self.mart_slug_entry.get().strip()
-        if slug_base:
-            self.cfg["martingale_slug_base"] = slug_base
-        try:
-            val = int(self.mart_window_entry.get().strip())
-            if val >= 30:
-                self.cfg["martingale_window"] = val
-        except ValueError:
-            pass
-        try:
-            val = int(self.mart_poll_entry.get().strip())
-            if val >= 1:
-                self.cfg["martingale_poll_seconds"] = val
-        except ValueError:
-            pass
-        try:
-            val = float(self.mart_price_min_entry.get().strip())
-            if 0 <= val < 1.0:
-                self.cfg["martingale_price_min"] = val
-        except ValueError:
-            pass
-        try:
-            val = float(self.mart_price_max_entry.get().strip())
-            if 0 < val <= 1.0:
-                self.cfg["martingale_price_max"] = val
-        except ValueError:
-            pass
-        try:
-            val = int(self.mart_max_entry_entry.get().strip())
-            if val >= 5:
-                self.cfg["martingale_max_entry_seconds"] = val
-        except ValueError:
-            pass
+        import copy as _copy
+        self.cfg["martingale_strategies"] = _copy.deepcopy(self._mart_strategies)
+        # Also keep flat keys in sync with the first strategy for backward compat
+        if self._mart_strategies:
+            s0 = self._mart_strategies[0]
+            self.cfg["martingale_direction"] = s0.get("direction", "Up")
+            self.cfg["martingale_start_bet"] = s0.get("start_bet", 5.0)
+            self.cfg["martingale_max_bet"] = s0.get("max_bet", 0)
+            self.cfg["martingale_max_streak"] = s0.get("max_streak", 0)
+            self.cfg["martingale_slug_base"] = s0.get("slug_base", "btc-updown-5m")
+            self.cfg["martingale_window"] = s0.get("window", 300)
+            self.cfg["martingale_poll_seconds"] = s0.get("poll_seconds", 10)
+            self.cfg["martingale_price_min"] = s0.get("price_min", 0.40)
+            self.cfg["martingale_price_max"] = s0.get("price_max", 0.55)
+            self.cfg["martingale_max_entry_seconds"] = s0.get("max_entry_seconds", 60)
 
     # ---- Button handlers ----
 
     def _reset_martingale_state(self):
-        """Delete martingale_state.json and reset in-memory state."""
-        try:
-            os.remove(MartingaleBot.STATE_FILE)
-        except OSError:
-            pass
-        if hasattr(self, "bot") and self.bot and hasattr(self.bot, "_martingale"):
-            mg = self.bot._martingale
-            if mg:
-                mg.reset_state()
-        self.mart_status_var.set("Martingale: state reset")
-        self._append_log("[Martingale] State reset — next run starts fresh\n")
+        """Delete all martingale state files and reset in-memory state."""
+        # Remove all martingale_state*.json files
+        import glob as _glob
+        for f in _glob.glob("martingale_state*.json"):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        # Reset running bots if any
+        mgr = getattr(self.bot, "_martingale_mgr", None) if self.bot else None
+        if mgr:
+            for mb in mgr.bots:
+                mb.reset_state()
+        self.mart_status_var.set("Martingale: all state reset")
+        self._append_log("[Martingale] All strategy states reset — next run starts fresh\n")
 
     def _toggle_pk(self):
         current = self.pk_entry.cget("show")
