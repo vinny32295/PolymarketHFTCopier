@@ -794,7 +794,9 @@ class TelegramCommandBot:
     # -- command handlers ---------------------------------------------------
 
     def _handle_command(self, text):
-        cmd = text.split()[0].lower().split("@")[0]  # strip @botname
+        parts = text.split()
+        cmd = parts[0].lower().split("@")[0]  # strip @botname
+        args = parts[1:]
         handlers = {
             "/balance": self._cmd_balance,
             "/positions": self._cmd_positions,
@@ -804,11 +806,32 @@ class TelegramCommandBot:
             "/status": self._cmd_status,
             "/help": self._cmd_help,
             "/start": self._cmd_help,
+            # -- Control commands --
+            "/stop": self._cmd_stop,
+            "/pause": self._cmd_pause,
+            "/resume": self._cmd_resume,
+            "/kill": self._cmd_kill,
+            # -- Toggles --
+            "/toggle_arb": self._cmd_toggle_arb,
+            "/toggle_martingale": self._cmd_toggle_martingale,
+            "/toggle_copy": self._cmd_toggle_copy,
+            "/dry_run": self._cmd_dry_run,
+            # -- Parameter tuning --
+            "/set_max_bet": self._cmd_set_max_bet,
+            "/set_copy_pct": self._cmd_set_copy_pct,
+            "/set_max_trade": self._cmd_set_max_trade,
+            "/set_min_edge": self._cmd_set_min_edge,
+            "/set_max_loss": self._cmd_set_max_loss,
+            "/set_exit": self._cmd_set_exit,
+            # -- Position management --
+            "/sell": self._cmd_sell,
+            "/reset_martingale": self._cmd_reset_martingale,
+            "/redeem": self._cmd_redeem,
         }
         handler = handlers.get(cmd)
         if handler:
             try:
-                handler()
+                handler(args)
             except Exception as exc:
                 self.send(f"Error: {exc}")
         else:
@@ -819,7 +842,7 @@ class TelegramCommandBot:
             return self.bot.executor
         return None
 
-    def _cmd_balance(self):
+    def _cmd_balance(self, args=None):
         executor = self._get_executor()
         if not executor:
             self.send("Bot not running — no balance data available.")
@@ -848,7 +871,7 @@ class TelegramCommandBot:
 
         self.send("\n".join(lines))
 
-    def _cmd_positions(self):
+    def _cmd_positions(self, args=None):
         executor = self._get_executor()
         if not executor:
             self.send("Bot not running — no position data available.")
@@ -902,7 +925,7 @@ class TelegramCommandBot:
         lines.append(f"\nTotal: cost ${total_cost:.2f} | value ${total_value:.2f} | {pnl_sign}${total_pnl:.2f}")
         self.send("\n".join(lines))
 
-    def _cmd_trades(self):
+    def _cmd_trades(self, args=None):
         # Try session trades first, then trade_history.json
         trades = []
         if self.bot:
@@ -982,7 +1005,7 @@ class TelegramCommandBot:
             ]
         return history
 
-    def _cmd_stats(self):
+    def _cmd_stats(self, args=None):
         """Session statistics: bets placed, W/L, win %, total return,
         plus per-strategy breakdown for martingale."""
         history = self._load_session_history()
@@ -1090,7 +1113,7 @@ class TelegramCommandBot:
 
         self.send("\n".join(lines))
 
-    def _cmd_strategies(self):
+    def _cmd_strategies(self, args=None):
         """Per-strategy diagnostic view — shows why each martingale
         strategy is or isn't betting."""
         mgr = getattr(self.bot, "_martingale_mgr", None) if self.bot else None
@@ -1141,7 +1164,7 @@ class TelegramCommandBot:
 
         self.send("\n".join(lines))
 
-    def _cmd_status(self):
+    def _cmd_status(self, args=None):
         running = self.bot.running if self.bot else False
         lines = [f"BOT STATUS: {'RUNNING' if running else 'STOPPED'}"]
 
@@ -1182,17 +1205,525 @@ class TelegramCommandBot:
 
         self.send("\n".join(lines))
 
-    def _cmd_help(self):
+    def _cmd_help(self, args=None):
         self.send(
             "Polymarket Bot Commands:\n"
+            "\n"
+            "INFO\n"
             "/balance — USDC & MATIC balances\n"
             "/positions — open positions with P/L\n"
             "/trades — recent trade history\n"
             "/stats — session W/L, win %, P&L, ROI\n"
             "/strategies — per-strategy diagnostics\n"
             "/status — bot state, uptime, session info\n"
+            "\n"
+            "CONTROL\n"
+            "/stop — graceful shutdown\n"
+            "/pause — pause new trades (keeps exits running)\n"
+            "/resume — resume after pause\n"
+            "/kill — emergency kill switch\n"
+            "\n"
+            "TOGGLES\n"
+            "/toggle_arb on|off\n"
+            "/toggle_martingale on|off\n"
+            "/toggle_copy on|off\n"
+            "/dry_run on|off\n"
+            "\n"
+            "PARAMETERS\n"
+            "/set_max_bet <usdc>\n"
+            "/set_copy_pct <0-100>\n"
+            "/set_max_trade <usdc>\n"
+            "/set_min_edge <pct>\n"
+            "/set_max_loss <usdc>\n"
+            "/set_exit whale|auto\n"
+            "\n"
+            "ACTIONS\n"
+            "/sell <token_id|all> — force sell position(s)\n"
+            "/reset_martingale [strategy] — reset streak & bet\n"
+            "/redeem — scan & redeem resolved positions\n"
             "/help — this message"
         )
+
+    # -------------------------------------------------------------------
+    # Control commands
+    # -------------------------------------------------------------------
+
+    def _cmd_stop(self, args=None):
+        """Graceful shutdown — stops all subsystems, lets active bets settle."""
+        if not self.bot:
+            self.send("No bot instance.")
+            return
+        if not self.bot.running:
+            self.send("Bot is already stopped.")
+            return
+        self.send("Stopping bot gracefully...")
+        self.bot.stop()
+
+    def _cmd_pause(self, args=None):
+        """Pause new trade detection without full shutdown."""
+        if not self.bot:
+            self.send("No bot instance.")
+            return
+        if not self.bot.running:
+            self.send("Bot is not running.")
+            return
+        if self.bot._paused_low_balance:
+            self.send("Already paused.")
+            return
+        self.bot._paused_low_balance = True
+        self.logger.info("MANUAL PAUSE via Telegram")
+        self.send(
+            "PAUSED — no new trades will be placed.\n"
+            "Exit checks & redemptions still running.\n"
+            "Use /resume to continue."
+        )
+
+    def _cmd_resume(self, args=None):
+        """Resume trading after a manual pause."""
+        if not self.bot:
+            self.send("No bot instance.")
+            return
+        if not self.bot.running:
+            self.send("Bot is not running.")
+            return
+        if not self.bot._paused_low_balance:
+            self.send("Bot is not paused.")
+            return
+        self.bot._paused_low_balance = False
+        self.logger.info("MANUAL RESUME via Telegram")
+        self.send("RESUMED — trading is active.")
+
+    def _cmd_kill(self, args=None):
+        """Emergency kill switch — stops everything immediately."""
+        if not self.bot:
+            self.send("No bot instance.")
+            return
+        executor = self._get_executor()
+        if executor:
+            executor.kill_switch_triggered = True
+        self.send("KILL SWITCH ACTIVATED — stopping all trading.")
+        self.logger.critical("KILL SWITCH triggered via Telegram")
+        self.bot.stop()
+
+    # -------------------------------------------------------------------
+    # Toggle commands
+    # -------------------------------------------------------------------
+
+    def _cmd_toggle_arb(self, args):
+        """Toggle arbitrage on/off.  Usage: /toggle_arb on|off"""
+        if not self.bot:
+            self.send("No bot instance.")
+            return
+        if not args:
+            cur = self.bot.cfg.get("arb_enabled", False)
+            self.send(f"Arbitrage is {'ON' if cur else 'OFF'}.\nUsage: /toggle_arb on|off")
+            return
+        val = args[0].lower()
+        if val not in ("on", "off"):
+            self.send("Usage: /toggle_arb on|off")
+            return
+        new_val = val == "on"
+        self.bot.cfg["arb_enabled"] = new_val
+        save_user_config(self.bot.cfg)
+        self.send(f"Arbitrage {'ENABLED' if new_val else 'DISABLED'}.")
+
+    def _cmd_toggle_martingale(self, args):
+        """Toggle martingale on/off.  Usage: /toggle_martingale on|off"""
+        if not self.bot:
+            self.send("No bot instance.")
+            return
+        if not args:
+            cur = self.bot.cfg.get("martingale_enabled", False)
+            self.send(
+                f"Martingale is {'ON' if cur else 'OFF'}.\n"
+                "Usage: /toggle_martingale on|off"
+            )
+            return
+        val = args[0].lower()
+        if val not in ("on", "off"):
+            self.send("Usage: /toggle_martingale on|off")
+            return
+        new_val = val == "on"
+        self.bot.cfg["martingale_enabled"] = new_val
+        save_user_config(self.bot.cfg)
+        self.send(f"Martingale {'ENABLED' if new_val else 'DISABLED'}.")
+
+    def _cmd_toggle_copy(self, args):
+        """Toggle copy trading on/off.  Usage: /toggle_copy on|off
+
+        Stores watched_addresses in _watched_addresses_backup when
+        toggling off so they can be restored with /toggle_copy on.
+        """
+        if not self.bot:
+            self.send("No bot instance.")
+            return
+        if not args:
+            cur = bool(self.bot.cfg.get("watched_addresses"))
+            self.send(
+                f"Copy trading is {'ON' if cur else 'OFF'}.\n"
+                "Usage: /toggle_copy on|off"
+            )
+            return
+        val = args[0].lower()
+        if val not in ("on", "off"):
+            self.send("Usage: /toggle_copy on|off")
+            return
+        if val == "off":
+            addrs = self.bot.cfg.get("watched_addresses", [])
+            if addrs:
+                self.bot._watched_addresses_backup = list(addrs)
+                self.bot.cfg["watched_addresses"] = []
+                save_user_config(self.bot.cfg)
+                self.send(
+                    f"Copy trading DISABLED ({len(addrs)} address(es) backed up).\n"
+                    "Use /toggle_copy on to restore."
+                )
+            else:
+                self.send("Copy trading is already off.")
+        else:
+            backup = getattr(self.bot, "_watched_addresses_backup", None)
+            current = self.bot.cfg.get("watched_addresses", [])
+            if current:
+                self.send(
+                    f"Copy trading already on ({len(current)} address(es))."
+                )
+            elif backup:
+                self.bot.cfg["watched_addresses"] = backup
+                save_user_config(self.bot.cfg)
+                self.send(
+                    f"Copy trading ENABLED — restored {len(backup)} address(es)."
+                )
+            else:
+                self.send(
+                    "No addresses to restore. Add watched_addresses "
+                    "to config.json manually."
+                )
+
+    def _cmd_dry_run(self, args):
+        """Toggle dry-run mode.  Usage: /dry_run on|off"""
+        if not self.bot:
+            self.send("No bot instance.")
+            return
+        if not args:
+            cur = self.bot.cfg.get("dry_run", False)
+            self.send(f"Dry run is {'ON' if cur else 'OFF'}.\nUsage: /dry_run on|off")
+            return
+        val = args[0].lower()
+        if val not in ("on", "off"):
+            self.send("Usage: /dry_run on|off")
+            return
+        new_val = val == "on"
+        self.bot.cfg["dry_run"] = new_val
+        save_user_config(self.bot.cfg)
+        self.send(f"Dry run {'ENABLED' if new_val else 'DISABLED'}.")
+
+    # -------------------------------------------------------------------
+    # Parameter tuning commands
+    # -------------------------------------------------------------------
+
+    def _cmd_set_max_bet(self, args):
+        """Set martingale max bet cap.  Usage: /set_max_bet <usdc>"""
+        if not self.bot:
+            self.send("No bot instance.")
+            return
+        if not args:
+            cur = self.bot.cfg.get("martingale_max_bet", 0)
+            self.send(
+                f"Current max bet: ${cur:.2f} (0 = no limit)\n"
+                "Usage: /set_max_bet <usdc>"
+            )
+            return
+        try:
+            val = float(args[0])
+        except ValueError:
+            self.send("Invalid number. Usage: /set_max_bet <usdc>")
+            return
+        if val < 0:
+            self.send("Max bet cannot be negative.")
+            return
+        self.bot.cfg["martingale_max_bet"] = val
+        # Also update per-strategy dicts so _scfg picks it up immediately
+        mgr = getattr(self.bot, "_martingale_mgr", None)
+        if mgr:
+            for mb in mgr.bots:
+                mb.strategy["max_bet"] = val
+        save_user_config(self.bot.cfg)
+        label = f"${val:.2f}" if val > 0 else "unlimited"
+        self.send(f"Martingale max bet set to {label}.")
+
+    def _cmd_set_copy_pct(self, args):
+        """Set copy trade percentage.  Usage: /set_copy_pct <0-100>"""
+        if not self.bot:
+            self.send("No bot instance.")
+            return
+        if not args:
+            cur = self.bot.cfg.get("copy_percentage", 50)
+            self.send(f"Current copy %: {cur}%\nUsage: /set_copy_pct <0-100>")
+            return
+        try:
+            val = float(args[0])
+        except ValueError:
+            self.send("Invalid number. Usage: /set_copy_pct <0-100>")
+            return
+        if val < 0 or val > 100:
+            self.send("Value must be between 0 and 100.")
+            return
+        self.bot.cfg["copy_percentage"] = val
+        save_user_config(self.bot.cfg)
+        executor = self._get_executor()
+        if executor:
+            executor.copy_pct = Decimal(str(val)) / Decimal("100")
+        self.send(f"Copy percentage set to {val:.0f}%.")
+
+    def _cmd_set_max_trade(self, args):
+        """Set max trade size in USDC.  Usage: /set_max_trade <usdc>"""
+        if not self.bot:
+            self.send("No bot instance.")
+            return
+        if not args:
+            cur = self.bot.cfg.get("max_trade_usdc", 100)
+            self.send(f"Current max trade: ${cur:.2f}\nUsage: /set_max_trade <usdc>")
+            return
+        try:
+            val = float(args[0])
+        except ValueError:
+            self.send("Invalid number. Usage: /set_max_trade <usdc>")
+            return
+        if val <= 0:
+            self.send("Max trade must be positive.")
+            return
+        self.bot.cfg["max_trade_usdc"] = val
+        save_user_config(self.bot.cfg)
+        executor = self._get_executor()
+        if executor:
+            executor.max_trade = Decimal(str(val))
+        self.send(f"Max trade size set to ${val:.2f}.")
+
+    def _cmd_set_min_edge(self, args):
+        """Set arb minimum edge %.  Usage: /set_min_edge <pct>"""
+        if not self.bot:
+            self.send("No bot instance.")
+            return
+        if not args:
+            cur = self.bot.cfg.get("arb_min_edge_pct", 1.0)
+            self.send(f"Current min edge: {cur}%\nUsage: /set_min_edge <pct>")
+            return
+        try:
+            val = float(args[0])
+        except ValueError:
+            self.send("Invalid number. Usage: /set_min_edge <pct>")
+            return
+        if val < 0:
+            self.send("Min edge cannot be negative.")
+            return
+        self.bot.cfg["arb_min_edge_pct"] = val
+        save_user_config(self.bot.cfg)
+        self.send(f"Arb min edge set to {val:.2f}%.")
+
+    def _cmd_set_max_loss(self, args):
+        """Set session max loss for kill switch.  Usage: /set_max_loss <usdc>"""
+        if not self.bot:
+            self.send("No bot instance.")
+            return
+        if not args:
+            cur = self.bot.cfg.get("max_loss_usdc", 0)
+            self.send(
+                f"Current max loss: ${cur:.2f} (0 = disabled)\n"
+                "Usage: /set_max_loss <usdc>"
+            )
+            return
+        try:
+            val = float(args[0])
+        except ValueError:
+            self.send("Invalid number. Usage: /set_max_loss <usdc>")
+            return
+        if val < 0:
+            self.send("Max loss cannot be negative.")
+            return
+        self.bot.cfg["max_loss_usdc"] = val
+        save_user_config(self.bot.cfg)
+        label = f"${val:.2f}" if val > 0 else "disabled"
+        self.send(f"Kill switch max loss set to {label}.")
+
+    def _cmd_set_exit(self, args):
+        """Set exit mode.  Usage: /set_exit whale|auto"""
+        if not self.bot:
+            self.send("No bot instance.")
+            return
+        if not args:
+            cur = self.bot.cfg.get("exit_mode", "whale")
+            self.send(f"Current exit mode: {cur}\nUsage: /set_exit whale|auto")
+            return
+        val = args[0].lower()
+        if val not in ("whale", "auto"):
+            self.send("Usage: /set_exit whale|auto")
+            return
+        self.bot.cfg["exit_mode"] = val
+        save_user_config(self.bot.cfg)
+        desc = (
+            "whale (hold until resolution/whale sell)"
+            if val == "whale" else
+            "auto (take-profit & stop-loss active)"
+        )
+        self.send(f"Exit mode set to {desc}.")
+
+    # -------------------------------------------------------------------
+    # Position management commands
+    # -------------------------------------------------------------------
+
+    def _cmd_sell(self, args):
+        """Force sell a position.  Usage: /sell <token_id|all>"""
+        executor = self._get_executor()
+        if not executor:
+            self.send("Bot not running — cannot sell.")
+            return
+        if not args:
+            self.send("Usage: /sell <token_id|all>\nUse /positions to see token IDs.")
+            return
+        if self.bot.cfg.get("dry_run", False):
+            self.send("Cannot sell in dry-run mode.")
+            return
+        target = args[0].lower()
+        positions = dict(executor._positions)
+        if not positions:
+            self.send("No open positions.")
+            return
+
+        if target == "all":
+            self.send(f"Force selling {len(positions)} position(s)...")
+            sold = 0
+            for token_id, pos in list(positions.items()):
+                ok = self._force_sell_position(executor, token_id, pos)
+                if ok:
+                    sold += 1
+            self.send(f"Sold {sold}/{len(positions)} positions.")
+        else:
+            # Match by full token_id or prefix
+            match = None
+            for tid in positions:
+                if tid == target or tid.startswith(target):
+                    match = tid
+                    break
+            if not match:
+                self.send(f"No position found matching '{target}'.")
+                return
+            pos = positions[match]
+            market = pos.get("market_name") or match[:16] + "..."
+            self.send(f"Force selling {market}...")
+            ok = self._force_sell_position(executor, match, pos)
+            if ok:
+                self.send(f"Sell submitted for {market}.")
+            else:
+                self.send(f"Failed to sell {market}. Check logs.")
+
+    def _force_sell_position(self, executor, token_id, pos):
+        """Place a market sell for a single position. Returns True on success."""
+        tokens = pos.get("tokens", Decimal("0"))
+        if tokens <= 0:
+            return False
+        try:
+            price = executor.clob_client.get_last_trade_price(token_id)
+            if price is None:
+                price = float(pos.get("entry_price", 0.5))
+            price_d = Decimal(str(price))
+            sell_usdc = float(tokens * price_d)
+            slippage_mult = Decimal(str(executor.slippage_bps)) / Decimal("10000")
+            adjusted = float(price_d * (Decimal("1") - slippage_mult))
+            adjusted = max(adjusted, 0.01)
+            neg_risk = pos.get("neg_risk", False)
+            executor.ensure_ct_approval(neg_risk=neg_risk)
+            result = executor.clob_client.place_order(
+                token_id=token_id,
+                side="SELL",
+                size_usdc=sell_usdc,
+                price=adjusted,
+            )
+            if result:
+                executor._log_closed_trade(
+                    token_id, pos.get("entry_price", 0), price_d,
+                    tokens, "manual_sell",
+                    market=pos.get("market_name"),
+                )
+                if token_id in executor._positions:
+                    del executor._positions[token_id]
+                executor._save_positions()
+                executor.invalidate_balance_cache()
+                return True
+        except Exception as exc:
+            self.logger.error("Force sell failed for %s: %s", token_id[:16], exc)
+        return False
+
+    def _cmd_reset_martingale(self, args):
+        """Reset martingale streak & bet.  Usage: /reset_martingale [strategy]"""
+        if not self.bot:
+            self.send("No bot instance.")
+            return
+        mgr = getattr(self.bot, "_martingale_mgr", None)
+        if not mgr or not mgr.bots:
+            self.send("No martingale strategies running.")
+            return
+        if not args:
+            # Reset all strategies
+            for mb in mgr.bots:
+                mb.reset_state()
+            self.send(
+                f"Reset {len(mgr.bots)} martingale strateg"
+                f"{'y' if len(mgr.bots) == 1 else 'ies'}."
+            )
+            return
+        # Reset a specific strategy by name
+        target = " ".join(args).lower()
+        matched = None
+        for mb in mgr.bots:
+            if mb.strategy_name.lower() == target:
+                matched = mb
+                break
+        if not matched:
+            names = ", ".join(mb.strategy_name for mb in mgr.bots)
+            self.send(f"Strategy '{target}' not found.\nAvailable: {names}")
+            return
+        matched.reset_state()
+        self.send(
+            f"Reset [{matched.strategy_name}] — "
+            f"bet=${matched.current_bet:.2f}, streak=0."
+        )
+
+    def _cmd_redeem(self, args=None):
+        """Scan for old resolved positions and redeem to EOA wallet."""
+        executor = self._get_executor()
+        if not executor:
+            self.send("Bot not running — cannot redeem.")
+            return
+        self.send("Scanning for redeemable positions...")
+        # Run the full portfolio scan in a background thread to avoid
+        # blocking the Telegram polling loop.
+        def _do_redeem():
+            try:
+                results = executor.scan_and_redeem_portfolio()
+                # Also try proxy wallet if configured
+                proxy_results = []
+                if self.bot.cfg.get("proxy_redeem", False):
+                    try:
+                        proxy_results = executor.scan_and_redeem_proxy_portfolio()
+                    except Exception as exc:
+                        self.logger.error("Proxy redeem scan failed: %s", exc)
+                eoa_count = len(results) if results else 0
+                proxy_count = len(proxy_results) if proxy_results else 0
+                total = eoa_count + proxy_count
+                if total > 0:
+                    lines = [f"Redeemed {total} position(s):"]
+                    for r in (results or []):
+                        pnl = r.get("pnl_usdc", 0)
+                        market = r.get("market", r.get("token_id", "?")[:20])
+                        lines.append(f"  {market}: ${pnl:+,.2f}")
+                    if proxy_count:
+                        lines.append(f"  + {proxy_count} proxy position(s)")
+                    self.send("\n".join(lines))
+                else:
+                    self.send("No redeemable positions found.")
+            except Exception as exc:
+                self.send(f"Redeem scan failed: {exc}")
+        threading.Thread(target=_do_redeem, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
