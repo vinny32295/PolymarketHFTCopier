@@ -1750,6 +1750,10 @@ class ArbitrageMonitor(threading.Thread):
         self.logger = logger or logging.getLogger("CopyTrader")
         self._stop_event = threading.Event()
 
+        # Lock protects _markets and _current_window_ts from concurrent
+        # access between _resolve_dynamic_slug() and _scan_cycle().
+        self._market_lock = threading.Lock()
+
         # condition_id -> {"yes_token": str, "no_token": str, "question": str}
         self._markets = {}
         # condition_id -> {"yes_fill": {...}, "no_fill": {...}, "cost": float, "ts": str}
@@ -1974,19 +1978,20 @@ class ArbitrageMonitor(threading.Thread):
             label0, label1 = outcome_labels[0], outcome_labels[1]
             question = market.get("question") or event.get("title") or slug
 
-            # Clear previous window's market(s) so we only track the current one
-            old_keys = [k for k in self._markets if k != cid]
-            for k in old_keys:
-                del self._markets[k]
-
-            self._markets[cid] = {
-                "yes_token": tid0,
-                "no_token": tid1,
-                "yes_label": label0,
-                "no_label": label1,
-                "question": question,
+            # Atomically swap in the new market so _scan_cycle() never
+            # sees a half-updated dict or iterates during mutation.
+            new_market = {
+                cid: {
+                    "yes_token": tid0,
+                    "no_token": tid1,
+                    "yes_label": label0,
+                    "no_label": label1,
+                    "question": question,
+                }
             }
-            self._current_window_ts = window_ts
+            with self._market_lock:
+                self._markets = new_market
+                self._current_window_ts = window_ts
             self._last_failed_window_ts = 0
             self.logger.info(
                 "Arb dynamic: resolved '%s' — %s=%s... / %s=%s... (window %d)",
@@ -2051,7 +2056,15 @@ class ArbitrageMonitor(threading.Thread):
         max_positions = self.cfg.get("arb_max_positions", 5)
         dry_run = self.cfg.get("dry_run", False)
 
-        for cid, mkt in self._markets.items():
+        # Snapshot markets under lock so we iterate a stable copy.
+        # Capture the wall-clock window timestamp for staleness checks
+        # (only relevant when using dynamic rotating markets).
+        is_dynamic = bool(self.cfg.get("arb_dynamic_slug", "").strip())
+        with self._market_lock:
+            markets_snapshot = dict(self._markets)
+        window_at_scan_start = self._get_dynamic_window_ts() if is_dynamic else 0
+
+        for cid, mkt in markets_snapshot.items():
             # Respect max positions
             if len(self._active_positions) >= max_positions:
                 break
@@ -2126,10 +2139,51 @@ class ArbitrageMonitor(threading.Thread):
                 self.logger.info("ARB DRY RUN — would buy both sides (skipping)")
                 continue
 
+            # Guard: abort if the 5-min window boundary has passed since we
+            # started this scan cycle.  The condition_id and token IDs from our
+            # snapshot belong to the *previous* window and Polymarket may have
+            # already created the next market — placing orders now would hit
+            # an expired/closing market.
+            if is_dynamic and self._get_dynamic_window_ts() != window_at_scan_start:
+                self.logger.warning(
+                    "ARB SKIPPED: window rotated during scan (%d -> %d) — "
+                    "aborting stale order for %s",
+                    window_at_scan_start, self._get_dynamic_window_ts(),
+                    mkt["question"][:40],
+                )
+                continue
+
             # Execute both legs
             yes_result = self._place_arb_leg(
                 yes_token, best_ask_yes, usdc_yes, mkt["yes_label"],
             )
+
+            # Guard between legs: if window rotated after first leg, do NOT
+            # place the second leg (it would target a different market).
+            if is_dynamic and self._get_dynamic_window_ts() != window_at_scan_start:
+                self.logger.warning(
+                    "ARB ABORTED BETWEEN LEGS: window rotated after %s leg "
+                    "filled — skipping %s leg to avoid cross-market position. "
+                    "%s leg result: %s",
+                    mkt["yes_label"], mkt["no_label"],
+                    mkt["yes_label"],
+                    "OK" if yes_result else "FAILED",
+                )
+                # Track the single-leg fill so we know about it
+                if yes_result:
+                    self._active_positions[cid] = {
+                        "question": mkt["question"],
+                        "yes_fill": yes_result,
+                        "no_fill": None,
+                        "total_cost": usdc_yes,
+                        "locked_profit": 0,
+                        "edge_pct": 0,
+                        "partial": True,
+                        "ts": datetime.now().isoformat(),
+                    }
+                    self._save_positions()
+                continue
+
             no_result = self._place_arb_leg(
                 no_token, best_ask_no, usdc_no, mkt["no_label"],
             )
@@ -2156,6 +2210,18 @@ class ArbitrageMonitor(threading.Thread):
                     "OK" if yes_result else "FAILED",
                     "OK" if no_result else "FAILED",
                 )
+                # Track partial fills so they aren't silently lost
+                self._active_positions[cid] = {
+                    "question": mkt["question"],
+                    "yes_fill": yes_result,
+                    "no_fill": no_result,
+                    "total_cost": (usdc_yes if yes_result else 0) + (usdc_no if no_result else 0),
+                    "locked_profit": 0,
+                    "edge_pct": round(edge_pct, 4),
+                    "partial": True,
+                    "ts": datetime.now().isoformat(),
+                }
+                self._save_positions()
 
     def _place_arb_leg(self, token_id, price, size_usdc, label):
         """Place a single FOK buy order for one side of the arb."""
