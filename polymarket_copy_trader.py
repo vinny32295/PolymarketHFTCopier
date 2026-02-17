@@ -4843,7 +4843,7 @@ class TradeExecutor:
                 post_bal = self.get_usdc_balance(max_age_seconds=0)
                 exit_price = self._get_redemption_exit_price(
                     pre_bal, post_bal, pos.get("tokens", 0),
-                    pos.get("entry_price", 0),
+                    pos.get("entry_price", 0), receipt=receipt,
                 )
                 self.logger.info(
                     "Redemption OK (auto-exit %s): tx %s — exit $%.2f "
@@ -5135,13 +5135,16 @@ class TradeExecutor:
                     exit_price = self._get_redemption_exit_price(
                         pre_bal, post_bal, tokens_held,
                         pos.get("entry_price", 0) if pos else 0,
+                        receipt=receipt,
                     )
+                    receipt_payout = self._usdc_payout_from_receipt(receipt)
+                    payout_usdc = float(receipt_payout) if receipt_payout else float(post_bal - pre_bal)
                     self.logger.info(
                         "Redemption OK: tx %s — exit $%.2f "
                         "(USDC %s%.4f)",
                         receipt.transactionHash.hex(), exit_price,
-                        "+" if post_bal >= pre_bal else "",
-                        float(post_bal - pre_bal),
+                        "+" if payout_usdc >= 0 else "",
+                        payout_usdc,
                     )
                     if pos:
                         self._log_closed_trade(
@@ -5340,19 +5343,63 @@ class TradeExecutor:
             )
             return None
 
-    def _get_redemption_exit_price(self, pre_balance, post_balance,
-                                   tokens, entry_price):
-        """Compute the actual exit price from USDC balance change.
+    # ERC-20 Transfer(address,address,uint256) event topic
+    _TRANSFER_TOPIC = bytes.fromhex(
+        "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+    )
 
-        Compares USDC balance before and after a redemption transaction.
-        If the balance increased by ~tokens USDC, the position won ($1.00).
-        If the balance didn't change (or barely changed), it lost ($0.00).
+    def _usdc_payout_from_receipt(self, receipt):
+        """Extract the total USDC transferred *to* our wallet from a tx receipt.
+
+        Parses ERC-20 Transfer events emitted by the USDC contract where
+        the ``to`` address matches our wallet.  This is immune to concurrent
+        balance changes (e.g. a martingale bet spending USDC at the same time)
+        because it reads the specific transaction's logs, not a balance diff.
+
+        Returns the payout as a :class:`Decimal` in USDC (6-decimal scaled),
+        or ``None`` if no matching transfer was found.
+        """
+        usdc_addr = Web3.to_checksum_address(USDC_ADDRESS).lower()
+        wallet = self.address.lower()
+        total = 0
+        for log in receipt.get("logs", []):
+            if log["address"].lower() != usdc_addr:
+                continue
+            topics = log.get("topics", [])
+            if len(topics) < 3:
+                continue
+            if topics[0] != self._TRANSFER_TOPIC:
+                continue
+            # topics[2] is the `to` address (zero-padded to 32 bytes)
+            to_addr = "0x" + topics[2].hex()[-40:]
+            if to_addr.lower() == wallet:
+                total += int(log["data"].hex(), 16)
+        if total > 0:
+            return Decimal(total) / Decimal("1000000")
+        return None
+
+    def _get_redemption_exit_price(self, pre_balance, post_balance,
+                                   tokens, entry_price, receipt=None):
+        """Compute the actual exit price from a redemption.
+
+        Prefers parsing the USDC Transfer event from *receipt* (immune to
+        concurrent balance changes).  Falls back to the pre/post balance diff
+        if the receipt is not provided or contains no matching transfers.
         """
         tokens_f = float(tokens) if isinstance(tokens, Decimal) else tokens
-        balance_diff = float(post_balance - pre_balance)
 
         if tokens_f <= 0:
             return 0.0
+
+        # Primary: use receipt logs (race-free)
+        if receipt is not None:
+            payout = self._usdc_payout_from_receipt(receipt)
+            if payout is not None:
+                payout_per_token = float(payout) / tokens_f
+                return 1.0 if payout_per_token >= 0.5 else 0.0
+
+        # Fallback: balance diff (may be inaccurate under concurrency)
+        balance_diff = float(post_balance - pre_balance)
 
         # Compute per-token payout
         payout_per_token = balance_diff / tokens_f if tokens_f > 0 else 0
@@ -5546,14 +5593,16 @@ class TradeExecutor:
                     post_bal = self.get_usdc_balance(max_age_seconds=0)
                     exit_price = self._get_redemption_exit_price(
                         pre_bal, post_bal, pos.get("tokens", 0),
-                        pos.get("entry_price", 0),
+                        pos.get("entry_price", 0), receipt=receipt,
                     )
+                    receipt_payout = self._usdc_payout_from_receipt(receipt)
+                    payout_usdc = float(receipt_payout) if receipt_payout else float(post_bal - pre_bal)
                     self.logger.info(
                         "Redemption confirmed: tx %s — exit $%.2f "
                         "(USDC %s%.4f)",
                         receipt.transactionHash.hex(), exit_price,
-                        "+" if post_bal >= pre_bal else "",
-                        float(post_bal - pre_bal),
+                        "+" if payout_usdc >= 0 else "",
+                        payout_usdc,
                     )
                     self._log_closed_trade(
                         token_id, pos.get("entry_price", 0), exit_price,
