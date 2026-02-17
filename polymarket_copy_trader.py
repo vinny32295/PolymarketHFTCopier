@@ -945,13 +945,21 @@ class TelegramCommandBot:
         recent = trades[-10:]  # last 10
         lines = [f"RECENT TRADES (last {len(recent)} of {len(trades)})"]
         for t in reversed(recent):
-            is_mart = t.get("reason") == "martingale"
-            if is_mart:
-                label = t.get("market", "martingale")
+            # Three record types:
+            #  1) Copy trade result (in-memory): has side, amount_usdc, price
+            #  2) Closed/resolved position (_log_closed_trade): has market,
+            #     entry_price, cost_basis_usdc, outcome
+            #  3) Martingale (_log_bet): like #2 but reason="martingale"
+            has_entry = "entry_price" in t or "cost_basis_usdc" in t
+            if has_entry:
+                # Types 2 & 3: resolved positions and martingale
+                outcome = t.get("outcome", "")
+                label = t.get("market", outcome or "closed")
                 amount = t.get("cost_basis_usdc", 0)
                 price = t.get("entry_price", 0)
                 ts = t.get("closed_at", "")
             else:
+                # Type 1: in-memory copy trade result
                 label = t.get("side", "?")
                 amount = t.get("amount_usdc", t.get("cost", 0))
                 price = t.get("price", 0)
@@ -4649,9 +4657,12 @@ class MartingaleBot(threading.Thread):
             actual_shares, self.consecutive_losses, slip_tag,
         )
         if self.notify_callback:
+            tg_slip = ""
+            if abs(slippage) >= 0.0001:
+                tg_slip = f" | slip {slippage:+.4f}"
             self.notify_callback(
                 f"{self.strategy_name} BET ${actual_cost:.2f} "
-                f"@ ${fill_price:.4f} "
+                f"@ ${fill_price:.4f}{tg_slip} "
                 f"| streak: {self.consecutive_losses}"
             )
         return True
@@ -4674,8 +4685,11 @@ class MartingaleBot(threading.Thread):
 
         self._log_bet(bet, won=True, profit=profit)
         if self.notify_callback:
+            tg_slip = ""
+            if abs(slip) >= 0.0001:
+                tg_slip = f" | fill ${bet.get('fill_price', 0):.4f} slip {slip:+.4f}"
             self.notify_callback(
-                f"{self.strategy_name} WIN +${profit:.4f} | "
+                f"{self.strategy_name} WIN +${profit:.4f}{tg_slip} | "
                 f"reset to ${self.start_bet:.2f}"
             )
 
@@ -4730,8 +4744,11 @@ class MartingaleBot(threading.Thread):
 
         self._log_bet(bet, won=False, profit=-loss)
         if self.notify_callback:
+            tg_slip = ""
+            if abs(slip) >= 0.0001:
+                tg_slip = f" | fill ${bet.get('fill_price', 0):.4f} slip {slip:+.4f}"
             self.notify_callback(
-                f"{self.strategy_name} LOSS -${loss:.2f} | "
+                f"{self.strategy_name} LOSS -${loss:.2f}{tg_slip} | "
                 f"next ${self.current_bet:.2f} (streak: {self.consecutive_losses})"
             )
 
@@ -8882,11 +8899,10 @@ class CopyTraderBot:
                                 self._save_session_trades()
                                 if result.get("status") == "submitted":
                                     self._notify(
-                                        "TRADE %s $%.2f @ %.4f (whale @ %.4f) — %s" % (
+                                        "TRADE %s $%.2f @ $%.4f — %s" % (
                                             result.get("side", "?"),
                                             result.get("amount_usdc", 0),
                                             result.get("price", 0),
-                                            result.get("whale_price", 0),
                                             result.get("token_id", "")[:16] + "...",
                                         )
                                     )
