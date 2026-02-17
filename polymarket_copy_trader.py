@@ -945,18 +945,27 @@ class TelegramCommandBot:
         recent = trades[-10:]  # last 10
         lines = [f"RECENT TRADES (last {len(recent)} of {len(trades)})"]
         for t in reversed(recent):
-            side = t.get("side", "?")
-            amount = t.get("amount_usdc", t.get("cost", 0))
-            price = t.get("price", 0)
-            ts = t.get("timestamp", t.get("ts", ""))
-            status = t.get("status", "")
-            pnl = t.get("pnl_usdc", "")
+            is_mart = t.get("reason") == "martingale"
+            if is_mart:
+                label = t.get("market", "martingale")
+                amount = t.get("cost_basis_usdc", 0)
+                price = t.get("entry_price", 0)
+                ts = t.get("closed_at", "")
+            else:
+                label = t.get("side", "?")
+                amount = t.get("amount_usdc", t.get("cost", 0))
+                price = t.get("price", 0)
+                ts = t.get("timestamp", t.get("ts", ""))
 
-            line = f"  {side} ${float(amount):,.2f} @ {float(price):.4f}"
+            pnl = t.get("pnl_usdc", "")
+            line = f"  {label} ${float(amount):,.2f} @ ${float(price):.4f}"
             if pnl:
                 line += f" | P/L ${float(pnl):+.2f}"
+            slip = t.get("slippage") or {}
+            vs_fair = slip.get("vs_fair", 0)
+            if vs_fair:
+                line += f" | slip {vs_fair:+.4f}"
             if ts:
-                # Show just time portion
                 ts_short = str(ts).split("T")[-1][:8] if "T" in str(ts) else str(ts)[-8:]
                 line += f" [{ts_short}]"
             lines.append(line)
@@ -1072,11 +1081,15 @@ class TelegramCommandBot:
             lines += ["", "MARTINGALE"]
             for name, records in strat_buckets.items():
                 s = self._bucket_stats(records)
+                sl = MartingaleBot._aggregate_slippage(records)
+                slip_tag = ""
+                if sl["avg_fill_price"] > 0:
+                    slip_tag = f"  |  avg fill ${sl['avg_fill_price']:.3f} slip ${sl['total_slippage_usdc']:+,.2f}"
                 lines.append(
                     f"  [{name}]  {s['n']} bets  |  "
                     f"W/L {s['wins']}/{s['losses']} ({s['win_pct']:.0f}%)  |  "
                     f"P&L ${s['pnl']:+,.2f}  |  "
-                    f"deployed ${s['cost']:,.2f}"
+                    f"deployed ${s['cost']:,.2f}{slip_tag}"
                 )
 
             # Live bot state (current bet, streak)
@@ -1149,7 +1162,7 @@ class TelegramCommandBot:
                 time_left = bet["window_end"] - now
                 lines.append(
                     f"  ACTIVE: {bet['direction']} ${bet['cost']:.2f} "
-                    f"@ ${bet['price']:.4f}  |  "
+                    f"@ ${bet.get('fill_price', 0):.4f}  |  "
                     f"resolves in {max(time_left, 0)}s"
                 )
             elif mb._skip_reason:
