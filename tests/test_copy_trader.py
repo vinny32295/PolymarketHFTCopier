@@ -3022,6 +3022,8 @@ class TestMartingaleBot(unittest.TestCase):
         mb.cfg = cfg
         mb.logger = logger
         mb._stop_event = MagicMock()
+        mb.strategy = cfg_overrides or {}
+        mb.strategy_name = mb.strategy.get("name", "default")
         mb.start_bet = cfg["martingale_start_bet"]
         mb.current_bet = cfg["martingale_start_bet"]
         mb.direction = cfg["martingale_direction"]
@@ -3031,6 +3033,9 @@ class TestMartingaleBot(unittest.TestCase):
         mb._bet_history = []
         mb._last_window_ts = 0
         mb._next_window_cache = None
+        mb._skip_reason = None
+        mb._windows_attempted = 0
+        mb._windows_no_market = 0
         mb.notify_callback = None
         mb.log_trade_callback = None
         return mb
@@ -3386,6 +3391,7 @@ class TestMartingaleBot(unittest.TestCase):
     def test_handle_loss_caps_at_max_bet(self):
         mb = self._make_bot({"martingale_max_bet": 15.0})
         mb.current_bet = 10.0
+        mb.consecutive_losses = 1  # simulate one prior loss
         bet = {
             "direction": "Up",
             "shares": 20.0,
@@ -3395,7 +3401,8 @@ class TestMartingaleBot(unittest.TestCase):
             "token_id": "tok_up",
         }
         mb._handle_loss(bet)
-        self.assertEqual(mb.current_bet, 15.0)  # capped, not 20.0
+        # geometric: 5.0 * 2^2 = 20.0, capped at 15.0
+        self.assertEqual(mb.current_bet, 15.0)
 
     def test_martingale_sequence(self):
         """Simulate: lose, lose, win — verify correct bet progression."""
@@ -3426,6 +3433,25 @@ class TestMartingaleBot(unittest.TestCase):
         self.assertEqual(mb.consecutive_losses, 0)
         # P&L: -5 -10 + (40-20) = +5
         self.assertAlmostEqual(mb.session_pnl, 5.0)
+
+    def test_martingale_geometric_ignores_cost_drift(self):
+        """Bet size must follow start_bet × 2^n even when exchange bumps cost."""
+        mb = self._make_bot()
+        # start_bet = 5.0, but exchange bumped actual cost to 5.20
+        mb._handle_loss({
+            "direction": "Up", "shares": 10.0, "cost": 5.20,
+            "bet_size": 5.0, "question": "BTC?", "token_id": "t1",
+        })
+        # Should be 5.0 × 2^1 = 10.0, NOT 5.20 × 2 = 10.40
+        self.assertEqual(mb.current_bet, 10.0)
+
+        # Second loss: exchange bumps cost again
+        mb._handle_loss({
+            "direction": "Up", "shares": 20.0, "cost": 10.40,
+            "bet_size": 10.0, "question": "BTC?", "token_id": "t1",
+        })
+        # Should be 5.0 × 2^2 = 20.0, NOT 10.40 × 2 = 20.80
+        self.assertEqual(mb.current_bet, 20.0)
 
     # -- resolution detection --
 
@@ -3624,7 +3650,7 @@ class TestMartingaleBot(unittest.TestCase):
         mb._log_bet(bet, won=True, profit=5.0)
         callback.assert_called_once()
         record = callback.call_args[0][0]
-        self.assertEqual(record["outcome"], "win")
+        self.assertEqual(record["outcome"], "won")
         self.assertEqual(record["reason"], "martingale")
         self.assertEqual(record["pnl_usdc"], 5.0)
 

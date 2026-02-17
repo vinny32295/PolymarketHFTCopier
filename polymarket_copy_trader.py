@@ -3923,6 +3923,19 @@ class MartingaleBot(threading.Thread):
         now = int(time.time())
         seconds_into = now - current_window_ts
 
+        # Skip if too far into the current window
+        max_entry = int(self._scfg(
+            "max_entry_seconds", "martingale_max_entry_seconds", 60,
+        ))
+        if max_entry > 0 and seconds_into > max_entry:
+            self.logger.info(
+                "MARTINGALE [%s]: %ds into window > max_entry %ds — skipping",
+                self.strategy_name, seconds_into, max_entry,
+            )
+            self._skip_reason = f"too late ({seconds_into}s > {max_entry}s)"
+            self._last_window_ts = current_window_ts
+            return False
+
         # Allow runtime direction toggle via config (must happen before
         # both the cached and non-cached paths so direction is always set).
         direction = self._scfg("direction", "martingale_direction", self.direction)
@@ -4089,13 +4102,25 @@ class MartingaleBot(threading.Thread):
         loss = bet["cost"]
         self.session_pnl -= loss
         self.consecutive_losses += 1
-        # Double the ACTUAL amount risked (bet["cost"]), not the pre-bump
-        # configured size (bet["bet_size"]).  When place_order bumps a small
-        # bet to meet Polymarket minimums (e.g. $2 → $2.50 for 5-token min),
-        # the next martingale bet must cover the real loss, not the smaller
-        # intended amount.
-        actual_risked = max(bet.get("cost", 0), bet.get("bet_size", 0))
-        self.current_bet = round(actual_risked * 2, 2)
+        # Use geometric doubling from start_bet to keep the martingale
+        # progression clean and predictable: start_bet × 2^streak.
+        # Previously this doubled the actual exchange cost, which caused
+        # drift when place_order bumped the bet to meet Polymarket minimums
+        # (e.g. $2.50 bumped to $2.60 → doubled to $5.20 instead of $5.00).
+        self.current_bet = round(
+            self.start_bet * (2 ** self.consecutive_losses), 2
+        )
+
+        # Log if the actual cost diverged from intended bet size
+        actual_cost = bet.get("cost", 0)
+        intended = bet.get("bet_size", 0)
+        if actual_cost and intended and abs(actual_cost - intended) > 0.01:
+            self.logger.info(
+                "MARTINGALE [%s]: exchange cost $%.2f differed from "
+                "intended $%.2f (bumped by %.0f%% to meet minimums)",
+                self.strategy_name, actual_cost, intended,
+                ((actual_cost - intended) / intended) * 100,
+            )
 
         max_bet = float(self._scfg("max_bet", "martingale_max_bet", 0))
         if max_bet > 0 and self.current_bet > max_bet:
@@ -4105,9 +4130,10 @@ class MartingaleBot(threading.Thread):
             )
 
         self.logger.info(
-            "MARTINGALE LOSS: %s -$%.2f — doubling to $%.2f, "
-            "streak: %d | session P&L: $%.4f",
+            "MARTINGALE LOSS: %s -$%.2f — next bet $%.2f "
+            "(start $%.2f × 2^%d), streak: %d | session P&L: $%.4f",
             bet["direction"], loss, self.current_bet,
+            self.start_bet, self.consecutive_losses,
             self.consecutive_losses, self.session_pnl,
         )
 
