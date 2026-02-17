@@ -744,11 +744,38 @@ class TelegramCommandBot:
         self._last_update_id = 0
 
     def start(self):
+        if not self._verify_token():
+            return  # token invalid — don't start polling
         self._delete_webhook()
+        self._flush_old_updates()
         self._register_commands()
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
         self.logger.info("Telegram command bot started (chat_id=%s)", self.chat_id)
+        self.send("Commands active — type /help for available commands.")
+
+    def _verify_token(self):
+        """Call getMe to verify the bot token is valid."""
+        try:
+            url = TELEGRAM_API.format(token=self.token) + "/getMe"
+            resp = requests.get(url, timeout=10)
+            data = resp.json()
+            if resp.status_code == 200 and data.get("ok"):
+                bot_user = data.get("result", {})
+                self.logger.info(
+                    "Telegram bot verified: @%s (id=%s)",
+                    bot_user.get("username", "?"), bot_user.get("id", "?"),
+                )
+                return True
+            else:
+                self.logger.error(
+                    "Telegram bot token INVALID — getMe returned %d: %s",
+                    resp.status_code, resp.text[:200],
+                )
+                return False
+        except Exception as exc:
+            self.logger.error("Telegram bot token check failed: %s", exc)
+            return False
 
     def _delete_webhook(self):
         """Remove any active webhook so getUpdates polling works.
@@ -769,6 +796,33 @@ class TelegramCommandBot:
                 )
         except Exception as exc:
             self.logger.warning("Could not delete Telegram webhook: %s", exc)
+
+    def _flush_old_updates(self):
+        """Consume all pending updates so the poll loop starts fresh.
+
+        Without this, stale updates from a previous session (or a
+        competing consumer) can desync ``_last_update_id`` and cause
+        the bot to either replay old commands or silently miss new ones.
+        """
+        try:
+            base = TELEGRAM_API.format(token=self.token)
+            resp = requests.get(
+                base + "/getUpdates", params={"offset": -1, "timeout": 0},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                results = resp.json().get("result", [])
+                if results:
+                    self._last_update_id = results[-1]["update_id"]
+                    self.logger.info(
+                        "Telegram: flushed %d stale update(s), "
+                        "resuming from update_id %d",
+                        len(results), self._last_update_id,
+                    )
+                else:
+                    self.logger.info("Telegram: no stale updates to flush")
+        except Exception as exc:
+            self.logger.warning("Telegram flush failed: %s", exc)
 
     def _register_commands(self):
         """Register all commands with Telegram via setMyCommands so they
@@ -828,10 +882,9 @@ class TelegramCommandBot:
     def _poll_loop(self):
         base = TELEGRAM_API.format(token=self.token)
         _poll_err_count = 0
+        _first_success = True
         while not self._stop_event.is_set():
             try:
-                # Use a short long-poll so the thread can exit quickly
-                # when stop() is called (at most ~5s lag).
                 resp = requests.get(
                     base + "/getUpdates",
                     params={
@@ -842,7 +895,6 @@ class TelegramCommandBot:
                 )
                 if resp.status_code != 200:
                     _poll_err_count += 1
-                    # Log first few errors visibly so the user knows
                     if _poll_err_count <= 3:
                         self.logger.warning(
                             "Telegram getUpdates HTTP %d: %s",
@@ -851,12 +903,17 @@ class TelegramCommandBot:
                     self._stop_event.wait(5)
                     continue
                 _poll_err_count = 0
+                if _first_success:
+                    self.logger.info("Telegram poll loop active — listening for commands")
+                    _first_success = False
                 data = resp.json()
                 for update in data.get("result", []):
                     self._last_update_id = update["update_id"]
-                    msg = update.get("message", {})
+                    # Accept both normal messages and edited messages
+                    msg = update.get("message") or update.get("edited_message") or {}
                     # Only respond to our configured chat
-                    if str(msg.get("chat", {}).get("id")) != self.chat_id:
+                    chat_id = str(msg.get("chat", {}).get("id", ""))
+                    if chat_id != self.chat_id:
                         continue
                     text = (msg.get("text") or "").strip()
                     if text.startswith("/"):
