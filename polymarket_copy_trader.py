@@ -1836,6 +1836,12 @@ class ArbitrageMonitor(threading.Thread):
         self._edge_log_ts = {}   # cid -> last log time
         self._noask_log_ts = {}  # cid -> last log time
 
+        # Callbacks wired up by CopyTraderBot after construction.
+        # notify_callback(message) — sends webhook notification.
+        # log_trade_callback(record) — appends to trade_history.json.
+        self.notify_callback = None
+        self.log_trade_callback = None
+
     # -- persistence --------------------------------------------------------
 
     def _load_positions(self):
@@ -1853,6 +1859,82 @@ class ArbitrageMonitor(threading.Thread):
             os.replace(tmp, self.ARB_POSITIONS_FILE)
         except Exception as exc:
             self.logger.debug("Could not save arb positions: %s", exc)
+
+    def _log_arb_trade(self, position, is_partial=False):
+        """Log a completed arb trade to trade_history.json.
+
+        Creates a single record per arb with both legs' data and the
+        correct locked P&L based on actual fill amounts.
+        """
+        if not self.log_trade_callback:
+            return
+
+        question = position.get("question", "Unknown")
+        yes_shares = position.get("yes_shares", 0)
+        no_shares = position.get("no_shares", 0)
+        total_cost = position.get("total_cost", 0)
+        locked_profit = position.get("locked_profit", 0)
+        edge_pct = position.get("edge_pct", 0)
+        matched_shares = min(yes_shares, no_shares)
+
+        # For a complete arb, the proceeds are guaranteed at resolution:
+        # each matched pair of shares pays out $1.00.
+        if is_partial:
+            outcome = "partial"
+            reason = "arb_partial"
+            # Partial arbs have unknown proceeds
+            proceeds = 0
+            pnl = -total_cost  # worst-case until resolution
+        else:
+            outcome = "arb"
+            reason = "arb_executed"
+            proceeds = matched_shares  # $1 per matched pair at resolution
+            pnl = locked_profit
+
+        # Extract per-leg details for the record
+        yes_fill = position.get("yes_fill") or {}
+        no_fill = position.get("no_fill") or {}
+
+        record = {
+            "closed_at": position.get("ts", datetime.now().isoformat()),
+            "token_id": "arb",
+            "market": question,
+            "shares": matched_shares,
+            "entry_price": round(total_cost / matched_shares, 6) if matched_shares > 0 else 0,
+            "exit_price": 1.0 if not is_partial else 0,
+            "cost_basis_usdc": round(total_cost, 6),
+            "proceeds_usdc": round(proceeds, 6),
+            "pnl_usdc": round(pnl, 6),
+            "outcome": outcome,
+            "reason": reason,
+            "arb_details": {
+                "yes_shares": yes_shares,
+                "no_shares": no_shares,
+                "yes_cost": round(
+                    float(yes_fill.get("makingAmount", 0))
+                    if isinstance(yes_fill, dict) else 0, 4,
+                ),
+                "no_cost": round(
+                    float(no_fill.get("makingAmount", 0))
+                    if isinstance(no_fill, dict) else 0, 4,
+                ),
+                "edge_pct": edge_pct,
+                "locked_profit": locked_profit,
+            },
+        }
+
+        try:
+            self.log_trade_callback(record)
+        except Exception as exc:
+            self.logger.debug("Could not log arb trade to history: %s", exc)
+
+    def _notify_arb(self, message):
+        """Send webhook notification for arb events."""
+        if self.notify_callback:
+            try:
+                self.notify_callback(message)
+            except Exception:
+                pass
 
     # -- market resolution --------------------------------------------------
 
@@ -2541,6 +2623,18 @@ class ArbitrageMonitor(threading.Thread):
                         abs(yes_shares - no_shares),
                         abs(yes_shares - no_shares),
                     )
+                # Log to trade history and send webhook
+                self._log_arb_trade(self._active_positions[cid])
+                self._notify_arb(
+                    "ARB EXECUTED: %s — %s=%.2f, %s=%.2f shares, "
+                    "cost $%.2f, locked profit $%.4f (%.2f%%)"
+                    % (
+                        mkt["question"][:50],
+                        mkt["yes_label"], yes_shares,
+                        mkt["no_label"], no_shares,
+                        actual_total_cost, actual_profit, actual_edge,
+                    )
+                )
             else:
                 self.logger.warning(
                     "ARB PARTIAL FILL: %s — %s=%s, %s=%s",
@@ -2550,7 +2644,7 @@ class ArbitrageMonitor(threading.Thread):
                     mkt["no_label"],
                     "%.2f shares" % no_shares if no_result else "FAILED",
                 )
-                self._active_positions[cid] = {
+                partial_pos = {
                     "question": mkt["question"],
                     "yes_fill": yes_result,
                     "no_fill": no_result,
@@ -2562,7 +2656,19 @@ class ArbitrageMonitor(threading.Thread):
                     "partial": True,
                     "ts": datetime.now().isoformat(),
                 }
+                self._active_positions[cid] = partial_pos
                 self._save_positions()
+                self._log_arb_trade(partial_pos, is_partial=True)
+                self._notify_arb(
+                    "ARB PARTIAL FILL: %s — %s=%s, %s=%s (NEEDS ATTENTION)"
+                    % (
+                        mkt["question"][:40],
+                        mkt["yes_label"],
+                        "%.2f shares" % yes_shares if yes_result else "FAILED",
+                        mkt["no_label"],
+                        "%.2f shares" % no_shares if no_result else "FAILED",
+                    )
+                )
 
     def _place_arb_leg(self, token_id, price, target_shares, label,
                        max_retry_price=None):
@@ -5713,6 +5819,28 @@ class CopyTraderBot:
         url = self.cfg.get("webhook_url", "")
         send_webhook(url, message, logger=self.logger)
 
+    def _append_trade_history(self, record):
+        """Append a trade record to the persistent trade_history.json.
+
+        Used by ArbitrageMonitor to log arb trades into the same history
+        file that the TradeExecutor uses for copy trades, so both appear
+        in the History tab and dashboard stats.
+        """
+        try:
+            history_file = self.cfg.get("trade_history_file", TRADE_HISTORY_FILE)
+            try:
+                with open(history_file, "r") as fh:
+                    history = json.load(fh)
+            except (FileNotFoundError, json.JSONDecodeError):
+                history = []
+            history.append(record)
+            tmp = history_file + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(history, fh, indent=2, default=str)
+            os.replace(tmp, history_file)
+        except Exception as exc:
+            self.logger.debug("Could not append trade history: %s", exc)
+
     def _save_session_trades(self):
         """Persist session trades to disk immediately (crash-safe).
 
@@ -5939,6 +6067,8 @@ class CopyTraderBot:
                 self._arb_monitor = ArbitrageMonitor(
                     self.clob_client, self.cfg, self.logger,
                 )
+                self._arb_monitor.notify_callback = self._notify
+                self._arb_monitor.log_trade_callback = self._append_trade_history
                 self._arb_monitor.start()
                 self.logger.info(
                     "Copy trading from watched wallets DISABLED while "
@@ -6789,16 +6919,81 @@ class CopyTraderGUI:
                 time_held,
             ))
 
-        # Totals
-        total_float_pnl = total_value - total_cost
+        # --- Arb positions ---
+        arb_mon = getattr(self.bot, "_arb_monitor", None)
+        arb_total_cost = Decimal("0")
+        arb_total_profit = Decimal("0")
+        n_arb_positions = 0
+        if arb_mon:
+            arb_positions = dict(arb_mon._active_positions)
+            n_arb_positions = len(arb_positions)
+            for _cid, apos in arb_positions.items():
+                a_cost = Decimal(str(apos.get("total_cost", 0)))
+                a_profit = Decimal(str(apos.get("locked_profit", 0)))
+                a_yes = apos.get("yes_shares", 0)
+                a_no = apos.get("no_shares", 0)
+                a_matched = min(a_yes, a_no)
+                a_question = apos.get("question", "Unknown")
+                is_partial = apos.get("partial", False)
+                arb_total_cost += a_cost
+                arb_total_profit += a_profit
+
+                # Time held
+                arb_time = "--"
+                arb_ts = apos.get("ts")
+                if arb_ts:
+                    try:
+                        arb_dt = datetime.fromisoformat(arb_ts)
+                        delta = now - arb_dt
+                        mins = int(delta.total_seconds()) // 60
+                        arb_time = f"{mins}m" if mins < 60 else f"{mins // 60}h {mins % 60}m"
+                    except Exception:
+                        pass
+
+                direction = "ARB" if not is_partial else "ARB!"
+                pnl_str = f"+${a_profit:.4f}" if a_profit > 0 else f"${a_profit:.4f}"
+                edge = apos.get("edge_pct", 0)
+
+                self.dash_tree.insert("", tk.END, values=(
+                    direction,
+                    a_question[:45],
+                    f"{a_matched:.2f}",
+                    f"${a_cost / Decimal(str(a_matched)) if a_matched > 0 else 0:.4f}",
+                    "$1.0000",  # arb exits at $1 per matched pair
+                    f"${a_cost:.2f}",
+                    f"${a_matched:.2f}" if not is_partial else "--",
+                    pnl_str,
+                    f"+{edge:.1f}%" if edge > 0 else "--",
+                    arb_time,
+                ))
+
+        # Totals (include arb positions)
+        total_float_pnl = total_value - total_cost + arb_total_profit
+        total_positions = len(positions) + n_arb_positions
+        self.dash_positions_var.set(f"Open Positions: {total_positions}")
         self.dash_total_pnl_var.set(
             f"Floating P/L: {'+'if total_float_pnl >= 0 else ''}${total_float_pnl:.2f}"
         )
+        arb_summary = ""
+        if n_arb_positions > 0:
+            arb_summary = (
+                f"  |  Arb: {n_arb_positions} pos, "
+                f"cost ${arb_total_cost:.2f}, "
+                f"locked +${arb_total_profit:.4f}"
+            )
         self.dash_summary_var.set(
-            f"Total Cost Basis: ${total_cost:.2f}  |  "
-            f"Total Current Value: ${total_value:.2f}  |  "
+            f"Total Cost Basis: ${total_cost + arb_total_cost:.2f}  |  "
+            f"Total Current Value: ${total_value + Decimal(str(arb_total_profit)):.2f}  |  "
             f"Net: {'+'if total_float_pnl >= 0 else ''}${total_float_pnl:.2f}"
+            f"{arb_summary}"
         )
+
+        # Update arb status label if monitor is running
+        if arb_mon and hasattr(self, 'arb_status_var'):
+            try:
+                self.arb_status_var.set("Arbitrage: " + arb_mon.get_status_summary())
+            except Exception:
+                pass
 
         # Whale comparison panel (read from whale_comparison.json)
         self._refresh_whale_comparison()

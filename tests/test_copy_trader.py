@@ -2540,6 +2540,8 @@ class TestArbitrageMonitorMultiSlug(unittest.TestCase):
         mon._slug_states = {}
         mon._edge_log_ts = {}
         mon._noask_log_ts = {}
+        mon.notify_callback = None
+        mon.log_trade_callback = None
         return mon
 
     # -- _get_effective_slugs -------------------------------------------------
@@ -2809,6 +2811,8 @@ class TestArbExecution(unittest.TestCase):
         mon._slug_states = {}
         mon._edge_log_ts = {}
         mon._noask_log_ts = {}
+        mon.notify_callback = None
+        mon.log_trade_callback = None
         return mon
 
     def test_place_arb_leg_returns_actual_shares(self):
