@@ -483,8 +483,12 @@ DEFAULT_CONFIG = {
     # --- Arbitrage mode (binary market spread capture) ---
     "arb_enabled": False,
     "arb_condition_ids": [],          # condition IDs of binary markets to monitor
-    "arb_dynamic_slug": "",           # e.g. "btc-updown-5m" — auto-discovers rotating markets
-    "arb_dynamic_window": 300,        # window duration in seconds (300 = 5 minutes)
+    "arb_dynamic_slug": "",           # DEPRECATED — single slug (kept for backward compat)
+    "arb_dynamic_window": 300,        # DEPRECATED — window for single slug (kept for compat)
+    "arb_dynamic_slugs": [],          # list of {"slug": str, "window": int, "format": str}
+                                      #   format: "timestamp" (default) or "hourly"
+                                      #   e.g. [{"slug": "btc-updown-15m", "window": 900},
+                                      #         {"slug": "ethereum-up-or-down", "window": 3600, "format": "hourly"}]
     "arb_min_edge_pct": 1.0,         # minimum spread % to trigger (e.g. 1.0 = 1%)
     "arb_size_usdc": 10.0,           # USDC to spend per side of each arb trade
     "arb_max_positions": 5,           # max simultaneous arb positions
@@ -503,8 +507,8 @@ _PERSISTENT_CONFIG_KEYS = [
     "dry_run", "auto_redeem_settled", "proxy_redeem", "proxy_withdraw",
     "max_price_deviation_pct", "trade_max_age_seconds",
     "arb_enabled", "arb_condition_ids", "arb_dynamic_slug",
-    "arb_dynamic_window", "arb_min_edge_pct", "arb_size_usdc",
-    "arb_max_positions", "arb_poll_seconds",
+    "arb_dynamic_window", "arb_dynamic_slugs", "arb_min_edge_pct",
+    "arb_size_usdc", "arb_max_positions", "arb_poll_seconds",
     "webhook_url",
 ]
 
@@ -1796,19 +1800,25 @@ class ArbitrageMonitor(threading.Thread):
         self.logger = logger or logging.getLogger("CopyTrader")
         self._stop_event = threading.Event()
 
-        # Lock protects _markets and _current_window_ts from concurrent
-        # access between _resolve_dynamic_slug() and _scan_cycle().
+        # Lock protects _markets from concurrent access between
+        # _resolve_dynamic_slugs() and _scan_cycle().
         self._market_lock = threading.Lock()
 
-        # condition_id -> {"yes_token": str, "no_token": str, "question": str}
+        # condition_id -> {"yes_token": str, "no_token": str, "question": str, ...}
         self._markets = {}
         # condition_id -> {"yes_fill": {...}, "no_fill": {...}, "cost": float, "ts": str}
         self._active_positions = {}
         self._load_positions()
 
-        # Dynamic slug state: tracks the current window timestamp so we
-        # know when to re-resolve to the next rotating market.
-        self._current_window_ts = 0
+        # Per-slug state: slug_base -> {"window_key": str, "failed_key": str}
+        # Tracks the last resolved window and last failed window for each
+        # configured dynamic slug so they rotate independently.
+        self._slug_states = {}
+
+        # Per-market log-throttle timestamps so multi-market scanning
+        # doesn't spam logs.
+        self._edge_log_ts = {}   # cid -> last log time
+        self._noask_log_ts = {}  # cid -> last log time
 
     # -- persistence --------------------------------------------------------
 
@@ -1881,50 +1891,193 @@ class ArbitrageMonitor(threading.Thread):
 
     # -- dynamic slug discovery ---------------------------------------------
 
-    def _get_dynamic_window_ts(self):
-        """Return the current window start timestamp for the dynamic slug."""
-        window = max(int(self.cfg.get("arb_dynamic_window", 300)), 30)
+    @staticmethod
+    def _get_window_ts(window):
+        """Return the current window-start unix timestamp for a given window size."""
+        window = max(int(window), 30)
         now = int(time.time())
         return now - (now % window)
 
-    def _resolve_dynamic_slug(self):
-        """Discover the current rotating market via the Gamma events API.
+    def _get_effective_slugs(self):
+        """Return the list of dynamic slug entries from config.
 
-        For markets like ``btc-updown-5m`` that rotate every 5 minutes,
-        the slug follows a deterministic pattern:
-            ``{base_slug}-{window_start_timestamp}``
-
-        The Gamma events API returns markets with:
-          - ``clobTokenIds``: a **stringified** JSON array of token ID strings
-          - ``outcomes``: a **stringified** JSON array of outcome labels
-          - ``condition_id`` / ``conditionId``: the market condition ID
-
-        This method computes the current slug, fetches it from the Gamma
-        API ``/events`` endpoint, parses the stringified fields, and
-        populates ``self._markets``.
-
-        Returns True if a new market was resolved, False otherwise.
+        Supports both the new ``arb_dynamic_slugs`` list format and the
+        legacy single ``arb_dynamic_slug`` string.  The legacy format is
+        automatically converted so callers always get a uniform list of
+        ``{"slug": str, "window": int, "format": str}`` dicts.
         """
-        base_slug = self.cfg.get("arb_dynamic_slug", "").strip()
-        if not base_slug:
-            return False
+        slugs = self.cfg.get("arb_dynamic_slugs") or []
+        if slugs:
+            # Normalise entries: ensure each has "format" defaulting to "timestamp"
+            normalised = []
+            for entry in slugs:
+                if isinstance(entry, str):
+                    entry = {"slug": entry}
+                if isinstance(entry, dict) and entry.get("slug", "").strip():
+                    normalised.append({
+                        "slug": entry["slug"].strip(),
+                        "window": int(entry.get("window", 300)),
+                        "format": entry.get("format", "timestamp"),
+                    })
+            return normalised
 
-        window_ts = self._get_dynamic_window_ts()
-        if window_ts == self._current_window_ts and self._markets:
-            return False  # same window, already resolved
+        # Backward compat: single slug string -> list of one
+        single = self.cfg.get("arb_dynamic_slug", "").strip()
+        if single:
+            return [{
+                "slug": single,
+                "window": int(self.cfg.get("arb_dynamic_window", 300)),
+                "format": "timestamp",
+            }]
+        return []
 
-        # Avoid spamming the API if we already failed for this window
-        if window_ts == getattr(self, "_last_failed_window_ts", 0):
-            return False
+    def _generate_slug(self, slug_entry):
+        """Generate the full event slug for the current window.
 
-        slug = f"{base_slug}-{window_ts}"
-        self.logger.info("Arb dynamic: discovering market for slug '%s'", slug)
+        For ``"timestamp"`` format (default):
+            ``{base_slug}-{unix_window_start}``
 
+        For ``"hourly"`` format:
+            ``{base_slug}-{month}-{day}-{hour}{am/pm}-et``
+            Uses US Eastern time with proper DST handling.
+        """
+        base = slug_entry["slug"]
+        window = slug_entry["window"]
+        fmt = slug_entry.get("format", "timestamp")
+
+        if fmt == "hourly":
+            return self._generate_hourly_slug(base, window)
+
+        # Default: timestamp format
+        window_ts = self._get_window_ts(window)
+        return f"{base}-{window_ts}"
+
+    @staticmethod
+    def _generate_hourly_slug(base, window):
+        """Generate a human-readable hourly slug in US Eastern time.
+
+        Pattern: ``{base}-{month}-{day}-{hour}{am/pm}-et``
+        Example: ``ethereum-up-or-down-february-16-9pm-et``
+        """
+        try:
+            from zoneinfo import ZoneInfo
+            et = ZoneInfo("America/New_York")
+        except (ImportError, KeyError):
+            from datetime import timedelta as _td
+            et = timezone(_td(hours=-5))
+
+        now_et = datetime.now(et)
+        # Truncate to the current window boundary.  For hourly markets
+        # the window is typically 3600 but we honour whatever is configured.
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        ts = int((now_et.astimezone(timezone.utc) - epoch).total_seconds())
+        window_start_ts = ts - (ts % max(window, 60))
+        window_start_utc = datetime.fromtimestamp(window_start_ts, tz=timezone.utc)
+        window_start_et = window_start_utc.astimezone(et)
+
+        month_name = window_start_et.strftime("%B").lower()
+        day = window_start_et.day
+        hour_12 = int(window_start_et.strftime("%I"))
+        ampm = window_start_et.strftime("%p").lower()
+        return f"{base}-{month_name}-{day}-{hour_12}{ampm}-et"
+
+    def _window_key_for(self, slug_entry):
+        """Return a comparable key representing the current window for a slug.
+
+        For timestamp slugs this is the unix timestamp (int).
+        For hourly slugs this is the generated slug suffix (str).
+        Either way, when the key changes the window has rotated.
+        """
+        return self._generate_slug(slug_entry)
+
+    def _resolve_dynamic_slugs(self):
+        """Discover current rotating markets for all configured dynamic slugs.
+
+        Unlike the legacy single-slug method, this **merges** newly discovered
+        markets into ``self._markets`` (keyed by condition_id) and removes
+        stale markets whose window has rotated.
+
+        Each market entry is tagged with ``_slug_key`` (the base slug) and
+        ``_resolved_slug`` (the full generated slug at discovery time) so
+        that ``_scan_cycle()`` can perform per-market staleness checks.
+        """
+        slug_entries = self._get_effective_slugs()
+        if not slug_entries:
+            return
+
+        any_resolved = False
+        new_markets = {}
+
+        for entry in slug_entries:
+            slug_base = entry["slug"]
+            current_key = self._window_key_for(entry)
+
+            state = self._slug_states.get(slug_base, {})
+            prev_key = state.get("window_key")
+
+            # Same window, already resolved — carry forward existing markets
+            if current_key == prev_key:
+                with self._market_lock:
+                    for cid, mkt in self._markets.items():
+                        if mkt.get("_slug_key") == slug_base:
+                            new_markets[cid] = mkt
+                continue
+
+            # Already failed for this exact window — skip
+            if current_key == state.get("failed_key"):
+                # Still carry forward any existing markets from this slug
+                # (they may be from a previous successful resolution)
+                with self._market_lock:
+                    for cid, mkt in self._markets.items():
+                        if mkt.get("_slug_key") == slug_base:
+                            new_markets[cid] = mkt
+                continue
+
+            full_slug = current_key  # _window_key_for returns the full slug
+            self.logger.info(
+                "Arb dynamic: discovering market for slug '%s'", full_slug,
+            )
+
+            resolved = self._fetch_and_parse_slug(
+                full_slug, slug_base, entry,
+            )
+            if resolved:
+                cid, mkt_data = resolved
+                new_markets[cid] = mkt_data
+                self._slug_states[slug_base] = {
+                    "window_key": current_key, "failed_key": "",
+                }
+                any_resolved = True
+            else:
+                self._slug_states[slug_base] = {
+                    "window_key": state.get("window_key", ""),
+                    "failed_key": current_key,
+                }
+                # Carry forward existing markets from this slug
+                with self._market_lock:
+                    for cid, mkt in self._markets.items():
+                        if mkt.get("_slug_key") == slug_base:
+                            new_markets[cid] = mkt
+
+        # Also carry forward any static (non-dynamic) markets.
+        with self._market_lock:
+            for cid, mkt in self._markets.items():
+                if not mkt.get("_slug_key"):
+                    new_markets[cid] = mkt
+
+        # Atomically swap the entire markets dict.
+        with self._market_lock:
+            self._markets = new_markets
+
+    def _fetch_and_parse_slug(self, full_slug, slug_base, slug_entry):
+        """Fetch a single event slug from the Gamma API and parse it.
+
+        Returns ``(condition_id, market_dict)`` on success, or ``None``.
+        """
         try:
             url = f"{GAMMA_API_BASE}/events"
-            data = self.clob_client._get_public(url, params={"slug": slug})
+            data = self.clob_client._get_public(url, params={"slug": full_slug})
 
-            # The events endpoint returns a list; we want the first event
             event = None
             if isinstance(data, list) and data:
                 event = data[0]
@@ -1934,41 +2087,30 @@ class ArbitrageMonitor(threading.Thread):
             if not event:
                 self.logger.warning(
                     "Arb dynamic: no event found for slug '%s' — "
-                    "market may not be open yet", slug,
+                    "market may not be open yet", full_slug,
                 )
-                self._last_failed_window_ts = window_ts
-                return False
+                return None
 
-            # An event contains a list of markets; grab the first binary one
             markets = event.get("markets") or []
             if not markets:
                 self.logger.warning(
-                    "Arb dynamic: event '%s' has no markets", slug,
+                    "Arb dynamic: event '%s' has no markets", full_slug,
                 )
-                self._last_failed_window_ts = window_ts
-                return False
+                return None
 
             market = markets[0]
             cid = market.get("condition_id") or market.get("conditionId") or ""
-
             if not cid:
                 self.logger.warning(
-                    "Arb dynamic: market in event '%s' has no condition_id", slug,
+                    "Arb dynamic: market in event '%s' has no condition_id",
+                    full_slug,
                 )
-                self._last_failed_window_ts = window_ts
-                return False
+                return None
 
             # --- Parse token IDs ---
-            # The Gamma events API returns clobTokenIds and outcomes as
-            # *stringified* JSON arrays, e.g.:
-            #   "clobTokenIds": "[\"abc123...\", \"def456...\"]"
-            #   "outcomes": "[\"Up\", \"Down\"]"
-            # We also fall back to a native "tokens" array (CLOB API format)
-            # in case the response shape varies.
             token_ids = []
             outcome_labels = []
 
-            # Try clobTokenIds (Gamma events API format — stringified)
             raw_clob = market.get("clobTokenIds") or ""
             if isinstance(raw_clob, str) and raw_clob.strip():
                 try:
@@ -1980,7 +2122,6 @@ class ArbitrageMonitor(threading.Thread):
             elif isinstance(raw_clob, list):
                 token_ids = [str(t) for t in raw_clob]
 
-            # Try outcomes (also stringified)
             raw_outcomes = market.get("outcomes") or ""
             if isinstance(raw_outcomes, str) and raw_outcomes.strip():
                 try:
@@ -2013,56 +2154,52 @@ class ArbitrageMonitor(threading.Thread):
                     market.get("clobTokenIds", ""),
                     len(market.get("tokens") or []),
                 )
-                self._last_failed_window_ts = window_ts
-                return False
+                return None
 
-            # Default labels if not parsed
             if len(outcome_labels) < 2:
                 outcome_labels = ["A", "B"]
 
             tid0, tid1 = token_ids[0], token_ids[1]
             label0, label1 = outcome_labels[0], outcome_labels[1]
-            question = market.get("question") or event.get("title") or slug
+            question = market.get("question") or event.get("title") or full_slug
 
-            # Atomically swap in the new market so _scan_cycle() never
-            # sees a half-updated dict or iterates during mutation.
-            new_market = {
-                cid: {
-                    "yes_token": tid0,
-                    "no_token": tid1,
-                    "yes_label": label0,
-                    "no_label": label1,
-                    "question": question,
-                }
-            }
-            with self._market_lock:
-                self._markets = new_market
-                self._current_window_ts = window_ts
-            self._last_failed_window_ts = 0
             self.logger.info(
-                "Arb dynamic: resolved '%s' — %s=%s... / %s=%s... (window %d)",
-                question[:50], label0, tid0[:12], label1, tid1[:12], window_ts,
+                "Arb dynamic: resolved '%s' — %s=%s... / %s=%s... (slug %s)",
+                question[:50], label0, tid0[:12], label1, tid1[:12], full_slug,
             )
-            return True
+
+            return cid, {
+                "yes_token": tid0,
+                "no_token": tid1,
+                "yes_label": label0,
+                "no_label": label1,
+                "question": question,
+                # Multi-slug metadata for per-market staleness checks
+                "_slug_key": slug_base,
+                "_slug_entry": slug_entry,
+                "_resolved_slug": full_slug,
+            }
 
         except Exception as exc:
-            self.logger.warning("Arb dynamic: failed to resolve slug '%s': %s", slug, exc)
-            self._last_failed_window_ts = window_ts
-            return False
+            self.logger.warning(
+                "Arb dynamic: failed to resolve slug '%s': %s", full_slug, exc,
+            )
+            return None
 
     # -- core loop ----------------------------------------------------------
 
     def run(self):
-        dynamic_slug = self.cfg.get("arb_dynamic_slug", "").strip()
+        slug_entries = self._get_effective_slugs()
         static_cids = self.cfg.get("arb_condition_ids", [])
 
-        if dynamic_slug:
-            self.logger.info(
-                "Arbitrage monitor starting — dynamic slug '%s' "
-                "(window %ds)", dynamic_slug,
-                self.cfg.get("arb_dynamic_window", 300),
-            )
-            self._resolve_dynamic_slug()
+        if slug_entries:
+            for entry in slug_entries:
+                self.logger.info(
+                    "Arbitrage monitor: dynamic slug '%s' "
+                    "(window %ds, format %s)",
+                    entry["slug"], entry["window"], entry.get("format", "timestamp"),
+                )
+            self._resolve_dynamic_slugs()
         else:
             self.logger.info(
                 "Arbitrage monitor starting — %d market(s) configured",
@@ -2070,7 +2207,7 @@ class ArbitrageMonitor(threading.Thread):
             )
             self._resolve_markets()
 
-        if not self._markets and not dynamic_slug:
+        if not self._markets and not slug_entries:
             self.logger.error("Arb: no markets could be resolved — monitor stopping")
             return
 
@@ -2078,9 +2215,9 @@ class ArbitrageMonitor(threading.Thread):
 
         while not self._stop_event.is_set():
             try:
-                # For dynamic slugs, re-resolve when the window rotates
-                if dynamic_slug:
-                    self._resolve_dynamic_slug()
+                # For dynamic slugs, re-resolve when any window rotates
+                if slug_entries:
+                    self._resolve_dynamic_slugs()
 
                 if self._markets:
                     self._scan_cycle()
@@ -2103,12 +2240,15 @@ class ArbitrageMonitor(threading.Thread):
         dry_run = self.cfg.get("dry_run", False)
 
         # Snapshot markets under lock so we iterate a stable copy.
-        # Capture the wall-clock window timestamp for staleness checks
-        # (only relevant when using dynamic rotating markets).
-        is_dynamic = bool(self.cfg.get("arb_dynamic_slug", "").strip())
         with self._market_lock:
             markets_snapshot = dict(self._markets)
-        window_at_scan_start = self._get_dynamic_window_ts() if is_dynamic else 0
+
+        # Capture per-market window keys at scan start for staleness checks.
+        window_keys_at_start = {}
+        for cid, mkt in markets_snapshot.items():
+            entry = mkt.get("_slug_entry")
+            if entry:
+                window_keys_at_start[cid] = self._window_key_for(entry)
 
         for cid, mkt in markets_snapshot.items():
             # Respect max positions
@@ -2138,8 +2278,9 @@ class ArbitrageMonitor(threading.Thread):
 
             if not asks_yes or not asks_no:
                 now = time.time()
-                if not hasattr(self, '_last_noask_log_t') or now - self._last_noask_log_t >= 60:
-                    self._last_noask_log_t = now
+                last_t = self._noask_log_ts.get(cid, 0)
+                if now - last_t >= 60:
+                    self._noask_log_ts[cid] = now
                     self.logger.info(
                         "Arb scan: %s — no asks on %s side (Yes asks: %d, No asks: %d)",
                         mkt["question"][:40],
@@ -2179,8 +2320,9 @@ class ArbitrageMonitor(threading.Thread):
                 # actively scanning and what the current spread looks like.
                 log_interval = self.cfg.get("arb_log_interval", 5)
                 now = time.time()
-                if not hasattr(self, '_last_edge_log_t') or now - self._last_edge_log_t >= log_interval:
-                    self._last_edge_log_t = now
+                last_t = self._edge_log_ts.get(cid, 0)
+                if now - last_t >= log_interval:
+                    self._edge_log_ts[cid] = now
                     self.logger.info(
                         "Arb scan: %s — %s=$%.3f + %s=$%.3f = $%.4f "
                         "(edge %.2f%% < min %.2f%%, no trade)",
@@ -2214,19 +2356,20 @@ class ArbitrageMonitor(threading.Thread):
                 self.logger.info("ARB DRY RUN — would buy both sides (skipping)")
                 continue
 
-            # Guard: abort if the 5-min window boundary has passed since we
-            # started this scan cycle.  The condition_id and token IDs from our
-            # snapshot belong to the *previous* window and Polymarket may have
-            # already created the next market — placing orders now would hit
-            # an expired/closing market.
-            if is_dynamic and self._get_dynamic_window_ts() != window_at_scan_start:
-                self.logger.warning(
-                    "ARB SKIPPED: window rotated during scan (%d -> %d) — "
-                    "aborting stale order for %s",
-                    window_at_scan_start, self._get_dynamic_window_ts(),
-                    mkt["question"][:40],
-                )
-                continue
+            # Guard: abort if this market's window boundary has passed since
+            # we started this scan cycle.  The condition_id and token IDs
+            # from our snapshot belong to the *previous* window and
+            # Polymarket may have already created the next market.
+            slug_entry = mkt.get("_slug_entry")
+            if slug_entry and cid in window_keys_at_start:
+                current_wk = self._window_key_for(slug_entry)
+                if current_wk != window_keys_at_start[cid]:
+                    self.logger.warning(
+                        "ARB SKIPPED: window rotated during scan — "
+                        "aborting stale order for %s",
+                        mkt["question"][:40],
+                    )
+                    continue
 
             # Execute both legs
             yes_result = self._place_arb_leg(
@@ -2235,29 +2378,31 @@ class ArbitrageMonitor(threading.Thread):
 
             # Guard between legs: if window rotated after first leg, do NOT
             # place the second leg (it would target a different market).
-            if is_dynamic and self._get_dynamic_window_ts() != window_at_scan_start:
-                self.logger.warning(
-                    "ARB ABORTED BETWEEN LEGS: window rotated after %s leg "
-                    "filled — skipping %s leg to avoid cross-market position. "
-                    "%s leg result: %s",
-                    mkt["yes_label"], mkt["no_label"],
-                    mkt["yes_label"],
-                    "OK" if yes_result else "FAILED",
-                )
-                # Track the single-leg fill so we know about it
-                if yes_result:
-                    self._active_positions[cid] = {
-                        "question": mkt["question"],
-                        "yes_fill": yes_result,
-                        "no_fill": None,
-                        "total_cost": usdc_yes,
-                        "locked_profit": 0,
-                        "edge_pct": 0,
-                        "partial": True,
-                        "ts": datetime.now().isoformat(),
-                    }
-                    self._save_positions()
-                continue
+            if slug_entry and cid in window_keys_at_start:
+                current_wk = self._window_key_for(slug_entry)
+                if current_wk != window_keys_at_start[cid]:
+                    self.logger.warning(
+                        "ARB ABORTED BETWEEN LEGS: window rotated after %s leg "
+                        "filled — skipping %s leg to avoid cross-market position. "
+                        "%s leg result: %s",
+                        mkt["yes_label"], mkt["no_label"],
+                        mkt["yes_label"],
+                        "OK" if yes_result else "FAILED",
+                    )
+                    # Track the single-leg fill so we know about it
+                    if yes_result:
+                        self._active_positions[cid] = {
+                            "question": mkt["question"],
+                            "yes_fill": yes_result,
+                            "no_fill": None,
+                            "total_cost": usdc_yes,
+                            "locked_profit": 0,
+                            "edge_pct": 0,
+                            "partial": True,
+                            "ts": datetime.now().isoformat(),
+                        }
+                        self._save_positions()
+                    continue
 
             no_result = self._place_arb_leg(
                 no_token, best_ask_no, usdc_no, mkt["no_label"],
@@ -5624,8 +5769,10 @@ class CopyTraderBot:
         # ---- Start Arbitrage Monitor (independent of copy trading) ----
         if self.cfg.get("arb_enabled") and self.clob_client:
             arb_cids = self.cfg.get("arb_condition_ids", [])
+            dynamic_slugs = self.cfg.get("arb_dynamic_slugs", [])
             dynamic_slug = self.cfg.get("arb_dynamic_slug", "").strip()
-            if arb_cids or dynamic_slug:
+            has_dynamic = bool(dynamic_slugs or dynamic_slug)
+            if arb_cids or has_dynamic:
                 self._arb_monitor = ArbitrageMonitor(
                     self.clob_client, self.cfg, self.logger,
                 )
@@ -5634,17 +5781,22 @@ class CopyTraderBot:
                     "Copy trading from watched wallets DISABLED while "
                     "arb mode is active (wallet polling skipped)"
                 )
-                if dynamic_slug:
+                if has_dynamic:
+                    # Use the monitor's helper to get the effective slug list
+                    eff_slugs = self._arb_monitor._get_effective_slugs()
                     self.logger.info(
-                        "Arbitrage monitor enabled — dynamic slug '%s' "
-                        "(window %ds), min edge %.1f%%, $%.0f/side, "
-                        "poll every %ds",
-                        dynamic_slug,
-                        self.cfg.get("arb_dynamic_window", 300),
+                        "Arbitrage monitor enabled — %d dynamic slug(s), "
+                        "min edge %.1f%%, $%.0f/side, poll every %ds",
+                        len(eff_slugs),
                         self.cfg.get("arb_min_edge_pct", 1.0),
                         self.cfg.get("arb_size_usdc", 10.0),
                         self.cfg.get("arb_poll_seconds", 2),
                     )
+                    for s in eff_slugs:
+                        self.logger.info(
+                            "  slug: '%s' (window %ds, format %s)",
+                            s["slug"], s["window"], s.get("format", "timestamp"),
+                        )
                 else:
                     self.logger.info(
                         "Arbitrage monitor enabled — scanning %d market(s), "
@@ -5657,7 +5809,7 @@ class CopyTraderBot:
             else:
                 self.logger.warning(
                     "arb_enabled=True but no arb_condition_ids or "
-                    "arb_dynamic_slug configured"
+                    "arb_dynamic_slugs configured"
                 )
 
         if web3_ok:
@@ -6775,36 +6927,65 @@ class CopyTraderGUI:
             wraplength=600,
         ).pack(anchor=tk.W, pady=(0, 8))
 
-        # Dynamic slug section
+        # Dynamic slugs section (multiple rotating markets)
         dyn_frame = ttk.LabelFrame(
-            parent, text="Dynamic Market (Rotating Slug)", padding=8,
+            parent, text="Dynamic Markets (Rotating Slugs)", padding=8,
         )
-        dyn_frame.pack(fill=tk.X, pady=(0, 8))
+        dyn_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
         ttk.Label(
             dyn_frame,
-            text="For rotating markets like BTC 5-min up/down, enter the "
-                 "base slug (e.g. 'btc-updown-5m'). The bot will auto-discover "
-                 "the current market every window. Leave blank to use static "
-                 "condition IDs instead.",
+            text="Add rotating market slugs below. Each slug auto-discovers "
+                 "the current market every window.\n"
+                 "Timestamp format (e.g. btc-updown-15m, window 900) for "
+                 "markets like btc-updown-15m-1771293600.\n"
+                 "Hourly format (e.g. ethereum-up-or-down, window 3600) for "
+                 "markets like ethereum-up-or-down-february-16-9pm-et.",
             wraplength=600,
-        ).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 5))
+        ).pack(anchor=tk.W, pady=(0, 5))
 
-        ttk.Label(dyn_frame, text="Dynamic Slug:").grid(
-            row=1, column=0, sticky=tk.W, pady=3,
+        slug_list_frame = ttk.Frame(dyn_frame)
+        slug_list_frame.pack(fill=tk.BOTH, expand=True, pady=3)
+        self.arb_slugs_listbox = tk.Listbox(
+            slug_list_frame, height=5, font=("Courier", 9),
         )
-        self.arb_dynamic_slug_entry = ttk.Entry(dyn_frame, width=30)
-        self.arb_dynamic_slug_entry.grid(row=1, column=1, sticky=tk.W, pady=3)
+        slug_scroll = ttk.Scrollbar(
+            slug_list_frame, orient=tk.VERTICAL,
+            command=self.arb_slugs_listbox.yview,
+        )
+        self.arb_slugs_listbox.configure(yscrollcommand=slug_scroll.set)
+        self.arb_slugs_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        slug_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        ttk.Label(dyn_frame, text="Window (seconds):").grid(
-            row=2, column=0, sticky=tk.W, pady=3,
+        # Entry row for adding new slug
+        slug_entry_frame = ttk.Frame(dyn_frame)
+        slug_entry_frame.pack(fill=tk.X, pady=3)
+        ttk.Label(slug_entry_frame, text="Slug:").pack(side=tk.LEFT)
+        self.arb_new_slug_entry = ttk.Entry(slug_entry_frame, width=25)
+        self.arb_new_slug_entry.pack(side=tk.LEFT, padx=3)
+        ttk.Label(slug_entry_frame, text="Window:").pack(side=tk.LEFT)
+        self.arb_new_window_entry = ttk.Entry(slug_entry_frame, width=6)
+        self.arb_new_window_entry.insert(0, "900")
+        self.arb_new_window_entry.pack(side=tk.LEFT, padx=3)
+        ttk.Label(slug_entry_frame, text="Format:").pack(side=tk.LEFT)
+        self.arb_new_format_var = tk.StringVar(value="timestamp")
+        fmt_combo = ttk.Combobox(
+            slug_entry_frame, textvariable=self.arb_new_format_var,
+            values=["timestamp", "hourly"], width=10, state="readonly",
         )
-        win_frame = ttk.Frame(dyn_frame)
-        win_frame.grid(row=2, column=1, sticky=tk.W, pady=3)
-        self.arb_dynamic_window_entry = ttk.Entry(win_frame, width=8)
-        self.arb_dynamic_window_entry.pack(side=tk.LEFT)
-        ttk.Label(
-            win_frame, text="(300 = 5 min, 60 = 1 min)",
-        ).pack(side=tk.LEFT, padx=5)
+        fmt_combo.pack(side=tk.LEFT, padx=3)
+
+        slug_btn_frame = ttk.Frame(dyn_frame)
+        slug_btn_frame.pack(fill=tk.X)
+        ttk.Button(
+            slug_btn_frame, text="Add Slug", command=self._arb_add_slug,
+        ).pack(side=tk.LEFT, padx=3)
+        ttk.Button(
+            slug_btn_frame, text="Remove Selected",
+            command=self._arb_remove_slug,
+        ).pack(side=tk.LEFT, padx=3)
+        ttk.Button(
+            slug_btn_frame, text="Clear All", command=self._arb_clear_slugs,
+        ).pack(side=tk.LEFT, padx=3)
 
         # Settings row
         settings_frame = ttk.LabelFrame(parent, text="Arbitrage Settings", padding=8)
@@ -6913,6 +7094,57 @@ class CopyTraderGUI:
 
     def _arb_clear_markets(self):
         self.arb_market_listbox.delete(0, tk.END)
+
+    def _arb_add_slug(self):
+        slug = self.arb_new_slug_entry.get().strip()
+        if not slug:
+            return
+        try:
+            window = int(self.arb_new_window_entry.get().strip())
+        except ValueError:
+            window = 900
+        fmt = self.arb_new_format_var.get() or "timestamp"
+        display = f"{slug}  |  window={window}s  |  {fmt}"
+        # Avoid duplicates by slug name
+        existing = list(self.arb_slugs_listbox.get(0, tk.END))
+        for e in existing:
+            if e.split("|")[0].strip() == slug:
+                return
+        self.arb_slugs_listbox.insert(tk.END, display)
+        self.arb_new_slug_entry.delete(0, tk.END)
+
+    def _arb_remove_slug(self):
+        sel = self.arb_slugs_listbox.curselection()
+        if sel:
+            self.arb_slugs_listbox.delete(sel[0])
+
+    def _arb_clear_slugs(self):
+        self.arb_slugs_listbox.delete(0, tk.END)
+
+    @staticmethod
+    def _parse_slug_display(display_str):
+        """Parse a listbox display string back into a slug dict."""
+        parts = [p.strip() for p in display_str.split("|")]
+        slug = parts[0].strip() if parts else ""
+        window = 900
+        fmt = "timestamp"
+        for p in parts[1:]:
+            if p.startswith("window="):
+                try:
+                    window = int(p.replace("window=", "").replace("s", ""))
+                except ValueError:
+                    pass
+            elif p in ("timestamp", "hourly"):
+                fmt = p
+        return {"slug": slug, "window": window, "format": fmt}
+
+    @staticmethod
+    def _format_slug_display(entry):
+        """Format a slug dict for display in the listbox."""
+        return (
+            f"{entry['slug']}  |  window={entry.get('window', 900)}s  "
+            f"|  {entry.get('format', 'timestamp')}"
+        )
 
     def _build_log_tab(self, parent):
         self.log_area = scrolledtext.ScrolledText(
@@ -7124,14 +7356,27 @@ class CopyTraderGUI:
             self.addr_listbox.insert(tk.END, addr)
         # Arbitrage fields
         self.arb_enabled_var.set(self.cfg.get("arb_enabled", False))
-        self.arb_dynamic_slug_entry.insert(0, self.cfg.get("arb_dynamic_slug", ""))
-        self.arb_dynamic_window_entry.insert(0, str(self.cfg.get("arb_dynamic_window", 300)))
         self.arb_min_edge_entry.insert(0, str(self.cfg.get("arb_min_edge_pct", 1.0)))
         self.arb_size_entry.insert(0, str(self.cfg.get("arb_size_usdc", 10.0)))
         self.arb_max_pos_entry.insert(0, str(self.cfg.get("arb_max_positions", 5)))
         self.arb_poll_entry.insert(0, str(self.cfg.get("arb_poll_seconds", 2)))
         for cid in self.cfg.get("arb_condition_ids", []):
             self.arb_market_listbox.insert(tk.END, cid)
+        # Load dynamic slugs list (new format) or migrate from legacy single slug
+        slugs = self.cfg.get("arb_dynamic_slugs", [])
+        if not slugs:
+            legacy = self.cfg.get("arb_dynamic_slug", "").strip()
+            if legacy:
+                slugs = [{
+                    "slug": legacy,
+                    "window": int(self.cfg.get("arb_dynamic_window", 300)),
+                    "format": "timestamp",
+                }]
+        for entry in slugs:
+            if isinstance(entry, dict) and entry.get("slug"):
+                self.arb_slugs_listbox.insert(
+                    tk.END, self._format_slug_display(entry),
+                )
 
     def _read_fields_to_config(self):
         self.cfg["rpc_url"] = self.rpc_entry.get().strip()
@@ -7193,14 +7438,15 @@ class CopyTraderGUI:
         self.cfg["watched_addresses"] = list(self.addr_listbox.get(0, tk.END))
         # Arbitrage fields
         self.cfg["arb_enabled"] = self.arb_enabled_var.get()
-        self.cfg["arb_dynamic_slug"] = self.arb_dynamic_slug_entry.get().strip()
-        try:
-            val = int(self.arb_dynamic_window_entry.get().strip())
-            if val >= 30:
-                self.cfg["arb_dynamic_window"] = val
-        except ValueError:
-            pass
         self.cfg["arb_condition_ids"] = list(self.arb_market_listbox.get(0, tk.END))
+        # Read dynamic slugs from listbox
+        slug_displays = list(self.arb_slugs_listbox.get(0, tk.END))
+        self.cfg["arb_dynamic_slugs"] = [
+            self._parse_slug_display(d) for d in slug_displays
+        ]
+        # Clear legacy single-slug field when using the new list
+        self.cfg["arb_dynamic_slug"] = ""
+        self.cfg["arb_dynamic_window"] = 300
         try:
             val = float(self.arb_min_edge_entry.get().strip())
             if val > 0:
@@ -7454,7 +7700,14 @@ def run_headless():
         cfg["arb_condition_ids"] = [
             c.strip() for c in os.environ["ARB_CONDITION_IDS"].split(",") if c.strip()
         ]
+    if os.environ.get("ARB_DYNAMIC_SLUGS"):
+        # JSON list: [{"slug":"btc-updown-15m","window":900},...]
+        try:
+            cfg["arb_dynamic_slugs"] = json.loads(os.environ["ARB_DYNAMIC_SLUGS"])
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("ARB_DYNAMIC_SLUGS env var is not valid JSON — ignoring")
     if os.environ.get("ARB_DYNAMIC_SLUG"):
+        # Legacy single slug — only used if arb_dynamic_slugs is empty
         cfg["arb_dynamic_slug"] = os.environ["ARB_DYNAMIC_SLUG"].strip()
     if os.environ.get("ARB_DYNAMIC_WINDOW"):
         cfg["arb_dynamic_window"] = int(os.environ["ARB_DYNAMIC_WINDOW"])
@@ -7468,13 +7721,15 @@ def run_headless():
         cfg["arb_poll_seconds"] = int(os.environ["ARB_POLL_SECONDS"])
 
     arb_mode = cfg.get("arb_enabled") and (
-        cfg.get("arb_condition_ids") or cfg.get("arb_dynamic_slug")
+        cfg.get("arb_condition_ids")
+        or cfg.get("arb_dynamic_slugs")
+        or cfg.get("arb_dynamic_slug")
     )
     if not cfg.get("watched_addresses") and not arb_mode:
         logger.error(
             "No watched addresses or arb markets configured. "
             "Set WATCHED_ADDRESSES (comma-separated) or "
-            "ARB_ENABLED=1 + ARB_CONDITION_IDS or ARB_DYNAMIC_SLUG."
+            "ARB_ENABLED=1 + ARB_CONDITION_IDS or ARB_DYNAMIC_SLUGS."
         )
         sys.exit(1)
 
@@ -7490,11 +7745,23 @@ def run_headless():
     logger.info("Proxy redeem: %s | Proxy withdraw: %s",
                 cfg.get("proxy_redeem", True), cfg.get("proxy_withdraw", True))
     if cfg.get("arb_enabled"):
-        dyn = cfg.get("arb_dynamic_slug", "").strip()
-        if dyn:
+        dyn_slugs = cfg.get("arb_dynamic_slugs", [])
+        dyn_legacy = cfg.get("arb_dynamic_slug", "").strip()
+        if dyn_slugs:
+            logger.info("Arbitrage: ENABLED | %d dynamic slug(s) | "
+                        "Min edge: %s%% | Size: $%s/side",
+                        len(dyn_slugs),
+                        cfg.get("arb_min_edge_pct", 1.0),
+                        cfg.get("arb_size_usdc", 10.0))
+            for s in dyn_slugs:
+                logger.info("  slug: '%s' (window %ds, format %s)",
+                            s.get("slug", "?"),
+                            s.get("window", 300),
+                            s.get("format", "timestamp"))
+        elif dyn_legacy:
             logger.info("Arbitrage: ENABLED | Dynamic slug: '%s' (window %ds) | "
                         "Min edge: %s%% | Size: $%s/side",
-                        dyn, cfg.get("arb_dynamic_window", 300),
+                        dyn_legacy, cfg.get("arb_dynamic_window", 300),
                         cfg.get("arb_min_edge_pct", 1.0),
                         cfg.get("arb_size_usdc", 10.0))
         else:

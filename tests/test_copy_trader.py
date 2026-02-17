@@ -2519,5 +2519,271 @@ class TestProxyConfig(unittest.TestCase):
         self.assertIn("execute", names)
 
 
+class TestArbitrageMonitorMultiSlug(unittest.TestCase):
+    """Tests for multi-slug ArbitrageMonitor support."""
+
+    def _make_monitor(self, cfg_overrides=None):
+        cfg = dict(bot.DEFAULT_CONFIG)
+        if cfg_overrides:
+            cfg.update(cfg_overrides)
+        logger = logging.getLogger("test_arb")
+        logger.handlers = [logging.NullHandler()]
+        clob = MagicMock()
+        mon = bot.ArbitrageMonitor.__new__(bot.ArbitrageMonitor)
+        mon.clob_client = clob
+        mon.cfg = cfg
+        mon.logger = logger
+        mon._stop_event = MagicMock()
+        mon._market_lock = __import__("threading").Lock()
+        mon._markets = {}
+        mon._active_positions = {}
+        mon._slug_states = {}
+        mon._edge_log_ts = {}
+        mon._noask_log_ts = {}
+        return mon
+
+    # -- _get_effective_slugs -------------------------------------------------
+
+    def test_effective_slugs_from_new_config(self):
+        slugs = [
+            {"slug": "btc-updown-15m", "window": 900},
+            {"slug": "sol-updown-15m", "window": 900, "format": "timestamp"},
+        ]
+        mon = self._make_monitor({"arb_dynamic_slugs": slugs})
+        eff = mon._get_effective_slugs()
+        self.assertEqual(len(eff), 2)
+        self.assertEqual(eff[0]["slug"], "btc-updown-15m")
+        self.assertEqual(eff[0]["window"], 900)
+        self.assertEqual(eff[0]["format"], "timestamp")
+        self.assertEqual(eff[1]["slug"], "sol-updown-15m")
+
+    def test_effective_slugs_backward_compat(self):
+        mon = self._make_monitor({
+            "arb_dynamic_slug": "btc-updown-5m",
+            "arb_dynamic_window": 300,
+        })
+        eff = mon._get_effective_slugs()
+        self.assertEqual(len(eff), 1)
+        self.assertEqual(eff[0]["slug"], "btc-updown-5m")
+        self.assertEqual(eff[0]["window"], 300)
+        self.assertEqual(eff[0]["format"], "timestamp")
+
+    def test_effective_slugs_new_takes_precedence(self):
+        mon = self._make_monitor({
+            "arb_dynamic_slug": "old-slug",
+            "arb_dynamic_slugs": [{"slug": "new-slug", "window": 600}],
+        })
+        eff = mon._get_effective_slugs()
+        self.assertEqual(len(eff), 1)
+        self.assertEqual(eff[0]["slug"], "new-slug")
+
+    def test_effective_slugs_empty(self):
+        mon = self._make_monitor()
+        eff = mon._get_effective_slugs()
+        self.assertEqual(eff, [])
+
+    def test_effective_slugs_string_entries(self):
+        """Entries that are plain strings get normalised."""
+        mon = self._make_monitor({
+            "arb_dynamic_slugs": ["btc-updown-15m"],
+        })
+        eff = mon._get_effective_slugs()
+        self.assertEqual(len(eff), 1)
+        self.assertEqual(eff[0]["slug"], "btc-updown-15m")
+        self.assertEqual(eff[0]["window"], 300)  # default
+        self.assertEqual(eff[0]["format"], "timestamp")
+
+    # -- _generate_slug -------------------------------------------------------
+
+    def test_generate_slug_timestamp(self):
+        mon = self._make_monitor()
+        entry = {"slug": "btc-updown-15m", "window": 900, "format": "timestamp"}
+        slug = mon._generate_slug(entry)
+        self.assertTrue(slug.startswith("btc-updown-15m-"))
+        # Suffix should be a valid integer
+        ts_part = slug.replace("btc-updown-15m-", "")
+        self.assertTrue(ts_part.isdigit())
+        # Should be aligned to 900-second boundary
+        self.assertEqual(int(ts_part) % 900, 0)
+
+    def test_generate_slug_hourly(self):
+        mon = self._make_monitor()
+        entry = {"slug": "ethereum-up-or-down", "window": 3600, "format": "hourly"}
+        slug = mon._generate_slug(entry)
+        self.assertTrue(slug.startswith("ethereum-up-or-down-"))
+        self.assertTrue(slug.endswith("-et"))
+        # Should have month-day-hourampm-et pattern
+        suffix = slug.replace("ethereum-up-or-down-", "")
+        parts = suffix.replace("-et", "").split("-")
+        self.assertEqual(len(parts), 3)
+        # parts[0] = month name, parts[1] = day, parts[2] = hourampm
+        self.assertTrue(parts[0].isalpha())
+        self.assertTrue(parts[1].isdigit())
+        self.assertTrue(parts[2].endswith("am") or parts[2].endswith("pm"))
+
+    # -- _window_key_for ------------------------------------------------------
+
+    def test_window_key_changes_with_time(self):
+        mon = self._make_monitor()
+        entry = {"slug": "btc-updown-15m", "window": 900, "format": "timestamp"}
+        key1 = mon._window_key_for(entry)
+        # Same call within the same window should return same key
+        key2 = mon._window_key_for(entry)
+        self.assertEqual(key1, key2)
+
+    # -- _fetch_and_parse_slug ------------------------------------------------
+
+    def test_fetch_and_parse_slug_success(self):
+        mon = self._make_monitor()
+        entry = {"slug": "btc-updown-15m", "window": 900, "format": "timestamp"}
+        mon.clob_client._get_public.return_value = [{
+            "title": "BTC Up or Down 15m",
+            "markets": [{
+                "condition_id": "0xabc123",
+                "clobTokenIds": '["token_up", "token_down"]',
+                "outcomes": '["Up", "Down"]',
+            }],
+        }]
+        result = mon._fetch_and_parse_slug(
+            "btc-updown-15m-123", "btc-updown-15m", entry,
+        )
+        self.assertIsNotNone(result)
+        cid, mkt = result
+        self.assertEqual(cid, "0xabc123")
+        self.assertEqual(mkt["yes_token"], "token_up")
+        self.assertEqual(mkt["no_token"], "token_down")
+        self.assertEqual(mkt["yes_label"], "Up")
+        self.assertEqual(mkt["no_label"], "Down")
+        self.assertEqual(mkt["_slug_key"], "btc-updown-15m")
+        self.assertEqual(mkt["_resolved_slug"], "btc-updown-15m-123")
+
+    def test_fetch_and_parse_slug_no_event(self):
+        mon = self._make_monitor()
+        entry = {"slug": "x", "window": 300, "format": "timestamp"}
+        mon.clob_client._get_public.return_value = []
+        result = mon._fetch_and_parse_slug("x-123", "x", entry)
+        self.assertIsNone(result)
+
+    def test_fetch_and_parse_slug_no_tokens(self):
+        mon = self._make_monitor()
+        entry = {"slug": "x", "window": 300, "format": "timestamp"}
+        mon.clob_client._get_public.return_value = [{
+            "markets": [{"condition_id": "0x1", "clobTokenIds": "[]"}],
+        }]
+        result = mon._fetch_and_parse_slug("x-123", "x", entry)
+        self.assertIsNone(result)
+
+    # -- _resolve_dynamic_slugs (integration) ---------------------------------
+
+    def test_resolve_multiple_slugs_merges_markets(self):
+        mon = self._make_monitor({
+            "arb_dynamic_slugs": [
+                {"slug": "btc-updown-15m", "window": 900},
+                {"slug": "sol-updown-15m", "window": 900},
+            ],
+        })
+
+        call_count = [0]
+        def mock_get_public(url, params=None):
+            call_count[0] += 1
+            slug = params.get("slug", "")
+            if "btc" in slug:
+                return [{"markets": [{
+                    "condition_id": "cid_btc",
+                    "clobTokenIds": '["btc_up", "btc_down"]',
+                    "outcomes": '["Up", "Down"]',
+                    "question": "BTC 15m",
+                }]}]
+            elif "sol" in slug:
+                return [{"markets": [{
+                    "condition_id": "cid_sol",
+                    "clobTokenIds": '["sol_up", "sol_down"]',
+                    "outcomes": '["Up", "Down"]',
+                    "question": "SOL 15m",
+                }]}]
+            return []
+
+        mon.clob_client._get_public.side_effect = mock_get_public
+        mon._resolve_dynamic_slugs()
+
+        self.assertEqual(len(mon._markets), 2)
+        self.assertIn("cid_btc", mon._markets)
+        self.assertIn("cid_sol", mon._markets)
+        self.assertEqual(mon._markets["cid_btc"]["yes_token"], "btc_up")
+        self.assertEqual(mon._markets["cid_sol"]["yes_token"], "sol_up")
+
+    def test_resolve_preserves_static_markets(self):
+        mon = self._make_monitor({
+            "arb_dynamic_slugs": [
+                {"slug": "btc-updown-15m", "window": 900},
+            ],
+        })
+        # Pre-populate a static market (no _slug_key)
+        mon._markets["static_cid"] = {
+            "yes_token": "t1", "no_token": "t2",
+            "yes_label": "A", "no_label": "B", "question": "Static",
+        }
+
+        mon.clob_client._get_public.return_value = [{"markets": [{
+            "condition_id": "cid_btc",
+            "clobTokenIds": '["btc_up", "btc_down"]',
+            "outcomes": '["Up", "Down"]',
+            "question": "BTC 15m",
+        }]}]
+        mon._resolve_dynamic_slugs()
+
+        self.assertIn("static_cid", mon._markets)
+        self.assertIn("cid_btc", mon._markets)
+
+    def test_resolve_failed_slug_keeps_existing(self):
+        mon = self._make_monitor({
+            "arb_dynamic_slugs": [
+                {"slug": "btc-updown-15m", "window": 900},
+                {"slug": "fail-slug", "window": 900},
+            ],
+        })
+
+        def mock_get_public(url, params=None):
+            slug = params.get("slug", "")
+            if "btc" in slug:
+                return [{"markets": [{
+                    "condition_id": "cid_btc",
+                    "clobTokenIds": '["btc_up", "btc_down"]',
+                    "outcomes": '["Up", "Down"]',
+                    "question": "BTC 15m",
+                }]}]
+            return []  # fail-slug returns nothing
+
+        mon.clob_client._get_public.side_effect = mock_get_public
+        mon._resolve_dynamic_slugs()
+
+        self.assertEqual(len(mon._markets), 1)
+        self.assertIn("cid_btc", mon._markets)
+
+    # -- _get_window_ts -------------------------------------------------------
+
+    def test_get_window_ts_alignment(self):
+        import time
+        now = int(time.time())
+        ts = bot.ArbitrageMonitor._get_window_ts(900)
+        self.assertEqual(ts % 900, 0)
+        self.assertLessEqual(ts, now)
+        self.assertGreater(ts + 900, now)
+
+    # -- _generate_hourly_slug ------------------------------------------------
+
+    def test_hourly_slug_format(self):
+        slug = bot.ArbitrageMonitor._generate_hourly_slug(
+            "xrp-up-or-down", 3600,
+        )
+        self.assertTrue(slug.startswith("xrp-up-or-down-"))
+        self.assertTrue(slug.endswith("-et"))
+        # Should be lowercase month
+        suffix = slug.replace("xrp-up-or-down-", "").replace("-et", "")
+        parts = suffix.split("-")
+        self.assertEqual(len(parts), 3)
+        self.assertTrue(parts[0][0].islower())  # month is lowercase
+
+
 if __name__ == "__main__":
     unittest.main()
