@@ -503,6 +503,8 @@ DEFAULT_CONFIG = {
     "martingale_slug_base": "btc-updown-5m",  # slug prefix for the market
     "martingale_window": 300,          # window size in seconds (300 = 5 min)
     "martingale_poll_seconds": 10,     # how often to check for resolution
+    "martingale_max_slippage": 0.10,   # max deviation from $0.50 (e.g. 0.10 = $0.40–$0.60)
+    "martingale_max_entry_seconds": 60, # only bet in the first N seconds of a window
 }
 
 # Keys from DEFAULT_CONFIG that are worth persisting across restarts.
@@ -522,6 +524,7 @@ _PERSISTENT_CONFIG_KEYS = [
     "martingale_enabled", "martingale_direction", "martingale_start_bet",
     "martingale_max_bet", "martingale_max_streak",
     "martingale_slug_base", "martingale_window", "martingale_poll_seconds",
+    "martingale_max_slippage", "martingale_max_entry_seconds",
 ]
 
 
@@ -3046,7 +3049,10 @@ class MartingaleBot(threading.Thread):
     # -- bet placement & result handling ------------------------------------
 
     def _try_place_bet(self):
-        """Attempt to place a bet on the current window."""
+        """Attempt to place a bet on the current window.
+
+        Returns ``True`` if a bet was placed, ``False`` otherwise.
+        """
         # Safety: max streak
         max_streak = int(self.cfg.get("martingale_max_streak", 0))
         if max_streak > 0 and self.consecutive_losses >= max_streak:
@@ -3055,7 +3061,7 @@ class MartingaleBot(threading.Thread):
                 max_streak,
             )
             self.stop()
-            return
+            return False
 
         # Safety: max bet
         max_bet = float(self.cfg.get("martingale_max_bet", 0))
@@ -3065,18 +3071,37 @@ class MartingaleBot(threading.Thread):
                 self.current_bet, max_bet,
             )
             self.stop()
-            return
+            return False
 
-        # Generate slug and avoid re-betting the same window
-        slug = self._generate_slug()
+        # Avoid re-betting the same window
         window = int(self.cfg.get("martingale_window", 300))
         current_window_ts = self._get_window_ts(window)
         if current_window_ts == self._last_window_ts:
-            return  # already bet on this window
+            return False  # already bet or skipped this window
 
+        # Check how far into the window we are — only bet in the early
+        # portion (default first 60s) when prices are closest to $0.50.
+        now = int(time.time())
+        seconds_into = now - current_window_ts
+        max_entry = int(self.cfg.get("martingale_max_entry_seconds", 60))
+        if seconds_into > max_entry:
+            self.logger.info(
+                "MARTINGALE: window %d is %ds old (max %ds) — skipping, "
+                "waiting for next window",
+                current_window_ts, seconds_into, max_entry,
+            )
+            self._last_window_ts = current_window_ts  # mark skipped
+            return False
+
+        # Fetch the market
+        slug = self._generate_slug()
         market = self._fetch_market(slug)
         if not market:
-            return
+            self.logger.info(
+                "MARTINGALE: market not available yet for '%s' — "
+                "will retry (%ds into window)", slug, seconds_into,
+            )
+            return False  # don't mark as skipped — retry on next poll
 
         # Allow runtime direction toggle via config
         direction = self.cfg.get("martingale_direction", self.direction)
@@ -3087,8 +3112,21 @@ class MartingaleBot(threading.Thread):
         )
         ask_price, ask_size = self._get_best_ask(token_id)
         if not ask_price or ask_price <= 0:
-            self.logger.debug("No asks available for %s token", direction)
-            return
+            self.logger.info(
+                "MARTINGALE: no asks for %s token yet — will retry "
+                "(%ds into window)", direction, seconds_into,
+            )
+            return False
+
+        # Slippage check — only bet when price is near $0.50
+        max_slippage = float(self.cfg.get("martingale_max_slippage", 0.10))
+        if abs(ask_price - 0.50) > max_slippage:
+            self.logger.info(
+                "MARTINGALE: price $%.4f too far from $0.50 "
+                "(slippage %.2f > max %.2f) — will retry",
+                ask_price, abs(ask_price - 0.50), max_slippage,
+            )
+            return False  # don't mark skipped — price might come back
 
         target_shares = self.current_bet / ask_price
         if target_shares > ask_size:
@@ -3096,7 +3134,7 @@ class MartingaleBot(threading.Thread):
                 "MARTINGALE: insufficient liquidity (need %.1f, have %.1f)",
                 target_shares, ask_size,
             )
-            return
+            return False
 
         # Dry run guard
         if self.cfg.get("dry_run", False):
@@ -3105,7 +3143,7 @@ class MartingaleBot(threading.Thread):
                 direction, ask_price, self.current_bet,
             )
             self._last_window_ts = current_window_ts
-            return
+            return False
 
         result = self.clob_client.place_order(
             token_id=token_id,
@@ -3118,12 +3156,17 @@ class MartingaleBot(threading.Thread):
         if isinstance(result, dict) and (
             result.get("status") == "fok_rejected" or result.get("error")
         ):
-            self.logger.warning("MARTINGALE: FOK rejected for %s", direction)
-            return
+            self.logger.warning(
+                "MARTINGALE: FOK rejected for %s @ $%.4f — will retry",
+                direction, ask_price,
+            )
+            return False
 
         if not result:
-            self.logger.warning("MARTINGALE: order failed for %s", direction)
-            return
+            self.logger.warning(
+                "MARTINGALE: order failed for %s — will retry", direction,
+            )
+            return False
 
         actual_shares = float(result.get("takingAmount", 0)) or target_shares
         actual_cost = float(result.get("makingAmount", 0)) or self.current_bet
@@ -3155,6 +3198,7 @@ class MartingaleBot(threading.Thread):
                 f"@ ${ask_price:.4f} ({actual_shares:.1f} shares) — "
                 f"streak: {self.consecutive_losses}"
             )
+        return True
 
     def _handle_win(self, bet):
         profit = bet["shares"] - bet["cost"]
@@ -3240,13 +3284,17 @@ class MartingaleBot(threading.Thread):
     # -- main loop ----------------------------------------------------------
 
     def _cycle(self):
-        """One tick of the martingale state machine."""
+        """One tick of the martingale state machine.
+
+        Returns ``True`` when the bot is in a position (slow-poll mode),
+        ``False`` when it's hunting for the next bet (fast-poll mode).
+        """
         if self._active_bet:
             bet = self._active_bet
             # Wait until window has ended + buffer before checking resolution
             now = int(time.time())
             if now < bet["window_end"] + 30:
-                return
+                return True  # waiting — slow poll
 
             resolved, won = self._check_resolution(
                 bet["condition_id"], bet["direction"],
@@ -3259,14 +3307,17 @@ class MartingaleBot(threading.Thread):
                         bet["slug"],
                     )
                     self._handle_loss(bet)
-                return
+                    return False  # switch to fast poll for next bet
+                return True  # still waiting — slow poll
 
             if won:
                 self._handle_win(bet)
             else:
                 self._handle_loss(bet)
+            return False  # resolved — switch to fast poll for next bet
         else:
-            self._try_place_bet()
+            placed = self._try_place_bet()
+            return placed  # fast poll until placed, then slow poll
 
     def run(self):
         self.logger.info(
@@ -3274,13 +3325,18 @@ class MartingaleBot(threading.Thread):
             self.direction, self.current_bet, self.consecutive_losses,
         )
 
-        poll = max(float(self.cfg.get("martingale_poll_seconds", 10)), 1)
+        poll_slow = max(float(self.cfg.get("martingale_poll_seconds", 10)), 1)
+        poll_fast = 2.0  # aggressive polling when looking for next bet
+
         while not self._stop_event.is_set():
             try:
-                self._cycle()
+                in_position = self._cycle()
             except Exception as exc:
                 self.logger.error("Martingale error: %s", exc, exc_info=True)
-            self._stop_event.wait(timeout=poll)
+                in_position = False
+            self._stop_event.wait(
+                timeout=poll_slow if in_position else poll_fast,
+            )
 
         self.logger.info("Martingale bot stopped")
 
@@ -8186,6 +8242,20 @@ class CopyTraderGUI:
         self.mart_poll_entry = ttk.Entry(settings_frame, width=10)
         self.mart_poll_entry.grid(row=row, column=1, padx=2, pady=2)
 
+        row += 1
+        ttk.Label(settings_frame, text="Max Slippage from $0.50:").grid(
+            row=row, column=0, sticky=tk.W, padx=2, pady=2,
+        )
+        self.mart_slippage_entry = ttk.Entry(settings_frame, width=10)
+        self.mart_slippage_entry.grid(row=row, column=1, padx=2, pady=2)
+
+        row += 1
+        ttk.Label(settings_frame, text="Max Entry (seconds into window):").grid(
+            row=row, column=0, sticky=tk.W, padx=2, pady=2,
+        )
+        self.mart_max_entry_entry = ttk.Entry(settings_frame, width=10)
+        self.mart_max_entry_entry.grid(row=row, column=1, padx=2, pady=2)
+
         # Status label
         self.mart_status_var = tk.StringVar(value="Martingale: idle")
         ttk.Label(
@@ -8433,6 +8503,8 @@ class CopyTraderGUI:
         self.mart_slug_entry.insert(0, self.cfg.get("martingale_slug_base", "btc-updown-5m"))
         self.mart_window_entry.insert(0, str(self.cfg.get("martingale_window", 300)))
         self.mart_poll_entry.insert(0, str(self.cfg.get("martingale_poll_seconds", 10)))
+        self.mart_slippage_entry.insert(0, str(self.cfg.get("martingale_max_slippage", 0.10)))
+        self.mart_max_entry_entry.insert(0, str(self.cfg.get("martingale_max_entry_seconds", 60)))
 
     def _read_fields_to_config(self):
         self.cfg["rpc_url"] = self.rpc_entry.get().strip()
@@ -8561,6 +8633,18 @@ class CopyTraderGUI:
             val = int(self.mart_poll_entry.get().strip())
             if val >= 1:
                 self.cfg["martingale_poll_seconds"] = val
+        except ValueError:
+            pass
+        try:
+            val = float(self.mart_slippage_entry.get().strip())
+            if 0 < val <= 0.50:
+                self.cfg["martingale_max_slippage"] = val
+        except ValueError:
+            pass
+        try:
+            val = int(self.mart_max_entry_entry.get().strip())
+            if val >= 5:
+                self.cfg["martingale_max_entry_seconds"] = val
         except ValueError:
             pass
 
@@ -8828,6 +8912,10 @@ def run_headless():
         cfg["martingale_window"] = int(os.environ["MARTINGALE_WINDOW"])
     if os.environ.get("MARTINGALE_POLL_SECONDS"):
         cfg["martingale_poll_seconds"] = int(os.environ["MARTINGALE_POLL_SECONDS"])
+    if os.environ.get("MARTINGALE_MAX_SLIPPAGE"):
+        cfg["martingale_max_slippage"] = float(os.environ["MARTINGALE_MAX_SLIPPAGE"])
+    if os.environ.get("MARTINGALE_MAX_ENTRY_SECONDS"):
+        cfg["martingale_max_entry_seconds"] = int(os.environ["MARTINGALE_MAX_ENTRY_SECONDS"])
 
     arb_mode = cfg.get("arb_enabled") and (
         cfg.get("arb_condition_ids")

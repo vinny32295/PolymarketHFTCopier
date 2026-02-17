@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 import unittest
 from decimal import Decimal
 from unittest.mock import MagicMock, patch, PropertyMock
@@ -3008,6 +3009,8 @@ class TestMartingaleBot(unittest.TestCase):
         cfg["martingale_slug_base"] = "btc-updown-5m"
         cfg["martingale_window"] = 300
         cfg["martingale_poll_seconds"] = 10
+        cfg["martingale_max_slippage"] = 0.50  # wide for tests
+        cfg["martingale_max_entry_seconds"] = 9999  # disable window-start guard for tests
         if cfg_overrides:
             cfg.update(cfg_overrides)
         logger = logging.getLogger("test_martingale")
@@ -3114,7 +3117,8 @@ class TestMartingaleBot(unittest.TestCase):
             "takingAmount": "10.0",
             "makingAmount": "5.0",
         }
-        mb._try_place_bet()
+        result = mb._try_place_bet()
+        self.assertTrue(result)
         self.assertIsNotNone(mb._active_bet)
         self.assertEqual(mb._active_bet["direction"], "Up")
         self.assertEqual(mb._active_bet["shares"], 10.0)
@@ -3182,6 +3186,79 @@ class TestMartingaleBot(unittest.TestCase):
         mb.current_bet = 20.0
         mb._try_place_bet()
         mb._stop_event.set.assert_called_once()
+
+    def test_try_place_bet_slippage_rejected(self):
+        """Price too far from $0.50 should be rejected."""
+        mb = self._make_bot({"martingale_max_slippage": 0.05})  # tight slippage
+        mb.clob_client._get_public.return_value = [{
+            "markets": [{
+                "condition_id": "cid1",
+                "question": "BTC?",
+                "clobTokenIds": '["tok_up", "tok_down"]',
+                "outcomes": '["Up", "Down"]',
+            }]
+        }]
+        mb.clob_client.get_order_book.return_value = {
+            "asks": [{"price": "0.70", "size": "100"}],  # too far from 0.50
+        }
+        result = mb._try_place_bet()
+        self.assertFalse(result)
+        self.assertIsNone(mb._active_bet)
+        # Should NOT mark window as skipped — price might come back
+        self.assertEqual(mb._last_window_ts, 0)
+
+    def test_try_place_bet_slippage_accepted(self):
+        """Price near $0.50 should be accepted."""
+        mb = self._make_bot({"martingale_max_slippage": 0.05})
+        mb.clob_client._get_public.return_value = [{
+            "markets": [{
+                "condition_id": "cid1",
+                "question": "BTC?",
+                "clobTokenIds": '["tok_up", "tok_down"]',
+                "outcomes": '["Up", "Down"]',
+            }]
+        }]
+        mb.clob_client.get_order_book.return_value = {
+            "asks": [{"price": "0.52", "size": "100"}],  # within slippage
+        }
+        mb.clob_client.place_order.return_value = {
+            "takingAmount": "9.6",
+            "makingAmount": "5.0",
+        }
+        result = mb._try_place_bet()
+        self.assertTrue(result)
+        self.assertIsNotNone(mb._active_bet)
+
+    def test_try_place_bet_window_too_old(self):
+        """Should skip if too far into the current window."""
+        mb = self._make_bot({"martingale_max_entry_seconds": 10})
+        # Don't set _last_window_ts so the same-window check passes,
+        # but the seconds_into check should catch it (we're >10s into
+        # the current 300s window unless the test happens to run right
+        # on a boundary, so use a very small max_entry to force it).
+        result = mb._try_place_bet()
+        self.assertFalse(result)
+        # Should mark window as skipped so we don't retry
+        window_ts = mb._get_window_ts(300)
+        self.assertEqual(mb._last_window_ts, window_ts)
+
+    def test_cycle_returns_false_when_no_bet(self):
+        """_cycle returns False when no active bet and bet not placed."""
+        mb = self._make_bot({"martingale_max_entry_seconds": 0})
+        result = mb._cycle()
+        self.assertFalse(result)
+
+    def test_cycle_returns_true_when_waiting_for_resolution(self):
+        """_cycle returns True when active bet is still pending."""
+        mb = self._make_bot()
+        mb._active_bet = {
+            "slug": "test",
+            "condition_id": "cid1",
+            "direction": "Up",
+            "window_end": int(time.time()) + 300,  # still in window
+        }
+        result = mb._cycle()
+        self.assertTrue(result)  # waiting for window to end
 
     # -- win/loss handling --
 
