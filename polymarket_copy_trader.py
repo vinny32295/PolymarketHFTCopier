@@ -3372,6 +3372,9 @@ class MartingaleBot(threading.Thread):
         self.notify_callback = None
         self.log_trade_callback = None
 
+        # Validate slug_base vs window — auto-correct common misconfigs
+        self._validate_slug_window()
+
         self._load_state()
 
     # -- strategy-aware config helper ----------------------------------------
@@ -3390,6 +3393,42 @@ class MartingaleBot(threading.Thread):
         if config_key:
             return self.cfg.get(config_key, default)
         return default
+
+    # -- config validation --------------------------------------------------
+
+    # Map common timeframe suffixes in slug_base → expected window seconds
+    _SLUG_TIMEFRAME_MAP = {
+        "1m": 60, "2m": 120, "3m": 180, "5m": 300, "10m": 600,
+        "15m": 900, "30m": 1800, "1h": 3600,
+    }
+
+    def _validate_slug_window(self):
+        """Warn (and auto-correct) when slug_base implies a different
+        window than what is configured.
+
+        E.g. slug_base='btc-updown-15m' clearly implies a 900s window,
+        but a user might forget to change window from the default 300.
+        """
+        slug_base = self._scfg("slug_base", "martingale_slug_base", "")
+        window = int(self._scfg("window", "martingale_window", 300))
+
+        # Try to infer expected window from slug_base suffix
+        inferred = None
+        for suffix, seconds in self._SLUG_TIMEFRAME_MAP.items():
+            if slug_base.endswith(f"-{suffix}") or slug_base.endswith(f"_{suffix}"):
+                inferred = seconds
+                break
+
+        if inferred and inferred != window:
+            self.logger.warning(
+                "MARTINGALE [%s] CONFIG MISMATCH: slug_base '%s' implies "
+                "window=%ds but config has window=%ds — auto-correcting to %ds. "
+                "Please fix your strategy config.",
+                self.strategy_name, slug_base, inferred, window, inferred,
+            )
+            # Auto-correct in the strategy dict so all downstream code
+            # uses the right window.
+            self.strategy["window"] = inferred
 
     # -- persistence --------------------------------------------------------
 
