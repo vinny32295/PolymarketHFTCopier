@@ -1099,16 +1099,13 @@ class TelegramCommandBot:
             sl = MartingaleBot._aggregate_slippage(slippage_records)
             lines += [
                 "",
-                "SLIPPAGE",
+                "SLIPPAGE (vs $0.50 fair — positive = good)",
                 f"  Bets tracked: {sl['bets_with_slippage_data']}",
-                f"  Total exec slippage: ${sl['total_exec_slippage_usdc']:+,.4f}",
-                f"  Avg slippage vs ask: ${sl['avg_slippage_vs_ask']:+.4f}/sh",
+                f"  Total slippage: ${sl['total_slippage_usdc']:+,.4f}",
+                f"  Avg slippage: {sl['avg_slippage']:+.4f}/sh",
                 f"  Avg fill price: ${sl['avg_fill_price']:.4f}",
-                f"  Favorable fills: {sl['favorable_fills']['count']}"
-                f"  (${sl['favorable_fills']['total_edge_gained_usdc']:,.4f} saved)",
-                f"  Unfavorable fills: {sl['unfavorable_fills']['count']}"
-                f"  (${sl['unfavorable_fills']['total_edge_lost_usdc']:,.4f} lost)",
-                f"  Net edge: ${sl['net_edge_usdc']:+,.4f} ({sl['net_verdict']})",
+                f"  Best fill: {sl['best_fill']:+.4f}/sh",
+                f"  Worst fill: {sl['worst_fill']:+.4f}/sh",
             ]
 
         self.send("\n".join(lines))
@@ -4598,15 +4595,11 @@ class MartingaleBot(threading.Thread):
         actual_shares = float(result.get("takingAmount", 0)) or target_shares
         actual_cost = float(result.get("makingAmount", 0)) or self.current_bet
 
-        # -- Slippage calculation --
-        # fill_price: what we actually paid per share
-        # ask_price:  best ask at order time (what we expected to pay)
-        # fair_price: 0.50 for a 50/50 binary — deviation from this is the
-        #             theoretical edge we're giving up
+        # -- Slippage: how far our fill deviated from $0.50 fair --
+        # Positive = bought below fair (good), negative = bought above (bad)
         fill_price = round(actual_cost / actual_shares, 6) if actual_shares > 0 else ask_price
-        slippage_vs_ask = round(fill_price - ask_price, 6)          # execution slippage
-        slippage_vs_fair = round(fill_price - 0.50, 6)              # edge slippage (cost above fair)
-        slippage_usdc = round(slippage_vs_ask * actual_shares, 6)   # total $ execution slippage
+        slippage = round(0.50 - fill_price, 6)
+        slippage_usdc = round(slippage * actual_shares, 6)
 
         opposite_token = (
             market["down_token"] if direction == "Up"
@@ -4619,12 +4612,10 @@ class MartingaleBot(threading.Thread):
             "opposite_token_id": opposite_token,
             "direction": direction,
             "bet_size": self.current_bet,
-            "price": ask_price,
             "fill_price": fill_price,
             "shares": actual_shares,
             "cost": actual_cost,
-            "slippage_vs_ask": slippage_vs_ask,
-            "slippage_vs_fair": slippage_vs_fair,
+            "slippage": slippage,
             "slippage_usdc": slippage_usdc,
             "question": market["question"],
             "window_end": self._get_window_end(),
@@ -4636,18 +4627,18 @@ class MartingaleBot(threading.Thread):
         self._save_state()
 
         slip_tag = ""
-        if abs(slippage_vs_ask) >= 0.0001:
-            slip_tag = f" | slip ${slippage_usdc:+.4f} ({slippage_vs_ask:+.4f}/sh)"
+        if abs(slippage) >= 0.0001:
+            slip_tag = f" | slip {slippage:+.4f} (${slippage_usdc:+.4f})"
         self.logger.info(
-            "MARTINGALE BET [%s]: %s $%.2f @ ask $%.4f fill $%.4f "
+            "MARTINGALE BET [%s]: %s $%.2f @ $%.4f "
             "(%.1f shares) — streak: %d%s",
-            self.strategy_name, direction, actual_cost, ask_price,
-            fill_price, actual_shares, self.consecutive_losses, slip_tag,
+            self.strategy_name, direction, actual_cost, fill_price,
+            actual_shares, self.consecutive_losses, slip_tag,
         )
         if self.notify_callback:
             self.notify_callback(
                 f"{self.strategy_name} BET ${actual_cost:.2f} "
-                f"@ ${fill_price:.4f} (ask ${ask_price:.4f}) "
+                f"@ ${fill_price:.4f} "
                 f"| streak: {self.consecutive_losses}"
             )
         return True
@@ -4656,18 +4647,10 @@ class MartingaleBot(threading.Thread):
         profit = bet["shares"] - bet["cost"]
         self.session_pnl += profit
 
-        # Slippage impact relative to fair value ($0.50).
-        # Negative = favorable (bought below fair, extra edge gained).
-        # Positive = unfavorable (bought above fair, edge lost).
-        slip_fair = bet.get("slippage_vs_fair", 0)
+        slip = bet.get("slippage", 0)
         slip_info = ""
-        if abs(slip_fair) >= 0.0001:
-            edge_usdc = slip_fair * bet["shares"]
-            tag = "edge lost" if slip_fair > 0 else "edge gained"
-            slip_info = (
-                f" | fill ${bet.get('fill_price', 0):.4f} vs "
-                f"$0.50 fair → ${abs(edge_usdc):.4f} {tag}"
-            )
+        if abs(slip) >= 0.0001:
+            slip_info = f" | slip {slip:+.4f} (${bet.get('slippage_usdc', 0):+.4f})"
 
         self.logger.info(
             "MARTINGALE WIN: %s +$%.4f (shares=%.1f, cost=$%.2f) — "
@@ -4719,12 +4702,10 @@ class MartingaleBot(threading.Thread):
                 "MARTINGALE [%s]: bet capped at max $%.2f", self.strategy_name, max_bet,
             )
 
-        slip_fair = bet.get("slippage_vs_fair", 0)
+        slip = bet.get("slippage", 0)
         slip_info = ""
-        if abs(slip_fair) >= 0.0001:
-            extra = slip_fair * bet["shares"]
-            tag = "overpaid" if slip_fair > 0 else "underpaid"
-            slip_info = f" | {tag} ${abs(extra):.4f} vs $0.50 fair"
+        if abs(slip) >= 0.0001:
+            slip_info = f" | slip {slip:+.4f} (${bet.get('slippage_usdc', 0):+.4f})"
 
         self.logger.info(
             "MARTINGALE LOSS: %s -$%.2f (fill $%.4f) — next bet $%.2f "
@@ -4746,9 +4727,7 @@ class MartingaleBot(threading.Thread):
 
     def _log_bet(self, bet, won, profit):
         fill_price = bet.get("fill_price", 0)
-        ask_price = bet.get("price", 0)
-        slippage_vs_ask = bet.get("slippage_vs_ask", 0)
-        slippage_vs_fair = bet.get("slippage_vs_fair", 0)
+        slippage = bet.get("slippage", 0)
         slippage_usdc = bet.get("slippage_usdc", 0)
 
         record = {
@@ -4764,10 +4743,8 @@ class MartingaleBot(threading.Thread):
             "outcome": "won" if won else "lost",
             "reason": "martingale",
             "slippage": {
-                "ask_price": ask_price,
                 "fill_price": fill_price,
-                "vs_ask": slippage_vs_ask,
-                "vs_fair": slippage_vs_fair,
+                "vs_fair": slippage,
                 "total_usdc": slippage_usdc,
             },
             "martingale_details": {
@@ -4799,57 +4776,28 @@ class MartingaleBot(threading.Thread):
     def _aggregate_slippage(records):
         """Compute slippage stats from a list of trade records.
 
-        Splits into favorable (bought below $0.50 fair) and unfavorable
-        (bought above $0.50 fair) so you can see exactly how much edge
-        you're gaining or losing to price execution.
+        Slippage = $0.50 - fill_price.
+        Positive = bought below fair (good), negative = bought above (bad).
         """
-        slips_vs_ask = []
-        slips_vs_fair = []
+        slippages = []
         total_slip_usdc = 0.0
         fill_prices = []
-        favorable_usdc = 0.0     # total $ saved by buying below fair
-        unfavorable_usdc = 0.0   # total $ lost by buying above fair
-        favorable_count = 0
-        unfavorable_count = 0
         for r in records:
             s = r.get("slippage") or {}
             if s:
-                vs_ask = s.get("vs_ask", 0)
                 vs_fair = s.get("vs_fair", 0)
-                slip_usdc = s.get("total_usdc", 0)
-                slips_vs_ask.append(vs_ask)
-                slips_vs_fair.append(vs_fair)
-                total_slip_usdc += slip_usdc
+                slippages.append(vs_fair)
+                total_slip_usdc += s.get("total_usdc", 0)
                 if s.get("fill_price"):
                     fill_prices.append(s["fill_price"])
-                    shares = r.get("shares", 0)
-                    edge_usdc = vs_fair * shares
-                    if vs_fair < 0:
-                        favorable_usdc += abs(edge_usdc)
-                        favorable_count += 1
-                    elif vs_fair > 0:
-                        unfavorable_usdc += edge_usdc
-                        unfavorable_count += 1
-        n = len(slips_vs_ask) or 1
-        net_edge = favorable_usdc - unfavorable_usdc
+        n = len(slippages) or 1
         return {
-            "total_exec_slippage_usdc": round(total_slip_usdc, 6),
-            "avg_slippage_vs_ask": round(sum(slips_vs_ask) / n, 6) if slips_vs_ask else 0,
+            "total_slippage_usdc": round(total_slip_usdc, 6),
+            "avg_slippage": round(sum(slippages) / n, 6) if slippages else 0,
             "avg_fill_price": round(sum(fill_prices) / len(fill_prices), 6) if fill_prices else 0,
-            "avg_slippage_vs_fair": round(sum(slips_vs_fair) / n, 6) if slips_vs_fair else 0,
-            "max_overpay_vs_ask": round(max(slips_vs_ask), 6) if slips_vs_ask else 0,
-            "best_underpay_vs_ask": round(min(slips_vs_ask), 6) if slips_vs_ask else 0,
-            "favorable_fills": {
-                "count": favorable_count,
-                "total_edge_gained_usdc": round(favorable_usdc, 6),
-            },
-            "unfavorable_fills": {
-                "count": unfavorable_count,
-                "total_edge_lost_usdc": round(unfavorable_usdc, 6),
-            },
-            "net_edge_usdc": round(net_edge, 6),
-            "net_verdict": "favorable" if net_edge > 0 else ("unfavorable" if net_edge < 0 else "neutral"),
-            "bets_with_slippage_data": len(slips_vs_ask),
+            "best_fill": round(max(slippages), 6) if slippages else 0,
+            "worst_fill": round(min(slippages), 6) if slippages else 0,
+            "bets_with_slippage_data": len(slippages),
         }
 
     def _persist_martingale_record(self, record):
@@ -9688,13 +9636,13 @@ class CopyTraderGUI:
                 m_pnl = ms.get("lifetime_pnl_usdc", 0)
                 m_wr = ms.get("win_rate_pct", 0)
                 slip = ms.get("slippage") or {}
-                net_edge = slip.get("net_edge_usdc", 0)
                 avg_fill = slip.get("avg_fill_price", 0)
+                total_slip = slip.get("total_slippage_usdc", 0)
                 edge_tag = ""
                 if avg_fill > 0:
                     edge_tag = (
                         f" avg ${avg_fill:.3f}"
-                        f" edge ${net_edge:+,.2f}"
+                        f" slip ${total_slip:+,.2f}"
                     )
                 mart_label = (
                     f"  |  Mart: W/L {m_wins}/{m_losses} "
