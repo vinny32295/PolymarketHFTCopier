@@ -10493,10 +10493,14 @@ class CopyTraderGUI:
         self.history_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Summary label
+        # Summary labels
         self.history_summary_var = tk.StringVar(value="")
         ttk.Label(parent, textvariable=self.history_summary_var, font=("Courier", 10)).pack(
             anchor=tk.W, pady=(5, 0),
+        )
+        self.history_fill_var = tk.StringVar(value="")
+        ttk.Label(parent, textvariable=self.history_fill_var, font=("Courier", 10)).pack(
+            anchor=tk.W, pady=(1, 0),
         )
 
         btn_frame = ttk.Frame(parent)
@@ -10547,6 +10551,9 @@ class CopyTraderGUI:
         total_cost = 0.0
         total_proceeds = 0.0
         total_slip_usdc = 0.0
+        total_slip_shares = 0.0       # shares-weighted for avg fill calc
+        total_slip_cost = 0.0         # cost of trades with slippage data
+        slip_count = 0
         wins = losses = 0
         for rec in reversed(history):  # newest first
             pnl = rec.get("pnl_usdc", 0)
@@ -10561,8 +10568,14 @@ class CopyTraderGUI:
             # Per-trade slippage (martingale records only)
             slip = rec.get("slippage") or {}
             slip_usdc = slip.get("total_usdc", 0)
-            total_slip_usdc += slip_usdc
-            slip_display = f"{slip_usdc:+.4f}" if slip_usdc else ""
+            fill_price = slip.get("fill_price", 0)
+            shares = rec.get("shares", 0)
+            if slip and fill_price:
+                total_slip_usdc += slip_usdc
+                total_slip_shares += shares
+                total_slip_cost += rec.get("cost_basis_usdc", 0)
+                slip_count += 1
+            slip_display = f"{slip_usdc:+.2f}" if slip_usdc else ""
 
             closed_at = rec.get("closed_at", "")
             # Shorten the ISO timestamp for display
@@ -10592,13 +10605,30 @@ class CopyTraderGUI:
         n = len(history)
         total_pnl = total_proceeds - total_cost
         win_rate = f"{wins/(wins+losses)*100:.0f}%" if (wins + losses) > 0 else "N/A"
-        slip_summary = f"  |  Slip: ${total_slip_usdc:+,.2f}" if total_slip_usdc else ""
         self.history_summary_var.set(
             f"Trades: {n}  |  Deployed: ${total_cost:,.2f}  |  "
             f"Returned: ${total_proceeds:,.2f}  |  "
             f"P&L: ${total_pnl:+,.2f}  |  "
-            f"W/L: {wins}/{losses} ({win_rate}){slip_summary}"
+            f"W/L: {wins}/{losses} ({win_rate})"
         )
+
+        # Fill-cost analysis line (only shown when slippage data exists)
+        if slip_count > 0:
+            avg_fill = total_slip_cost / total_slip_shares if total_slip_shares else 0
+            # total_slip_usdc: positive = net saved (bought below .50),
+            #                  negative = net overpaid (bought above .50)
+            if total_slip_usdc >= 0:
+                net_label = f"saved ${total_slip_usdc:,.2f}"
+            else:
+                net_label = f"overpaid ${abs(total_slip_usdc):,.2f}"
+            self.history_fill_var.set(
+                f"Fill Analysis ({slip_count} trades):  "
+                f"Avg Fill: ${avg_fill:.4f}  |  "
+                f"Net vs $0.50 Fair: {net_label}  |  "
+                f"on ${total_slip_cost:,.2f} deployed"
+            )
+        else:
+            self.history_fill_var.set("")
 
     def _export_history_csv(self):
         """Export trade history to a CSV file."""
