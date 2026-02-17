@@ -2136,6 +2136,15 @@ class ArbitrageMonitor(threading.Thread):
             asks_no = book_no.get("asks") or []
 
             if not asks_yes or not asks_no:
+                now = time.time()
+                if not hasattr(self, '_last_noask_log_t') or now - self._last_noask_log_t >= 60:
+                    self._last_noask_log_t = now
+                    self.logger.info(
+                        "Arb scan: %s — no asks on %s side (Yes asks: %d, No asks: %d)",
+                        mkt["question"][:40],
+                        "Yes" if not asks_yes else "No",
+                        len(asks_yes), len(asks_no),
+                    )
                 continue
 
             best_ask_yes = float(asks_yes[0].get("price", 0))
@@ -2151,14 +2160,19 @@ class ArbitrageMonitor(threading.Thread):
             edge_pct = edge * 100.0
 
             if edge_pct < min_edge_pct:
-                # Log occasionally for visibility (every ~30 seconds at 2s poll)
-                self.logger.debug(
-                    "Arb: %s — %s=$%.3f + %s=$%.3f = $%.4f (edge %.2f%% < %.2f%%)",
-                    mkt["question"][:40],
-                    mkt["yes_label"], best_ask_yes,
-                    mkt["no_label"], best_ask_no,
-                    combined, edge_pct, min_edge_pct,
-                )
+                # Log at INFO every ~30s so user can see the monitor is
+                # actively scanning and what the current spread looks like.
+                now = time.time()
+                if not hasattr(self, '_last_edge_log_t') or now - self._last_edge_log_t >= 30:
+                    self._last_edge_log_t = now
+                    self.logger.info(
+                        "Arb scan: %s — %s=$%.3f + %s=$%.3f = $%.4f "
+                        "(edge %.2f%% < min %.2f%%, no trade)",
+                        mkt["question"][:40],
+                        mkt["yes_label"], best_ask_yes,
+                        mkt["no_label"], best_ask_no,
+                        combined, edge_pct, min_edge_pct,
+                    )
                 continue
 
             # --- OPPORTUNITY FOUND ---
@@ -2278,6 +2292,17 @@ class ArbitrageMonitor(threading.Thread):
                 price=price,
                 use_fok=True,
             )
+            # Guard against FOK rejections that return a truthy dict like
+            # {"status": "fok_rejected", ...} or {"error": ...} — these
+            # are *not* successful fills and must not be treated as such.
+            if isinstance(result, dict) and (
+                result.get("status") == "fok_rejected"
+                or result.get("error")
+            ):
+                self.logger.warning(
+                    "Arb leg NOT filled (%s): %s", label, result,
+                )
+                return None
             if result:
                 self.logger.info(
                     "Arb leg filled: %s @ $%.3f for $%.2f — %s",
