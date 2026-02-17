@@ -4127,7 +4127,7 @@ class MartingaleBot(threading.Thread):
         record = {
             "closed_at": datetime.now().isoformat(),
             "token_id": bet["token_id"],
-            "market": bet["question"],
+            "market": f"{self.strategy_name} {bet['direction']}",
             "shares": bet["shares"],
             "entry_price": round(bet["cost"] / bet["shares"], 6) if bet["shares"] > 0 else 0,
             "exit_price": 1.0 if won else 0.0,
@@ -9629,9 +9629,18 @@ class CopyTraderGUI:
             # Shorten the ISO timestamp for display
             if "T" in closed_at:
                 closed_at = closed_at.replace("T", " ")[:19]
+            # For martingale records, prefer the short strategy name
+            # over the long Gamma API question text.
+            market_label = rec.get("market", "")
+            details = rec.get("martingale_details")
+            if details and details.get("strategy"):
+                market_label = (
+                    f"{details['strategy']} {details.get('direction', '')}"
+                ).strip()
+
             self.history_tree.insert("", tk.END, values=(
                 closed_at,
-                rec.get("market", ""),
+                market_label,
                 f"{rec.get('shares', 0):.4f}",
                 f"{rec.get('entry_price', 0):.4f}",
                 f"{rec.get('exit_price', 0):.4f}",
