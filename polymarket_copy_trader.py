@@ -744,10 +744,31 @@ class TelegramCommandBot:
         self._last_update_id = 0
 
     def start(self):
+        self._delete_webhook()
         self._register_commands()
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
         self.logger.info("Telegram command bot started (chat_id=%s)", self.chat_id)
+
+    def _delete_webhook(self):
+        """Remove any active webhook so getUpdates polling works.
+
+        The Telegram Bot API refuses to deliver updates via getUpdates
+        while a webhook is set — returning 409 Conflict instead.  This
+        silently breaks command handling while notifications (sendMessage)
+        continue to work normally, making the issue hard to diagnose.
+        """
+        try:
+            url = TELEGRAM_API.format(token=self.token) + "/deleteWebhook"
+            resp = requests.post(url, timeout=10)
+            if resp.status_code == 200 and resp.json().get("ok"):
+                self.logger.info("Telegram webhook cleared (getUpdates enabled)")
+            else:
+                self.logger.warning(
+                    "deleteWebhook returned unexpected response: %s", resp.text[:200],
+                )
+        except Exception as exc:
+            self.logger.warning("Could not delete Telegram webhook: %s", exc)
 
     def _register_commands(self):
         """Register all commands with Telegram via setMyCommands so they
@@ -806,6 +827,7 @@ class TelegramCommandBot:
 
     def _poll_loop(self):
         base = TELEGRAM_API.format(token=self.token)
+        _poll_err_count = 0
         while not self._stop_event.is_set():
             try:
                 # Use a short long-poll so the thread can exit quickly
@@ -819,8 +841,16 @@ class TelegramCommandBot:
                     timeout=10,
                 )
                 if resp.status_code != 200:
+                    _poll_err_count += 1
+                    # Log first few errors visibly so the user knows
+                    if _poll_err_count <= 3:
+                        self.logger.warning(
+                            "Telegram getUpdates HTTP %d: %s",
+                            resp.status_code, resp.text[:300],
+                        )
                     self._stop_event.wait(5)
                     continue
+                _poll_err_count = 0
                 data = resp.json()
                 for update in data.get("result", []):
                     self._last_update_id = update["update_id"]
@@ -834,7 +864,7 @@ class TelegramCommandBot:
             except requests.exceptions.Timeout:
                 continue
             except Exception as exc:
-                self.logger.debug("Telegram poll error: %s", exc)
+                self.logger.warning("Telegram poll error: %s", exc)
                 self._stop_event.wait(5)
 
     # -- command handlers ---------------------------------------------------
