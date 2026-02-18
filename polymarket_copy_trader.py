@@ -722,6 +722,35 @@ def send_telegram(token, chat_id, message, logger=None, parse_mode=None):
     threading.Thread(target=_post, daemon=True).start()
 
 
+def send_telegram_photo(token, chat_id, photo_bytes, caption=None, logger=None):
+    """Fire-and-forget a photo to Telegram.
+
+    *photo_bytes* should be a bytes object (e.g. PNG image).
+    Runs in a daemon thread so it never blocks the bot loop.
+    """
+    if not token or not chat_id or not requests:
+        return
+
+    def _post():
+        try:
+            url = TELEGRAM_API.format(token=token) + "/sendPhoto"
+            files = {"photo": ("chart.png", photo_bytes, "image/png")}
+            data = {"chat_id": chat_id}
+            if caption:
+                data["caption"] = caption[:1024]
+            resp = requests.post(url, data=data, files=files, timeout=30)
+            if resp.status_code >= 400 and logger:
+                logger.debug(
+                    "Telegram sendPhoto returned %d: %s",
+                    resp.status_code, resp.text[:200],
+                )
+        except Exception as exc:
+            if logger:
+                logger.debug("Telegram sendPhoto failed: %s", exc)
+
+    threading.Thread(target=_post, daemon=True).start()
+
+
 class TelegramCommandBot:
     """Long-polls the Telegram Bot API for commands and replies with bot data.
 
@@ -834,6 +863,7 @@ class TelegramCommandBot:
             ("stats", "Session W/L, win %, total P&L, ROI"),
             ("strategies", "Martingale strategy status"),
             ("status", "Bot state, session P&L, uptime"),
+            ("chart", "Equity P&L chart (add 'session' for current)"),
             ("stop", "Stop the bot gracefully"),
             ("pause", "Pause trading (keep monitoring)"),
             ("resume", "Resume trading after pause"),
@@ -937,6 +967,7 @@ class TelegramCommandBot:
             "/stats": self._cmd_stats,
             "/strategies": self._cmd_strategies,
             "/status": self._cmd_status,
+            "/chart": self._cmd_chart,
             "/help": self._cmd_help,
             "/start": self._cmd_help,
             # -- Control commands --
@@ -1009,15 +1040,29 @@ class TelegramCommandBot:
         if not executor:
             self.send("Bot not running — no position data available.")
             return
+
         positions = dict(executor._positions)
-        if not positions:
+        # Collect arb positions
+        arb_mon = getattr(self.bot, "_arb_monitor", None)
+        arb_positions = dict(arb_mon._active_positions) if arb_mon else {}
+        # Collect martingale active bets
+        mart_mgr = getattr(self.bot, "_martingale_mgr", None)
+        mart_bets = []
+        if mart_mgr:
+            for mb in mart_mgr.bots:
+                if mb._active_bet:
+                    mart_bets.append((mb.strategy_name, mb._active_bet))
+
+        total_count = len(positions) + len(arb_positions) + len(mart_bets)
+        if total_count == 0:
             self.send("No open positions.")
             return
 
-        lines = [f"OPEN POSITIONS ({len(positions)})"]
+        lines = [f"OPEN POSITIONS ({total_count})"]
         total_cost = Decimal("0")
         total_value = Decimal("0")
 
+        # --- Copy / direct positions ---
         for token_id, pos in positions.items():
             tokens = pos.get("tokens", Decimal("0"))
             entry_price = pos.get("entry_price", Decimal("0"))
@@ -1053,7 +1098,41 @@ class TelegramCommandBot:
                     f"    {tokens:.1f} shares @ ${entry_price:.4f}"
                 )
 
-        total_pnl = total_value - total_cost
+        # --- Arbitrage positions ---
+        arb_total_profit = Decimal("0")
+        for _cid, apos in arb_positions.items():
+            a_cost = Decimal(str(apos.get("total_cost", 0)))
+            a_profit = Decimal(str(apos.get("locked_profit", 0)))
+            a_yes = Decimal(str(apos.get("yes_shares", 0)))
+            a_no = Decimal(str(apos.get("no_shares", 0)))
+            a_matched = min(a_yes, a_no)
+            a_question = apos.get("question", "Unknown")
+            is_partial = apos.get("partial", False)
+            total_cost += a_cost
+            arb_total_profit += a_profit
+            tag = "ARB" if not is_partial else "ARB!"
+            edge = apos.get("edge_pct", 0)
+            lines.append(
+                f"\n  [{tag}] {a_question[:36]}\n"
+                f"    {a_matched:.1f} matched | cost ${a_cost:.2f}\n"
+                f"    Locked P/L +${a_profit:.4f} (edge {edge:.1f}%)"
+            )
+
+        # --- Martingale active bets ---
+        for strat_name, bet in mart_bets:
+            m_cost = Decimal(str(bet.get("cost", 0)))
+            m_shares = Decimal(str(bet.get("shares", 0)))
+            direction = bet.get("direction", "?")
+            question = bet.get("question", "?")
+            total_cost += m_cost
+            entry_p = m_cost / m_shares if m_shares > 0 else Decimal("0")
+            lines.append(
+                f"\n  [MART-{direction}] {question[:34]}\n"
+                f"    {m_shares:.1f} shares @ ${entry_p:.4f}\n"
+                f"    [{strat_name}] pending resolution"
+            )
+
+        total_pnl = total_value - total_cost + arb_total_profit
         pnl_sign = "+" if total_pnl >= 0 else ""
         lines.append(f"\nTotal: cost ${total_cost:.2f} | value ${total_value:.2f} | {pnl_sign}${total_pnl:.2f}")
         self.send("\n".join(lines))
@@ -1356,6 +1435,99 @@ class TelegramCommandBot:
 
         self.send("\n".join(lines))
 
+    def _cmd_chart(self, args=None):
+        """Generate a cumulative P&L equity chart and send it as a photo."""
+        try:
+            import matplotlib
+            matplotlib.use("Agg")  # headless backend
+            import matplotlib.pyplot as plt
+            import matplotlib.dates as mdates
+            import io
+        except ImportError:
+            self.send("Chart unavailable — matplotlib not installed.\nRun: pip install matplotlib")
+            return
+
+        # Load trade history
+        try:
+            with open(TRADE_HISTORY_FILE, "r") as fh:
+                history = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            history = []
+
+        if not history:
+            self.send("No trade data yet — chart unavailable.")
+            return
+
+        history.sort(key=lambda r: r.get("closed_at", ""))
+
+        # Session filter: /chart session
+        session_only = args and args[0].lower() == "session"
+        if session_only and self.bot:
+            ss = getattr(self.bot, "_session_start", None)
+            if ss:
+                session_start = ss.isoformat() if hasattr(ss, "isoformat") else str(ss)
+                history = [r for r in history if r.get("closed_at", "") >= session_start]
+
+        if not history:
+            self.send("No trades in current session.")
+            return
+
+        # Build cumulative P&L series
+        timestamps = []
+        cum_pnl = []
+        running = 0.0
+        for rec in history:
+            running += rec.get("pnl_usdc", 0)
+            ts_str = rec.get("closed_at", "")
+            try:
+                dt = datetime.fromisoformat(ts_str)
+            except (ValueError, TypeError):
+                continue
+            timestamps.append(dt)
+            cum_pnl.append(round(running, 2))
+
+        if len(timestamps) < 2:
+            self.send("Not enough data points for a chart.")
+            return
+
+        # Generate chart
+        fig, ax = plt.subplots(figsize=(10, 5))
+        fig.patch.set_facecolor("#1e1e1e")
+        ax.set_facecolor("#1e1e1e")
+
+        final_pnl = cum_pnl[-1]
+        line_color = "#00cc44" if final_pnl >= 0 else "#cc4444"
+        fill_color = "#0a3d0a" if final_pnl >= 0 else "#3d0a0a"
+
+        ax.plot(timestamps, cum_pnl, color=line_color, linewidth=2)
+        ax.fill_between(timestamps, cum_pnl, 0, color=fill_color, alpha=0.5)
+        ax.axhline(y=0, color="#666666", linewidth=0.8)
+
+        ax.set_title(
+            f"Cumulative P&L: ${final_pnl:+,.2f}  ({len(cum_pnl)} trades)",
+            color=line_color, fontsize=13, fontweight="bold",
+        )
+        ax.set_ylabel("P&L ($)", color="#aaaaaa", fontsize=10)
+        ax.tick_params(colors="#aaaaaa", labelsize=8)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_color("#444444")
+        ax.spines["bottom"].set_color("#444444")
+        ax.grid(axis="y", color="#333333", linestyle="--", linewidth=0.5)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d %H:%M"))
+        fig.autofmt_xdate(rotation=30, ha="right")
+        plt.tight_layout()
+
+        # Render to PNG bytes
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=150, facecolor=fig.get_facecolor())
+        plt.close(fig)
+        buf.seek(0)
+        png_bytes = buf.read()
+
+        caption = f"Equity Chart | {timestamps[0].strftime('%m/%d %H:%M')} → {timestamps[-1].strftime('%m/%d %H:%M')} | P&L ${final_pnl:+,.2f}"
+        send_telegram_photo(self.token, self.chat_id, png_bytes, caption=caption, logger=self.logger)
+
     def _cmd_help(self, args=None):
         self.send(
             "Polymarket Bot Commands:\n"
@@ -1367,6 +1539,7 @@ class TelegramCommandBot:
             "/stats — session W/L, win %, P&L, ROI\n"
             "/strategies — per-strategy diagnostics\n"
             "/status — bot state, uptime, session info\n"
+            "/chart — equity P&L chart (add 'session' for current session)\n"
             "\n"
             "CONTROL\n"
             "/stop — graceful shutdown\n"
