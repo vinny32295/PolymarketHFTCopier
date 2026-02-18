@@ -9489,7 +9489,12 @@ class CopyTraderGUI:
         notebook.add(history_frame, text="Trade History")
         self._build_history_tab(history_frame)
 
-        # Tab 6: Log / Status
+        # Tab 7: Equity Chart
+        equity_frame = ttk.Frame(notebook, padding=10)
+        notebook.add(equity_frame, text="Equity")
+        self._build_equity_tab(equity_frame)
+
+        # Tab 8: Log / Status
         log_frame = ttk.Frame(notebook, padding=10)
         notebook.add(log_frame, text="Log")
         self._build_log_tab(log_frame)
@@ -10630,6 +10635,248 @@ class CopyTraderGUI:
         self.mart_listbox.selection_set(idx)
         self._mart_selected_idx = idx
         self._mart_on_select()
+
+    # ------------------------------------------------------------------
+    # Equity Chart tab
+    # ------------------------------------------------------------------
+
+    def _build_equity_tab(self, parent):
+        """Build an hourly cumulative P&L chart using tkinter Canvas."""
+        # Controls bar
+        ctrl = ttk.Frame(parent)
+        ctrl.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(ctrl, text="Refresh", command=self._refresh_equity_chart).pack(
+            side=tk.LEFT,
+        )
+        self.equity_session_only_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            ctrl, text="Current Session Only",
+            variable=self.equity_session_only_var,
+            command=self._refresh_equity_chart,
+        ).pack(side=tk.LEFT, padx=10)
+        self.equity_info_var = tk.StringVar(value="")
+        ttk.Label(ctrl, textvariable=self.equity_info_var, font=("Courier", 10)).pack(
+            side=tk.RIGHT,
+        )
+
+        # Canvas
+        self.equity_canvas = tk.Canvas(
+            parent, bg="#1e1e1e", highlightthickness=0,
+        )
+        self.equity_canvas.pack(fill=tk.BOTH, expand=True)
+        self.equity_canvas.bind("<Configure>", lambda e: self._refresh_equity_chart())
+
+    def _refresh_equity_chart(self):
+        """Redraw the equity chart from trade_history.json data."""
+        canvas = self.equity_canvas
+        canvas.delete("all")
+        w = canvas.winfo_width()
+        h = canvas.winfo_height()
+        if w < 80 or h < 80:
+            return
+
+        # ── Load & filter trade records ──
+        try:
+            with open(TRADE_HISTORY_FILE, "r") as fh:
+                history = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            history = []
+
+        if not history:
+            canvas.create_text(
+                w // 2, h // 2, text="No trade data yet",
+                fill="#888888", font=("Courier", 14),
+            )
+            return
+
+        history.sort(key=lambda r: r.get("closed_at", ""))
+
+        # Session filter
+        if self.equity_session_only_var.get():
+            session_start = None
+            if hasattr(self, "bot") and self.bot:
+                ss = getattr(self.bot, "_session_start", None)
+                if ss:
+                    session_start = ss.isoformat() if hasattr(ss, "isoformat") else str(ss)
+            if session_start:
+                history = [
+                    r for r in history
+                    if r.get("closed_at", "") >= session_start
+                ]
+
+        if not history:
+            canvas.create_text(
+                w // 2, h // 2, text="No trades in current session",
+                fill="#888888", font=("Courier", 14),
+            )
+            return
+
+        # ── Compute cumulative P&L at each trade ──
+        cum_pnl = []
+        running = 0.0
+        for rec in history:
+            running += rec.get("pnl_usdc", 0)
+            ts_str = rec.get("closed_at", "")
+            cum_pnl.append((ts_str, round(running, 2)))
+
+        # ── Group into hourly buckets for the X-axis ──
+        # Keep the last P&L value for each hour bucket.
+        hourly = {}
+        for ts_str, pnl in cum_pnl:
+            hour_key = ts_str[:13]  # "2026-02-17 14" or "2026-02-17T14"
+            hourly[hour_key] = pnl
+        # Also keep individual trade points for plotting
+        trade_points = cum_pnl
+
+        # ── Chart geometry ──
+        margin_l = 70   # left margin for Y-axis labels
+        margin_r = 20
+        margin_t = 25
+        margin_b = 50   # bottom margin for X-axis labels
+        chart_w = w - margin_l - margin_r
+        chart_h = h - margin_t - margin_b
+        if chart_w < 40 or chart_h < 40:
+            return
+
+        # ── Data range ──
+        pnl_values = [p for _, p in trade_points]
+        pnl_min = min(min(pnl_values), 0)
+        pnl_max = max(max(pnl_values), 0)
+        pnl_range = pnl_max - pnl_min
+        if pnl_range == 0:
+            pnl_range = 10  # avoid division by zero
+        # Add 10% padding
+        pnl_min -= pnl_range * 0.1
+        pnl_max += pnl_range * 0.1
+        pnl_range = pnl_max - pnl_min
+
+        def y_px(val):
+            return margin_t + chart_h * (1 - (val - pnl_min) / pnl_range)
+
+        def x_px(idx):
+            n = len(trade_points)
+            if n <= 1:
+                return margin_l + chart_w // 2
+            return margin_l + chart_w * idx / (n - 1)
+
+        # ── Draw grid lines & Y-axis labels ──
+        # Choose nice Y-axis tick spacing
+        raw_step = pnl_range / 6
+        magnitude = 10 ** int(f"{raw_step:.0e}".split("e")[1]) if raw_step > 0 else 1
+        nice_step = max(magnitude, 1)
+        for mult in [1, 2, 5, 10, 20, 50, 100]:
+            if magnitude * mult >= raw_step:
+                nice_step = magnitude * mult
+                break
+
+        tick = nice_step * (int(pnl_min / nice_step))
+        while tick <= pnl_max:
+            if pnl_min <= tick <= pnl_max:
+                yp = y_px(tick)
+                color = "#333333"
+                if tick == 0:
+                    color = "#555555"
+                canvas.create_line(
+                    margin_l, yp, w - margin_r, yp, fill=color, dash=(2, 4),
+                )
+                canvas.create_text(
+                    margin_l - 5, yp, text=f"${tick:+,.0f}",
+                    fill="#aaaaaa", font=("Courier", 8), anchor=tk.E,
+                )
+            tick += nice_step
+
+        # ── Zero line (prominent) ──
+        zero_y = y_px(0)
+        canvas.create_line(
+            margin_l, zero_y, w - margin_r, zero_y,
+            fill="#666666", width=1,
+        )
+
+        # ── Draw filled area + line ──
+        if len(trade_points) >= 2:
+            # Build polygon points for filled area (from zero line)
+            fill_above = []  # green segments (P&L > 0)
+            fill_below = []  # red segments (P&L < 0)
+
+            # Simple approach: draw the line and a filled polygon
+            line_coords = []
+            for i, (_, pnl) in enumerate(trade_points):
+                px = x_px(i)
+                py = y_px(pnl)
+                line_coords.extend([px, py])
+
+            # Filled polygon from line to zero
+            poly_coords = [x_px(0), zero_y]
+            for i, (_, pnl) in enumerate(trade_points):
+                poly_coords.extend([x_px(i), y_px(pnl)])
+            poly_coords.extend([x_px(len(trade_points) - 1), zero_y])
+
+            # Determine dominant color
+            final_pnl = trade_points[-1][1]
+            fill_color = "#0a3d0a" if final_pnl >= 0 else "#3d0a0a"
+            line_color = "#00cc44" if final_pnl >= 0 else "#cc4444"
+
+            canvas.create_polygon(
+                poly_coords, fill=fill_color, outline="",
+            )
+            canvas.create_line(
+                line_coords, fill=line_color, width=2, smooth=True,
+            )
+
+            # ── Dot markers at each trade point ──
+            for i, (_, pnl) in enumerate(trade_points):
+                px = x_px(i)
+                py = y_px(pnl)
+                dot_color = "#00ff55" if pnl >= 0 else "#ff4444"
+                r = 2 if len(trade_points) > 30 else 3
+                canvas.create_oval(
+                    px - r, py - r, px + r, py + r,
+                    fill=dot_color, outline="",
+                )
+        elif len(trade_points) == 1:
+            px = x_px(0)
+            py = y_px(trade_points[0][1])
+            dot_color = "#00ff55" if trade_points[0][1] >= 0 else "#ff4444"
+            canvas.create_oval(px - 5, py - 5, px + 5, py + 5, fill=dot_color, outline="")
+
+        # ── X-axis time labels ──
+        # Show a subset of labels to avoid overlap
+        n = len(trade_points)
+        max_labels = max(chart_w // 90, 2)
+        step = max(n // max_labels, 1)
+        for i in range(0, n, step):
+            ts_str = trade_points[i][0]
+            # Extract "HH:MM" or "MM/DD HH:MM"
+            label = ts_str[11:16] if len(ts_str) >= 16 else ts_str[:10]
+            # Add date prefix if data spans multiple days
+            if i == 0 or (i > 0 and trade_points[i][0][:10] != trade_points[i - 1][0][:10]):
+                label = ts_str[5:10] + "\n" + ts_str[11:16] if len(ts_str) >= 16 else ts_str[:10]
+            px = x_px(i)
+            canvas.create_text(
+                px, h - margin_b + 15, text=label,
+                fill="#aaaaaa", font=("Courier", 7), anchor=tk.N,
+            )
+
+        # ── Axis borders ──
+        canvas.create_line(
+            margin_l, margin_t, margin_l, h - margin_b, fill="#666666",
+        )
+        canvas.create_line(
+            margin_l, h - margin_b, w - margin_r, h - margin_b, fill="#666666",
+        )
+
+        # ── Title + info label ──
+        final_pnl = trade_points[-1][1] if trade_points else 0
+        title_color = "#00cc44" if final_pnl >= 0 else "#cc4444"
+        canvas.create_text(
+            margin_l + 10, margin_t - 8,
+            text=f"Cumulative P&L: ${final_pnl:+,.2f}  ({len(trade_points)} trades)",
+            fill=title_color, font=("Courier", 10, "bold"), anchor=tk.W,
+        )
+
+        first_ts = trade_points[0][0][:16].replace("T", " ") if trade_points else ""
+        last_ts = trade_points[-1][0][:16].replace("T", " ") if trade_points else ""
+        self.equity_info_var.set(f"{first_ts}  →  {last_ts}")
 
     def _build_log_tab(self, parent):
         self.log_area = scrolledtext.ScrolledText(
