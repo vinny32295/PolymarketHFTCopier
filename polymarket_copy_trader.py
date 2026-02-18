@@ -4088,6 +4088,7 @@ class MartingaleBot(threading.Thread):
         self._skip_reason = None        # last reason a window was skipped
         self._windows_attempted = 0     # windows where we tried to bet
         self._windows_no_market = 0     # market slug not found on Gamma API
+        self._recent_asks = []          # recent ask prices for stability check
 
         # Callbacks (wired by CopyTraderBot)
         self.notify_callback = None
@@ -4671,6 +4672,7 @@ class MartingaleBot(threading.Thread):
                 self.strategy_name, seconds_into, max_entry,
             )
             self._skip_reason = f"too late ({seconds_into}s > {max_entry}s)"
+            self._recent_asks.clear()  # stale — new window
             self._last_window_ts = current_window_ts
             return False
 
@@ -4748,6 +4750,15 @@ class MartingaleBot(threading.Thread):
                     base_price_max, price_max,
                 )
 
+        # Track recent asks for stability check
+        self._recent_asks.append(ask_price)
+        # Keep only the last N readings (configurable, default 3)
+        stability_n = int(self._scfg(
+            "price_stability_n", "martingale_price_stability_n", 3,
+        ))
+        if len(self._recent_asks) > stability_n:
+            self._recent_asks = self._recent_asks[-stability_n:]
+
         if ask_price < price_min or ask_price > price_max:
             self.logger.info(
                 "MARTINGALE [%s]: price $%.4f outside range [$%.2f–$%.2f] "
@@ -4757,6 +4768,40 @@ class MartingaleBot(threading.Thread):
             )
             self._skip_reason = f"price ${ask_price:.4f} outside [{price_min:.2f}–{price_max:.2f}]"
             return False  # don't mark skipped — price might come back
+
+        # Price stability: require the last N consecutive asks to ALL be
+        # within range before entering.  A single momentary in-range reading
+        # during wild oscillations (e.g. $0.30→$0.62→$0.46) is not enough —
+        # the book is too unstable and the fill will deviate from the ask.
+        if len(self._recent_asks) < stability_n:
+            self.logger.info(
+                "MARTINGALE [%s]: price $%.4f in range but need %d "
+                "consecutive readings (have %d) — will retry",
+                self.strategy_name, ask_price, stability_n,
+                len(self._recent_asks),
+            )
+            self._skip_reason = (
+                f"price OK but warming up ({len(self._recent_asks)}/{stability_n})"
+            )
+            return False
+
+        all_in_range = all(
+            price_min <= p <= price_max for p in self._recent_asks
+        )
+        if not all_in_range:
+            out_of_range = [
+                f"${p:.4f}" for p in self._recent_asks
+                if p < price_min or p > price_max
+            ]
+            self.logger.info(
+                "MARTINGALE [%s]: price $%.4f in range but recent asks "
+                "unstable %s — need %d consecutive in-range readings",
+                self.strategy_name, ask_price, out_of_range, stability_n,
+            )
+            self._skip_reason = (
+                f"price unstable (recent out-of-range: {', '.join(out_of_range)})"
+            )
+            return False
 
         # Check aggregate depth across all ask levels up to price_max.
         # FOK/market orders sweep multiple levels, so single-level
@@ -4841,6 +4886,18 @@ class MartingaleBot(threading.Thread):
         slippage = round(0.50 - fill_price, 6)
         slippage_usdc = round(slippage * actual_shares, 6)
 
+        # -- Post-fill sanity check --
+        # If the fill price is wildly different from the ask we checked,
+        # the book moved between our check and the execution.
+        fill_deviation = abs(fill_price - ask_price)
+        if fill_deviation > 0.10:
+            self.logger.warning(
+                "MARTINGALE [%s]: FILL PRICE DEVIATION — expected ~$%.4f "
+                "(ask), got $%.4f (fill), deviation $%.4f. "
+                "Book moved between check and execution.",
+                self.strategy_name, ask_price, fill_price, fill_deviation,
+            )
+
         opposite_token = (
             market["down_token"] if direction == "Up"
             else market["up_token"]
@@ -4863,6 +4920,7 @@ class MartingaleBot(threading.Thread):
         }
         self._last_window_ts = current_window_ts
         self._skip_reason = None  # bet placed successfully
+        self._recent_asks.clear()  # reset for next window
         self._windows_attempted += 1
         self._save_state()
 
