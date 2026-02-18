@@ -4088,7 +4088,6 @@ class MartingaleBot(threading.Thread):
         self._skip_reason = None        # last reason a window was skipped
         self._windows_attempted = 0     # windows where we tried to bet
         self._windows_no_market = 0     # market slug not found on Gamma API
-        self._recent_asks = []          # recent ask prices for stability check
 
         # Callbacks (wired by CopyTraderBot)
         self.notify_callback = None
@@ -4592,9 +4591,10 @@ class MartingaleBot(threading.Thread):
     def _prefetch_next_window(self):
         """Pre-fetch the next window's market so we're ready to bet instantly.
 
-        Called in the final 15s of the current window.  Stores the slug,
+        Called in the final 30s of the current window.  Stores the slug,
         market data, and token ID so ``_try_place_bet`` can skip the
-        expensive Gamma API call.
+        expensive Gamma API call.  Also pre-runs balance check and USDC
+        approval so they don't block the critical order path.
         """
         try:
             window = int(self._scfg("window", "martingale_window", 300))
@@ -4613,11 +4613,39 @@ class MartingaleBot(threading.Thread):
                 market["up_token"] if direction == "Up" else market["down_token"]
             )
 
+            # Pre-run USDC approval so it's not on the critical path.
+            # Use the next bet size (current_bet after potential doubling).
+            neg_risk = market.get("neg_risk", False)
+            try:
+                raw_amount = int(self.current_bet * 2 * 1_000_000)  # approve 2x for headroom
+                self.clob_client.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
+                if neg_risk:
+                    self.clob_client.ensure_usdc_approval(
+                        NEG_RISK_CTF_EXCHANGE_ADDRESS, raw_amount,
+                    )
+            except Exception as exc:
+                self.logger.debug("MARTINGALE: prefetch approval failed (%s)", exc)
+
+            # Pre-check balance so we know early if we're short.
+            balance_ok = True
+            try:
+                usdc_bal = float(self.clob_client.get_usdc_balance(max_age_seconds=0))
+                if usdc_bal < self.current_bet:
+                    self.logger.warning(
+                        "MARTINGALE: prefetch balance warning — $%.2f < next bet $%.2f",
+                        usdc_bal, self.current_bet,
+                    )
+                    balance_ok = False
+            except Exception:
+                pass
+
             self._next_window_cache = {
                 "window_ts": next_window_ts,
                 "slug": slug,
                 "market": market,
                 "token_id": token_id,
+                "approval_done": True,
+                "balance_ok": balance_ok,
             }
             self.logger.info(
                 "MARTINGALE: pre-cached next window market '%s' (token=%s..)",
@@ -4672,7 +4700,6 @@ class MartingaleBot(threading.Thread):
                 self.strategy_name, seconds_into, max_entry,
             )
             self._skip_reason = f"too late ({seconds_into}s > {max_entry}s)"
-            self._recent_asks.clear()  # stale — new window
             self._last_window_ts = current_window_ts
             return False
 
@@ -4683,10 +4710,14 @@ class MartingaleBot(threading.Thread):
 
         # Use pre-fetched cache if it matches this window
         cache = self._next_window_cache
+        prefetch_approval_done = False
+        prefetch_balance_ok = None
         if cache and cache["window_ts"] == current_window_ts:
             slug = cache["slug"]
             market = cache["market"]
             token_id = cache["token_id"]
+            prefetch_approval_done = cache.get("approval_done", False)
+            prefetch_balance_ok = cache.get("balance_ok")
             self._next_window_cache = None  # consumed
             self.logger.info(
                 "MARTINGALE: using pre-cached market for '%s'", slug,
@@ -4750,15 +4781,6 @@ class MartingaleBot(threading.Thread):
                     base_price_max, price_max,
                 )
 
-        # Track recent asks for stability check
-        self._recent_asks.append(ask_price)
-        # Keep only the last N readings (configurable, default 3)
-        stability_n = int(self._scfg(
-            "price_stability_n", "martingale_price_stability_n", 3,
-        ))
-        if len(self._recent_asks) > stability_n:
-            self._recent_asks = self._recent_asks[-stability_n:]
-
         if ask_price < price_min or ask_price > price_max:
             self.logger.info(
                 "MARTINGALE [%s]: price $%.4f outside range [$%.2f–$%.2f] "
@@ -4768,40 +4790,6 @@ class MartingaleBot(threading.Thread):
             )
             self._skip_reason = f"price ${ask_price:.4f} outside [{price_min:.2f}–{price_max:.2f}]"
             return False  # don't mark skipped — price might come back
-
-        # Price stability: require the last N consecutive asks to ALL be
-        # within range before entering.  A single momentary in-range reading
-        # during wild oscillations (e.g. $0.30→$0.62→$0.46) is not enough —
-        # the book is too unstable and the fill will deviate from the ask.
-        if len(self._recent_asks) < stability_n:
-            self.logger.info(
-                "MARTINGALE [%s]: price $%.4f in range but need %d "
-                "consecutive readings (have %d) — will retry",
-                self.strategy_name, ask_price, stability_n,
-                len(self._recent_asks),
-            )
-            self._skip_reason = (
-                f"price OK but warming up ({len(self._recent_asks)}/{stability_n})"
-            )
-            return False
-
-        all_in_range = all(
-            price_min <= p <= price_max for p in self._recent_asks
-        )
-        if not all_in_range:
-            out_of_range = [
-                f"${p:.4f}" for p in self._recent_asks
-                if p < price_min or p > price_max
-            ]
-            self.logger.info(
-                "MARTINGALE [%s]: price $%.4f in range but recent asks "
-                "unstable %s — need %d consecutive in-range readings",
-                self.strategy_name, ask_price, out_of_range, stability_n,
-            )
-            self._skip_reason = (
-                f"price unstable (recent out-of-range: {', '.join(out_of_range)})"
-            )
-            return False
 
         # Check aggregate depth across all ask levels up to price_max.
         # FOK/market orders sweep multiple levels, so single-level
@@ -4826,31 +4814,40 @@ class MartingaleBot(threading.Thread):
             self._last_window_ts = current_window_ts
             return False
 
-        # Pre-trade balance check — the CLOB API rejects orders when the
-        # EOA lacks sufficient USDC or allowance.
-        try:
-            usdc_bal = float(self.clob_client.get_usdc_balance(max_age_seconds=0))
-            if usdc_bal < self.current_bet:
-                self.logger.warning(
-                    "MARTINGALE [%s]: USDC balance $%.2f < bet $%.2f — skipping",
-                    self.strategy_name, usdc_bal, self.current_bet,
-                )
-                self._skip_reason = f"low balance (${usdc_bal:.2f} < ${self.current_bet:.2f})"
-                return False
-        except Exception as exc:
-            self.logger.debug("MARTINGALE: balance check failed (%s) — proceeding", exc)
+        # Pre-trade balance check — skip if prefetch already verified.
+        if prefetch_balance_ok is False:
+            self.logger.warning(
+                "MARTINGALE [%s]: prefetch flagged low balance — skipping",
+                self.strategy_name,
+            )
+            self._skip_reason = "low balance (prefetch)"
+            return False
+        if prefetch_balance_ok is None:
+            # No prefetch data — check now
+            try:
+                usdc_bal = float(self.clob_client.get_usdc_balance(max_age_seconds=0))
+                if usdc_bal < self.current_bet:
+                    self.logger.warning(
+                        "MARTINGALE [%s]: USDC balance $%.2f < bet $%.2f — skipping",
+                        self.strategy_name, usdc_bal, self.current_bet,
+                    )
+                    self._skip_reason = f"low balance (${usdc_bal:.2f} < ${self.current_bet:.2f})"
+                    return False
+            except Exception as exc:
+                self.logger.debug("MARTINGALE: balance check failed (%s) — proceeding", exc)
 
-        # Ensure USDC approval for the correct exchange contract
+        # Ensure USDC approval — skip if prefetch already handled it.
         neg_risk = market.get("neg_risk", False)
-        try:
-            raw_amount = int(self.current_bet * 1_000_000)
-            self.clob_client.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
-            if neg_risk:
-                self.clob_client.ensure_usdc_approval(
-                    NEG_RISK_CTF_EXCHANGE_ADDRESS, raw_amount,
-                )
-        except Exception as exc:
-            self.logger.warning("MARTINGALE: approval failed (%s) — proceeding", exc)
+        if not prefetch_approval_done:
+            try:
+                raw_amount = int(self.current_bet * 1_000_000)
+                self.clob_client.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
+                if neg_risk:
+                    self.clob_client.ensure_usdc_approval(
+                        NEG_RISK_CTF_EXCHANGE_ADDRESS, raw_amount,
+                    )
+            except Exception as exc:
+                self.logger.warning("MARTINGALE: approval failed (%s) — proceeding", exc)
 
         result = self.clob_client.place_order(
             token_id=token_id,
@@ -4920,7 +4917,6 @@ class MartingaleBot(threading.Thread):
         }
         self._last_window_ts = current_window_ts
         self._skip_reason = None  # bet placed successfully
-        self._recent_asks.clear()  # reset for next window
         self._windows_attempted += 1
         self._save_state()
 
@@ -5197,11 +5193,11 @@ class MartingaleBot(threading.Thread):
             bet = self._active_bet
             now = int(time.time())
 
-            # Pre-cache next window's market in the final 15s of the
+            # Pre-cache next window's market in the final 30s of the
             # current window so we're ready to bet immediately after
             # resolution.
             time_left = bet["window_end"] - now
-            if 0 < time_left <= 15 and not self._next_window_cache:
+            if 0 < time_left <= 30 and not self._next_window_cache:
                 self._prefetch_next_window()
 
             # While the window is still open, slow-poll is fine
@@ -5211,10 +5207,10 @@ class MartingaleBot(threading.Thread):
             # === WINDOW HAS ENDED — fast-poll from here on ===
             elapsed = now - bet["window_end"]
 
-            # Small buffer (3s) before checking to let the orderbook
+            # Small buffer (1s) before checking to let the orderbook
             # settle, but use fast poll so we retry quickly.
-            if elapsed < 3:
-                return False  # fast poll — check again in 2s
+            if elapsed < 1:
+                return False  # fast poll — check again soon
 
             # --- Orderbook is fastest — check it FIRST ---
             resolved = False
@@ -5257,7 +5253,7 @@ class MartingaleBot(threading.Thread):
         )
 
         poll_slow = max(float(self._scfg("poll_seconds", "martingale_poll_seconds", 10)), 1)
-        poll_fast = 2.0  # aggressive polling when looking for next bet
+        poll_fast = 1.0  # aggressive polling when looking for next bet
 
         while not self._stop_event.is_set():
             try:
