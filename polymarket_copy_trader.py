@@ -1503,6 +1503,73 @@ class TelegramCommandBot:
         ax.fill_between(timestamps, cum_pnl, 0, color=fill_color, alpha=0.5)
         ax.axhline(y=0, color="#666666", linewidth=0.8)
 
+        # --- Annotate key data points (high, low, latest) ---
+        max_pnl = max(cum_pnl)
+        min_pnl = min(cum_pnl)
+        max_idx = cum_pnl.index(max_pnl)
+        min_idx = cum_pnl.index(min_pnl)
+        pnl_range = max(abs(max_pnl - min_pnl), 1)
+
+        annotated_indices = set()
+
+        # High point
+        if max_pnl != 0:
+            ax.annotate(
+                f"High ${max_pnl:+,.2f}\n{timestamps[max_idx].strftime('%m/%d %H:%M')}",
+                xy=(timestamps[max_idx], max_pnl),
+                xytext=(0, 12), textcoords="offset points",
+                fontsize=7, color="#00ff88", fontweight="bold",
+                ha="center", va="bottom",
+                arrowprops=dict(arrowstyle="-", color="#00ff88", lw=0.8),
+            )
+            ax.plot(timestamps[max_idx], max_pnl, "o", color="#00ff88", markersize=5, zorder=5)
+            annotated_indices.add(max_idx)
+
+        # Low point
+        if min_pnl != 0 and min_idx != max_idx:
+            ax.annotate(
+                f"Low ${min_pnl:+,.2f}\n{timestamps[min_idx].strftime('%m/%d %H:%M')}",
+                xy=(timestamps[min_idx], min_pnl),
+                xytext=(0, -12), textcoords="offset points",
+                fontsize=7, color="#ff6666", fontweight="bold",
+                ha="center", va="top",
+                arrowprops=dict(arrowstyle="-", color="#ff6666", lw=0.8),
+            )
+            ax.plot(timestamps[min_idx], min_pnl, "o", color="#ff6666", markersize=5, zorder=5)
+            annotated_indices.add(min_idx)
+
+        # Latest point
+        last_idx = len(cum_pnl) - 1
+        if last_idx not in annotated_indices:
+            last_color = "#00ff88" if final_pnl >= 0 else "#ff6666"
+            ax.annotate(
+                f"Now ${final_pnl:+,.2f}",
+                xy=(timestamps[last_idx], final_pnl),
+                xytext=(8, 0), textcoords="offset points",
+                fontsize=7, color=last_color, fontweight="bold",
+                ha="left", va="center",
+            )
+            ax.plot(timestamps[last_idx], final_pnl, "o", color=last_color, markersize=5, zorder=5)
+            annotated_indices.add(last_idx)
+
+        # --- Interval labels along the curve ---
+        n_pts = len(cum_pnl)
+        if n_pts > 10:
+            interval = max(n_pts // 8, 1)
+            for i in range(interval, n_pts - interval // 2, interval):
+                if i in annotated_indices:
+                    continue
+                # Alternate above/below to avoid overlap
+                offset_y = 10 if cum_pnl[i] >= 0 else -10
+                va = "bottom" if offset_y > 0 else "top"
+                ax.annotate(
+                    f"${cum_pnl[i]:+,.2f}",
+                    xy=(timestamps[i], cum_pnl[i]),
+                    xytext=(0, offset_y), textcoords="offset points",
+                    fontsize=6, color="#aaaaaa", ha="center", va=va,
+                )
+                ax.plot(timestamps[i], cum_pnl[i], "o", color="#888888", markersize=3, zorder=4)
+
         ax.set_title(
             f"Cumulative P&L: ${final_pnl:+,.2f}  ({len(cum_pnl)} trades)",
             color=line_color, fontsize=13, fontweight="bold",
