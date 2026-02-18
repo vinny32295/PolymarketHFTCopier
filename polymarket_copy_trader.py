@@ -2365,20 +2365,39 @@ class PolymarketCLOBClient:
                         retry_bid = float(retry_bids[0].get("price", 0)) if retry_bids else 0
                         retry_ask = float(retry_asks[0].get("price", 0)) if retry_asks else 0
                         if side.upper() == "BUY" and retry_ask > 0:
-                            retry_price = round(min(retry_ask * 1.005, 0.99), 2)
-                            # Respect price cap (arb edge / martingale price_max)
-                            if max_retry_price is not None:
-                                if retry_price > max_retry_price:
-                                    self.logger.warning(
-                                        "FOK retry: refreshed ask $%.4f exceeds "
-                                        "max price cap $%.4f — aborting",
-                                        retry_price, max_retry_price,
-                                    )
-                                    return {"status": "fok_rejected",
-                                            "reason": "retry_price_exceeds_cap"}
-                                retry_price = min(retry_price, max_retry_price)
+                            # Hard ceiling: never pay more than 5% above our
+                            # original price.  The old 0.99 fallback was
+                            # effectively a market buy that could fill at any
+                            # ask on the book — causing massive overpays.
+                            inherent_cap = round(rounded_price * 1.05, 2)
+                            price_cap = min(
+                                inherent_cap,
+                                max_retry_price or inherent_cap,
+                            )
+                            retry_price = round(min(retry_ask * 1.005, price_cap), 2)
+                            if retry_price > price_cap:
+                                self.logger.warning(
+                                    "FOK retry: refreshed ask $%.4f exceeds "
+                                    "price cap $%.4f (original $%.4f) — aborting",
+                                    retry_ask, price_cap, rounded_price,
+                                )
+                                return {"status": "fok_rejected",
+                                        "reason": "retry_price_exceeds_cap"}
                         elif side.upper() == "SELL" and retry_bid > 0:
-                            retry_price = round(max(retry_bid * 0.995, 0.01), 2)
+                            inherent_floor = round(rounded_price * 0.95, 2)
+                            price_floor = max(
+                                inherent_floor,
+                                max_retry_price or inherent_floor,
+                            )
+                            retry_price = round(max(retry_bid * 0.995, price_floor, 0.01), 2)
+                            if retry_price < price_floor:
+                                self.logger.warning(
+                                    "FOK retry: refreshed bid $%.4f below "
+                                    "price floor $%.4f — aborting",
+                                    retry_bid, price_floor,
+                                )
+                                return {"status": "fok_rejected",
+                                        "reason": "retry_price_below_floor"}
                         else:
                             self.logger.warning("FOK retry: no orderbook — aborting")
                             return {"status": "fok_rejected", "reason": str(fok_exc)}
