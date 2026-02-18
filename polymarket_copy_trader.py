@@ -864,6 +864,7 @@ class TelegramCommandBot:
             ("strategies", "Martingale strategy status"),
             ("status", "Bot state, session P&L, uptime"),
             ("chart", "Equity P&L chart (add 'session' for current)"),
+            ("missed", "Missed windows analysis (price/book/balance)"),
             ("stop", "Stop the bot gracefully"),
             ("pause", "Pause trading (keep monitoring)"),
             ("resume", "Resume trading after pause"),
@@ -968,6 +969,7 @@ class TelegramCommandBot:
             "/strategies": self._cmd_strategies,
             "/status": self._cmd_status,
             "/chart": self._cmd_chart,
+            "/missed": self._cmd_missed,
             "/help": self._cmd_help,
             "/start": self._cmd_help,
             # -- Control commands --
@@ -1435,6 +1437,102 @@ class TelegramCommandBot:
 
         self.send("\n".join(lines))
 
+    def _cmd_missed(self, args=None):
+        """Analyze windows missed due to price out of range / other reasons."""
+        mart_mgr = getattr(self.bot, "_martingale_mgr", None) if self.bot else None
+        if not mart_mgr:
+            self.send("Martingale not active — no missed window data.")
+            return
+
+        # Collect missed windows from all strategy bots
+        all_missed = []
+        for mb in mart_mgr.bots:
+            for m in mb._missed_windows:
+                rec = dict(m)
+                rec["strategy"] = mb.strategy_name
+                all_missed.append(rec)
+
+        if not all_missed:
+            self.send("No missed windows recorded yet.")
+            return
+
+        all_missed.sort(key=lambda r: r.get("ts", ""))
+
+        # --- Breakdown by reason ---
+        reason_counts = {}
+        for m in all_missed:
+            reason = m.get("reason", "unknown")
+            # Normalize price-related reasons to a single bucket
+            if "outside" in reason:
+                reason = "price outside range"
+            elif "thin book" in reason:
+                reason = "thin book"
+            elif "too late" in reason:
+                reason = "too late"
+            elif "low balance" in reason:
+                reason = "low balance"
+            elif "market not found" in reason:
+                reason = "market not found"
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+        # --- By streak level at time of miss ---
+        streak_at_miss = {}
+        for m in all_missed:
+            s = m.get("streak", 0)
+            streak_at_miss[s] = streak_at_miss.get(s, 0) + 1
+
+        # --- Estimate capital at risk from missed windows ---
+        total_missed_exposure = sum(m.get("bet_would_be", 0) for m in all_missed)
+
+        # --- Consecutive missed windows ---
+        # Group by strategy and find the worst streak of consecutive misses
+        by_strat = {}
+        for m in all_missed:
+            s = m.get("strategy", "default")
+            by_strat.setdefault(s, []).append(m)
+
+        max_consec = 0
+        for strat, misses in by_strat.items():
+            wts = sorted(set(m.get("window_ts", 0) for m in misses))
+            if len(wts) < 2:
+                max_consec = max(max_consec, len(wts))
+                continue
+            # Infer window size from gaps
+            gaps = [wts[i+1] - wts[i] for i in range(len(wts)-1)]
+            window_s = min(gaps) if gaps else 300
+            consec = 1
+            best = 1
+            for i in range(1, len(wts)):
+                if wts[i] - wts[i-1] == window_s:
+                    consec += 1
+                    best = max(best, consec)
+                else:
+                    consec = 1
+            max_consec = max(max_consec, best)
+
+        # --- Build message ---
+        lines = [f"MISSED WINDOWS ANALYSIS ({len(all_missed)} total)"]
+
+        lines.append("\nBy Reason:")
+        for reason, cnt in sorted(reason_counts.items(), key=lambda x: -x[1]):
+            pct = cnt / len(all_missed) * 100
+            lines.append(f"  {reason}: {cnt} ({pct:.0f}%)")
+
+        lines.append("\nBy Streak at Time of Miss:")
+        for streak, cnt in sorted(streak_at_miss.items()):
+            label = f"streak {streak}" if streak > 0 else "no streak"
+            lines.append(f"  {label}: {cnt} missed")
+
+        lines.append(f"\nMax Consecutive Misses: {max_consec}")
+        lines.append(f"Total Exposure Missed: ${total_missed_exposure:,.2f}")
+
+        # Time range
+        first = all_missed[0].get("ts", "?")[:16].replace("T", " ")
+        last = all_missed[-1].get("ts", "?")[:16].replace("T", " ")
+        lines.append(f"\nPeriod: {first} → {last}")
+
+        self.send("\n".join(lines))
+
     def _cmd_chart(self, args=None):
         """Generate a cumulative P&L equity chart and send it as a photo."""
         try:
@@ -1607,6 +1705,7 @@ class TelegramCommandBot:
             "/strategies — per-strategy diagnostics\n"
             "/status — bot state, uptime, session info\n"
             "/chart — equity P&L chart (add 'session' for current session)\n"
+            "/missed — missed windows analysis (price/book/balance)\n"
             "\n"
             "CONTROL\n"
             "/stop — graceful shutdown\n"
@@ -4328,6 +4427,7 @@ class MartingaleBot(threading.Thread):
         self._skip_reason = None        # last reason a window was skipped
         self._windows_attempted = 0     # windows where we tried to bet
         self._windows_no_market = 0     # market slug not found on Gamma API
+        self._missed_windows = []       # windows skipped due to price/book/balance
 
         # Callbacks (wired by CopyTraderBot)
         self.notify_callback = None
@@ -4401,6 +4501,7 @@ class MartingaleBot(threading.Thread):
             "direction": self.direction,
             "active_bet": self._active_bet,
             "last_window_ts": self._last_window_ts,
+            "missed_windows": self._missed_windows[-500:],  # cap at 500
         }
         try:
             tmp = self.STATE_FILE + ".tmp"
@@ -4420,11 +4521,13 @@ class MartingaleBot(threading.Thread):
             self.direction = state.get("direction", self.direction)
             self._active_bet = state.get("active_bet")
             self._last_window_ts = int(state.get("last_window_ts", 0))
+            self._missed_windows = state.get("missed_windows", [])
             self.logger.info(
                 "Loaded martingale state: bet=$%.2f, streak=%d, pnl=$%.4f, "
-                "dir=%s, last_window_ts=%d",
+                "dir=%s, last_window_ts=%d, missed=%d",
                 self.current_bet, self.consecutive_losses,
                 self.session_pnl, self.direction, self._last_window_ts,
+                len(self._missed_windows),
             )
 
             # Discard stale active bets from a previous session.
@@ -4935,12 +5038,22 @@ class MartingaleBot(threading.Thread):
             "max_entry_seconds", "martingale_max_entry_seconds", 60,
         ))
         if max_entry > 0 and seconds_into > max_entry:
+            # Record the missed window with whatever skip reason was active
+            reason = self._skip_reason or f"too late ({seconds_into}s > {max_entry}s)"
             self.logger.info(
-                "MARTINGALE [%s]: %ds into window > max_entry %ds — skipping",
-                self.strategy_name, seconds_into, max_entry,
+                "MARTINGALE [%s]: %ds into window > max_entry %ds — skipping (%s)",
+                self.strategy_name, seconds_into, max_entry, reason,
             )
-            self._skip_reason = f"too late ({seconds_into}s > {max_entry}s)"
+            self._missed_windows.append({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "window_ts": current_window_ts,
+                "reason": reason,
+                "streak": self.consecutive_losses,
+                "bet_would_be": self.current_bet,
+            })
+            self._skip_reason = reason
             self._last_window_ts = current_window_ts
+            self._save_state()
             return False
 
         # Allow runtime direction toggle via config (must happen before
@@ -5043,6 +5156,8 @@ class MartingaleBot(threading.Thread):
                 self.strategy_name, target_shares, book_depth, price_max,
             )
             self._skip_reason = f"thin book ({book_depth:.0f}/{target_shares:.0f} shares)"
+            # Thin book retries like price-out-of-range; will be caught by
+            # the max_entry_seconds guard and recorded as a missed window.
             return False
 
         # Dry run guard
