@@ -860,7 +860,7 @@ class TelegramCommandBot:
             ("balance", "Current USDC & MATIC balances"),
             ("positions", "Open positions with floating P&L"),
             ("trades", "Recent trade history (last 10)"),
-            ("stats", "Session W/L, win %, total P&L, ROI"),
+            ("stats", "Stats by timeframe (1D 7D 30D ALL)"),
             ("strategies", "Martingale strategy status"),
             ("status", "Bot state, session P&L, uptime"),
             ("chart", "Equity P&L chart (add 'session' for current)"),
@@ -1236,19 +1236,94 @@ class TelegramCommandBot:
             ]
         return history
 
+    def _load_history_with_timeframe(self, timeframe=None):
+        """Load trade_history.json with optional timeframe filter.
+
+        Supported timeframes: '1D' (today), '7D', '30D', 'ALL', 'session' (default).
+        Returns (filtered_history, label) tuple.
+        """
+        history = []
+        try:
+            history_file = (
+                self.bot.cfg.get("trade_history_file", TRADE_HISTORY_FILE)
+                if self.bot else TRADE_HISTORY_FILE
+            )
+            with open(history_file, "r") as fh:
+                history = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+        if not timeframe or timeframe.lower() == "session":
+            # Default: current session only
+            session_start = None
+            if self.bot:
+                ss = getattr(self.bot, "_session_start", None)
+                if ss:
+                    session_start = ss.isoformat() if hasattr(ss, "isoformat") else str(ss)
+            if session_start:
+                history = [
+                    r for r in history
+                    if r.get("closed_at", "") >= session_start
+                ]
+            return history, "SESSION"
+
+        tf = timeframe.upper()
+        if tf == "ALL":
+            return history, "ALL TIME"
+
+        # Calendar-day based filtering
+        now = datetime.now(timezone.utc)
+        if tf == "1D":
+            # Current calendar day (UTC)
+            cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            label = f"TODAY ({cutoff.strftime('%m/%d')})"
+        elif tf == "7D":
+            from datetime import timedelta
+            cutoff = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+            label = "LAST 7 DAYS"
+        elif tf == "30D":
+            from datetime import timedelta
+            cutoff = (now - timedelta(days=30)).replace(hour=0, minute=0, second=0, microsecond=0)
+            label = "LAST 30 DAYS"
+        else:
+            # Unknown — fall back to session
+            session_start = None
+            if self.bot:
+                ss = getattr(self.bot, "_session_start", None)
+                if ss:
+                    session_start = ss.isoformat() if hasattr(ss, "isoformat") else str(ss)
+            if session_start:
+                history = [
+                    r for r in history
+                    if r.get("closed_at", "") >= session_start
+                ]
+            return history, "SESSION"
+
+        cutoff_str = cutoff.isoformat()
+        history = [
+            r for r in history
+            if r.get("closed_at", "") >= cutoff_str
+        ]
+        return history, label
+
     def _cmd_stats(self, args=None):
-        """Session statistics: bets placed, W/L, win %, total return,
-        plus per-strategy breakdown for martingale."""
-        history = self._load_session_history()
+        """Statistics: bets placed, W/L, win %, total return,
+        plus per-strategy breakdown for martingale.
+
+        Usage: /stats [1D|7D|30D|ALL|session]
+        Defaults to current session if no timeframe given.
+        """
+        timeframe = args[0] if args else None
+        history, label = self._load_history_with_timeframe(timeframe)
 
         if not history:
-            self.send("No trades this session.")
+            self.send(f"No trades for {label}.")
             return
 
         # -- Overall totals --
         t = self._bucket_stats(history)
         lines = [
-            "SESSION STATS",
+            f"STATS — {label}",
             f"  Bets placed: {t['n']}",
             f"  Won: {t['wins']}  |  Lost: {t['losses']}"
             + (f"  |  Sold: {t['sold']}" if t["sold"] else ""),
@@ -1701,7 +1776,7 @@ class TelegramCommandBot:
             "/balance — USDC & MATIC balances\n"
             "/positions — open positions with P/L\n"
             "/trades — recent trade history\n"
-            "/stats — session W/L, win %, P&L, ROI\n"
+            "/stats [1D|7D|30D|ALL] — W/L, win %, P&L, ROI\n"
             "/strategies — per-strategy diagnostics\n"
             "/status — bot state, uptime, session info\n"
             "/chart — equity P&L chart (add 'session' for current session)\n"
@@ -11094,10 +11169,18 @@ class CopyTraderGUI:
         self.equity_canvas.pack(fill=tk.BOTH, expand=True)
         self.equity_canvas.bind("<Configure>", lambda e: self._refresh_equity_chart())
 
+        # Hover tooltip state
+        self._equity_points = []       # [(px, py, ts_str, pnl), ...]
+        self._equity_tooltip_id = None  # canvas item id for tooltip
+        self._equity_highlight_id = None
+        self.equity_canvas.bind("<Motion>", self._equity_on_hover)
+        self.equity_canvas.bind("<Leave>", self._equity_on_leave)
+
     def _refresh_equity_chart(self):
         """Redraw the equity chart from trade_history.json data."""
         canvas = self.equity_canvas
         canvas.delete("all")
+        self._equity_points = []
         w = canvas.winfo_width()
         h = canvas.winfo_height()
         if w < 80 or h < 80:
@@ -11252,7 +11335,8 @@ class CopyTraderGUI:
             )
 
             # ── Dot markers at each trade point ──
-            for i, (_, pnl) in enumerate(trade_points):
+            self._equity_points = []
+            for i, (ts_str, pnl) in enumerate(trade_points):
                 px = x_px(i)
                 py = y_px(pnl)
                 dot_color = "#00ff55" if pnl >= 0 else "#ff4444"
@@ -11261,11 +11345,14 @@ class CopyTraderGUI:
                     px - r, py - r, px + r, py + r,
                     fill=dot_color, outline="",
                 )
+                self._equity_points.append((px, py, ts_str, pnl))
         elif len(trade_points) == 1:
+            self._equity_points = []
             px = x_px(0)
             py = y_px(trade_points[0][1])
             dot_color = "#00ff55" if trade_points[0][1] >= 0 else "#ff4444"
             canvas.create_oval(px - 5, py - 5, px + 5, py + 5, fill=dot_color, outline="")
+            self._equity_points.append((px, py, trade_points[0][0], trade_points[0][1]))
 
         # ── X-axis time labels ──
         # Show a subset of labels to avoid overlap
@@ -11305,6 +11392,88 @@ class CopyTraderGUI:
         first_ts = trade_points[0][0][:16].replace("T", " ") if trade_points else ""
         last_ts = trade_points[-1][0][:16].replace("T", " ") if trade_points else ""
         self.equity_info_var.set(f"{first_ts}  →  {last_ts}")
+
+    def _equity_on_hover(self, event):
+        """Show tooltip when hovering near a data point on the equity chart."""
+        canvas = self.equity_canvas
+        # Clear previous tooltip
+        self._equity_clear_tooltip()
+
+        if not self._equity_points:
+            return
+
+        mx, my = event.x, event.y
+        # Find the nearest point within a reasonable radius
+        best_dist = float("inf")
+        best = None
+        for px, py, ts_str, pnl in self._equity_points:
+            dist = ((mx - px) ** 2 + (my - py) ** 2) ** 0.5
+            if dist < best_dist:
+                best_dist = dist
+                best = (px, py, ts_str, pnl)
+
+        # Snap threshold — must be within 20px of a data point
+        if best is None or best_dist > 20:
+            return
+
+        px, py, ts_str, pnl = best
+        ts_label = ts_str[:19].replace("T", " ") if len(ts_str) >= 16 else ts_str
+        pnl_label = f"${pnl:+,.2f}"
+
+        # Highlight the point
+        r = 5
+        self._equity_highlight_id = canvas.create_oval(
+            px - r, py - r, px + r, py + r,
+            outline="#ffffff", width=2, fill="",
+        )
+
+        # Tooltip background + text
+        text = f"{ts_label}\nP&L: {pnl_label}"
+        # Position tooltip above and to the right; flip if near edges
+        tx = px + 12
+        ty = py - 12
+        anchor = tk.SW
+        cw = canvas.winfo_width()
+        if tx + 120 > cw:
+            tx = px - 12
+            anchor = tk.SE
+        if ty < 30:
+            ty = py + 12
+            anchor = tk.NW if anchor == tk.SW else tk.NE
+
+        bg_color = "#2a2a2a"
+        text_color = "#00ff88" if pnl >= 0 else "#ff6666"
+
+        # Draw tooltip text (use a tag so we can delete it)
+        self._equity_tooltip_id = canvas.create_text(
+            tx, ty, text=text, fill=text_color,
+            font=("Courier", 9, "bold"), anchor=anchor,
+            tags=("tooltip",),
+        )
+        # Draw background rectangle behind text
+        bbox = canvas.bbox(self._equity_tooltip_id)
+        if bbox:
+            pad = 4
+            bg = canvas.create_rectangle(
+                bbox[0] - pad, bbox[1] - pad,
+                bbox[2] + pad, bbox[3] + pad,
+                fill=bg_color, outline="#555555",
+                tags=("tooltip_bg",),
+            )
+            canvas.tag_raise(self._equity_tooltip_id, bg)
+
+    def _equity_on_leave(self, event):
+        """Clear tooltip when mouse leaves the canvas."""
+        self._equity_clear_tooltip()
+
+    def _equity_clear_tooltip(self):
+        canvas = self.equity_canvas
+        canvas.delete("tooltip")
+        canvas.delete("tooltip_bg")
+        if self._equity_highlight_id:
+            canvas.delete(self._equity_highlight_id)
+            self._equity_highlight_id = None
+        self._equity_tooltip_id = None
 
     def _build_log_tab(self, parent):
         self.log_area = scrolledtext.ScrolledText(
