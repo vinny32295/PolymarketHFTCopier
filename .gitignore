@@ -31,6 +31,8 @@ trade_history.csv
 positions.json
 arb_positions.json
 martingale_state.json
+martingale_history.json
+martingale_summary.json
 whale_comparison.json
 strategy_summary.json
 session_trades.json
