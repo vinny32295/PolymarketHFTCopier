@@ -3038,6 +3038,14 @@ class TestMartingaleBot(unittest.TestCase):
         mb._windows_no_market = 0
         mb.notify_callback = None
         mb.log_trade_callback = None
+        mb._streak_paused = False
+        mb._streak_paused_at = None
+        mb._recovery_candles = []
+        mb._recovery_candle_open = None
+        mb._recovery_candle_ts = 0
+        mb._skip_price = None
+        mb._skip_gap = None
+        mb._missed_windows = []
         return mb
 
     # -- slug generation --
@@ -3182,11 +3190,14 @@ class TestMartingaleBot(unittest.TestCase):
         # Should not even fetch market
         mb.clob_client._get_public.assert_not_called()
 
-    def test_try_place_bet_max_streak_stops(self):
+    def test_try_place_bet_max_streak_pauses(self):
         mb = self._make_bot({"martingale_max_streak": 3})
         mb.consecutive_losses = 3
-        mb._try_place_bet()
-        mb._stop_event.set.assert_called_once()
+        result = mb._try_place_bet()
+        self.assertFalse(result)
+        self.assertTrue(mb._streak_paused)
+        # Should NOT stop the bot — it pauses and waits for recovery
+        mb._stop_event.set.assert_not_called()
 
     def test_try_place_bet_max_bet_stops(self):
         mb = self._make_bot({"martingale_max_bet": 10.0})

@@ -511,6 +511,9 @@ DEFAULT_CONFIG = {
     "martingale_start_bet": 5.0,       # starting bet size in USDC
     "martingale_max_bet": 0,           # max bet cap in USDC (0 = no limit)
     "martingale_max_streak": 0,        # stop after N consecutive losses (0 = no limit)
+    "martingale_recovery_candles": 10,  # number of candles to evaluate for recovery
+    "martingale_recovery_green": 5,     # how many of those candles must be green to resume
+    "martingale_recovery_interval": 300, # candle interval in seconds for recovery sampling
     "martingale_slug_base": "btc-updown-5m",  # slug prefix for the market
     "martingale_window": 300,          # window size in seconds (300 = 5 min)
     "martingale_poll_seconds": 10,     # how often to check for resolution
@@ -548,6 +551,8 @@ _PERSISTENT_CONFIG_KEYS = [
     "martingale_max_bet", "martingale_max_streak",
     "martingale_slug_base", "martingale_window", "martingale_poll_seconds",
     "martingale_price_min", "martingale_price_max", "martingale_max_entry_seconds",
+    "martingale_recovery_candles", "martingale_recovery_green",
+    "martingale_recovery_interval",
     "martingale_strategies",
 ]
 
@@ -1544,11 +1549,23 @@ class TelegramCommandBot:
             mgr = getattr(self.bot, "_martingale_mgr", None)
             if mgr:
                 for mg in mgr.bots:
+                    status_extra = ""
+                    if mg._streak_paused:
+                        green = sum(1 for c in mg._recovery_candles if c.get("green"))
+                        total = len(mg._recovery_candles)
+                        n_needed = int(mg._scfg(
+                            "recovery_green", "martingale_recovery_green", 5))
+                        n_candles = int(mg._scfg(
+                            "recovery_candles", "martingale_recovery_candles", 10))
+                        status_extra = (
+                            f" [PAUSED — recovery {green}/{total} "
+                            f"green, need {n_needed}/{n_candles}]"
+                        )
                     lines.append(
                         f"  Martingale [{mg.strategy_name}]: "
                         f"streak={mg.consecutive_losses}, "
                         f"bet=${mg.current_bet:.2f}, "
-                        f"P/L=${mg.session_pnl:+.2f}"
+                        f"P/L=${mg.session_pnl:+.2f}{status_extra}"
                     )
                 modes.append(f"Martingale ({len(mgr.bots)} strat)")
             lines.append(f"  Modes: {', '.join(modes) if modes else 'none'}")
@@ -4629,6 +4646,13 @@ class MartingaleBot(threading.Thread):
         self._windows_no_market = 0     # market slug not found on Gamma API
         self._missed_windows = []       # windows skipped due to price/book/balance
 
+        # Streak-pause recovery state
+        self._streak_paused = False     # True when max_streak hit, waiting for recovery
+        self._streak_paused_at = None   # datetime when pause started
+        self._recovery_candles = []     # list of {"open": px, "close": px, "green": bool}
+        self._recovery_candle_open = None   # price at start of current candle
+        self._recovery_candle_ts = 0    # epoch when current candle opened
+
         # Callbacks (wired by CopyTraderBot)
         self.notify_callback = None
         self.log_trade_callback = None
@@ -4702,6 +4726,9 @@ class MartingaleBot(threading.Thread):
             "active_bet": self._active_bet,
             "last_window_ts": self._last_window_ts,
             "missed_windows": self._missed_windows[-500:],  # cap at 500
+            "streak_paused": self._streak_paused,
+            "streak_paused_at": self._streak_paused_at.isoformat() if self._streak_paused_at else None,
+            "recovery_candles": self._recovery_candles[-20:],
         }
         try:
             tmp = self.STATE_FILE + ".tmp"
@@ -4722,12 +4749,21 @@ class MartingaleBot(threading.Thread):
             self._active_bet = state.get("active_bet")
             self._last_window_ts = int(state.get("last_window_ts", 0))
             self._missed_windows = state.get("missed_windows", [])
+            self._streak_paused = bool(state.get("streak_paused", False))
+            paused_at_str = state.get("streak_paused_at")
+            if paused_at_str:
+                try:
+                    self._streak_paused_at = datetime.fromisoformat(paused_at_str)
+                except (ValueError, TypeError):
+                    self._streak_paused_at = None
+            self._recovery_candles = state.get("recovery_candles", [])
             self.logger.info(
                 "Loaded martingale state: bet=$%.2f, streak=%d, pnl=$%.4f, "
-                "dir=%s, last_window_ts=%d, missed=%d",
+                "dir=%s, last_window_ts=%d, missed=%d%s",
                 self.current_bet, self.consecutive_losses,
                 self.session_pnl, self.direction, self._last_window_ts,
                 len(self._missed_windows),
+                " [PAUSED — waiting for recovery]" if self._streak_paused else "",
             )
 
             # Discard stale active bets from a previous session.
@@ -4757,6 +4793,11 @@ class MartingaleBot(threading.Thread):
         self.session_pnl = 0.0
         self._active_bet = None
         self._last_window_ts = 0
+        self._streak_paused = False
+        self._streak_paused_at = None
+        self._recovery_candles = []
+        self._recovery_candle_open = None
+        self._recovery_candle_ts = 0
         try:
             os.remove(self.STATE_FILE)
         except OSError:
@@ -5197,6 +5238,107 @@ class MartingaleBot(threading.Thread):
         except Exception as exc:
             self.logger.debug("MARTINGALE: prefetch failed: %s", exc)
 
+    # -- streak recovery (candle sampling) ------------------------------------
+
+    def _check_streak_recovery(self):
+        """Sample price to build candles and check if market has recovered.
+
+        Called each cycle while ``_streak_paused`` is True.  Returns True
+        when the recovery condition is met (N out of M candles are green),
+        meaning the bot should resume trading.
+
+        A "candle" is simply the price at the start and end of each
+        *recovery_interval* period.  Green = close >= open.
+        """
+        interval = int(self._scfg(
+            "recovery_interval", "martingale_recovery_interval", 300))
+        n_candles = int(self._scfg(
+            "recovery_candles", "martingale_recovery_candles", 10))
+        n_green = int(self._scfg(
+            "recovery_green", "martingale_recovery_green", 5))
+
+        # Get a token_id to sample — use the current window's market
+        slug = self._generate_slug()
+        market = self._fetch_market(slug)
+        if not market:
+            return False  # can't sample yet
+
+        direction = self._scfg("direction", "martingale_direction", self.direction)
+        token_id = (
+            market["up_token"] if direction == "Up"
+            else market["down_token"]
+        )
+        price, _ = self._get_best_ask(token_id)
+        if not price or price <= 0:
+            return False  # no asks — can't sample
+
+        now = int(time.time())
+
+        # Start a new candle if none open or interval elapsed
+        if self._recovery_candle_ts == 0 or (now - self._recovery_candle_ts) >= interval:
+            # Close the previous candle if one was open
+            if self._recovery_candle_open is not None and self._recovery_candle_ts > 0:
+                candle = {
+                    "open": self._recovery_candle_open,
+                    "close": price,
+                    "green": price >= self._recovery_candle_open,
+                    "ts": self._recovery_candle_ts,
+                }
+                self._recovery_candles.append(candle)
+                # Keep only the last N candles
+                self._recovery_candles = self._recovery_candles[-n_candles:]
+                self._save_state()
+
+                green_count = sum(1 for c in self._recovery_candles if c["green"])
+                total = len(self._recovery_candles)
+                color = "GREEN" if candle["green"] else "RED"
+                self.logger.info(
+                    "MARTINGALE [%s] recovery candle: %s (%.4f → %.4f) "
+                    "— %d/%d green (%d needed from %d candles)",
+                    self.strategy_name, color, candle["open"], candle["close"],
+                    green_count, total, n_green, n_candles,
+                )
+
+                # Check recovery condition
+                if total >= n_candles and green_count >= n_green:
+                    return True
+
+            # Open a new candle
+            self._recovery_candle_open = price
+            self._recovery_candle_ts = now
+
+        return False
+
+    def _resume_from_streak_pause(self):
+        """Resume trading after streak recovery is confirmed."""
+        paused_dur = ""
+        if self._streak_paused_at:
+            delta = datetime.now() - self._streak_paused_at
+            mins = int(delta.total_seconds() // 60)
+            paused_dur = f" (paused for {mins}m)"
+
+        green_count = sum(1 for c in self._recovery_candles if c["green"])
+        total = len(self._recovery_candles)
+
+        self._streak_paused = False
+        self._streak_paused_at = None
+        self._recovery_candles = []
+        self._recovery_candle_open = None
+        self._recovery_candle_ts = 0
+        self._save_state()
+
+        msg = (
+            f"MARTINGALE [{self.strategy_name}] RESUMED: recovery confirmed "
+            f"({green_count}/{total} green candles){paused_dur} "
+            f"— streak={self.consecutive_losses}, next bet=${self.current_bet:.2f}"
+        )
+        self.logger.info(msg)
+        if self.notify_callback:
+            try:
+                self.notify_callback(msg)
+            except Exception:
+                pass
+
     # -- bet placement & result handling ------------------------------------
 
     def _try_place_bet(self):
@@ -5204,15 +5346,34 @@ class MartingaleBot(threading.Thread):
 
         Returns ``True`` if a bet was placed, ``False`` otherwise.
         """
-        # Safety: max streak
+        # Safety: max streak — pause and wait for bullish recovery
         max_streak = int(self._scfg("max_streak", "martingale_max_streak", 0))
-        if max_streak > 0 and self.consecutive_losses >= max_streak:
-            self.logger.warning(
-                "MARTINGALE [%s] STOPPED: max streak of %d losses reached",
-                self.strategy_name, max_streak,
+        if max_streak > 0 and self.consecutive_losses >= max_streak and not self._streak_paused:
+            self._streak_paused = True
+            self._streak_paused_at = datetime.now()
+            self._recovery_candles = []
+            self._recovery_candle_open = None
+            self._recovery_candle_ts = 0
+            self._save_state()
+            n_candles = int(self._scfg(
+                "recovery_candles", "martingale_recovery_candles", 10))
+            n_green = int(self._scfg(
+                "recovery_green", "martingale_recovery_green", 5))
+            msg = (
+                f"MARTINGALE [{self.strategy_name}] PAUSED: max streak of "
+                f"{max_streak} losses reached — waiting for {n_green}/{n_candles} "
+                f"green candles before resuming"
             )
-            self.stop()
+            self.logger.warning(msg)
+            if self.notify_callback:
+                try:
+                    self.notify_callback(msg)
+                except Exception:
+                    pass
             return False
+
+        if self._streak_paused:
+            return False  # recovery check happens in _cycle()
 
         # Safety: max bet
         max_bet = float(self._scfg("max_bet", "martingale_max_bet", 0))
@@ -5828,6 +5989,11 @@ class MartingaleBot(threading.Thread):
                 self._handle_loss(bet)
             return False  # resolved — fast poll for next bet
         else:
+            # While paused for streak recovery, sample candles instead of betting
+            if self._streak_paused:
+                if self._check_streak_recovery():
+                    self._resume_from_streak_pause()
+                return False  # keep fast-polling to sample prices
             placed = self._try_place_bet()
             return placed  # fast poll until placed, then slow poll
 
