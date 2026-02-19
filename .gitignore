@@ -33,6 +33,7 @@ arb_positions.json
 martingale_state.json
 martingale_history.json
 martingale_summary.json
+missed_windows.json
 whale_comparison.json
 strategy_summary.json
 session_trades.json

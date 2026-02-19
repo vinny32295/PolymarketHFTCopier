@@ -218,6 +218,8 @@ SESSION_TRADES_FILE = "session_trades.json"
 _TRADE_HISTORY_LOCK = threading.Lock()
 STRATEGY_SUMMARY_FILE = "strategy_summary.json"
 MARTINGALE_HISTORY_FILE = "martingale_history.json"
+MISSED_WINDOWS_FILE = "missed_windows.json"
+_MISSED_WINDOWS_LOCK = threading.Lock()
 MARTINGALE_SUMMARY_FILE = "martingale_summary.json"
 USER_CONFIG_FILE = "config.json"  # persists RPC URLs, proxy address, etc.
 
@@ -692,6 +694,34 @@ def send_webhook(url, message, logger=None):
 TELEGRAM_API = "https://api.telegram.org/bot{token}"
 
 
+def _append_missed_window(record, logger=None):
+    """Append a missed-window record to missed_windows.json (thread-safe)."""
+    with _MISSED_WINDOWS_LOCK:
+        try:
+            with open(MISSED_WINDOWS_FILE, "r") as fh:
+                history = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            history = []
+        history.append(record)
+        try:
+            tmp = MISSED_WINDOWS_FILE + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(history, fh, indent=2, default=str)
+            os.replace(tmp, MISSED_WINDOWS_FILE)
+        except OSError as exc:
+            if logger:
+                logger.debug("Could not save missed_windows.json: %s", exc)
+
+
+def _load_missed_windows():
+    """Load all missed-window records from missed_windows.json."""
+    try:
+        with open(MISSED_WINDOWS_FILE, "r") as fh:
+            return json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
 def send_telegram(token, chat_id, message, logger=None, parse_mode=None):
     """Fire-and-forget a Telegram message.
 
@@ -864,7 +894,7 @@ class TelegramCommandBot:
             ("strategies", "Martingale strategy status"),
             ("status", "Bot state, session P&L, uptime"),
             ("chart", "Equity P&L chart (add 'session' for current)"),
-            ("missed", "Missed windows analysis (price/book/balance)"),
+            ("missed", "Missed windows (1D 7D 30D ALL)"),
             ("stop", "Stop the bot gracefully"),
             ("pause", "Pause trading (keep monitoring)"),
             ("resume", "Resume trading after pause"),
@@ -1271,18 +1301,17 @@ class TelegramCommandBot:
         if tf == "ALL":
             return history, "ALL TIME"
 
-        # Calendar-day based filtering
-        now = datetime.now(timezone.utc)
+        # Calendar-day based filtering using LOCAL time (matching how
+        # trade timestamps are stored via datetime.now().isoformat()).
+        from datetime import timedelta
+        now = datetime.now()
         if tf == "1D":
-            # Current calendar day (UTC)
             cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
             label = f"TODAY ({cutoff.strftime('%m/%d')})"
         elif tf == "7D":
-            from datetime import timedelta
             cutoff = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
             label = "LAST 7 DAYS"
         elif tf == "30D":
-            from datetime import timedelta
             cutoff = (now - timedelta(days=30)).replace(hour=0, minute=0, second=0, microsecond=0)
             label = "LAST 30 DAYS"
         else:
@@ -1299,6 +1328,7 @@ class TelegramCommandBot:
                 ]
             return history, "SESSION"
 
+        # Use naive isoformat (no +00:00 suffix) to match trade timestamps
         cutoff_str = cutoff.isoformat()
         history = [
             r for r in history
@@ -1320,10 +1350,27 @@ class TelegramCommandBot:
             self.send(f"No trades for {label}.")
             return
 
+        # -- Session runtime --
+        runtime_str = ""
+        if self.bot:
+            start = getattr(self.bot, "_session_start", None)
+            if start:
+                delta = datetime.now() - start
+                total_s = int(delta.total_seconds())
+                hours, rem = divmod(total_s, 3600)
+                mins, secs = divmod(rem, 60)
+                if hours > 0:
+                    runtime_str = f"{hours}h {mins}m {secs}s"
+                else:
+                    runtime_str = f"{mins}m {secs}s"
+
         # -- Overall totals --
         t = self._bucket_stats(history)
+        header = f"STATS — {label}"
+        if runtime_str:
+            header += f"  (runtime: {runtime_str})"
         lines = [
-            f"STATS — {label}",
+            header,
             f"  Bets placed: {t['n']}",
             f"  Won: {t['wins']}  |  Lost: {t['losses']}"
             + (f"  |  Sold: {t['sold']}" if t["sold"] else ""),
@@ -1513,22 +1560,43 @@ class TelegramCommandBot:
         self.send("\n".join(lines))
 
     def _cmd_missed(self, args=None):
-        """Analyze windows missed due to price out of range / other reasons."""
-        mart_mgr = getattr(self.bot, "_martingale_mgr", None) if self.bot else None
-        if not mart_mgr:
-            self.send("Martingale not active — no missed window data.")
-            return
+        """Analyze windows missed due to price out of range / other reasons.
 
-        # Collect missed windows from all strategy bots
-        all_missed = []
-        for mb in mart_mgr.bots:
-            for m in mb._missed_windows:
-                rec = dict(m)
-                rec["strategy"] = mb.strategy_name
-                all_missed.append(rec)
+        Usage: /missed [1D|7D|30D|ALL|session]
+        Defaults to current session if no timeframe given.
+        """
+        # Load from persistent file (historical) for non-session queries
+        timeframe = args[0] if args else None
+        tf = (timeframe or "").upper()
+
+        if tf in ("1D", "7D", "30D", "ALL"):
+            all_missed = _load_missed_windows()
+            if tf != "ALL":
+                from datetime import timedelta
+                now = datetime.now()
+                if tf == "1D":
+                    cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                elif tf == "7D":
+                    cutoff = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+                else:  # 30D
+                    cutoff = (now - timedelta(days=30)).replace(hour=0, minute=0, second=0, microsecond=0)
+                cutoff_str = cutoff.isoformat()
+                all_missed = [m for m in all_missed if m.get("ts", "") >= cutoff_str]
+            label = {"1D": "TODAY", "7D": "LAST 7 DAYS", "30D": "LAST 30 DAYS", "ALL": "ALL TIME"}[tf]
+        else:
+            # Default: current session from in-memory bot data
+            mart_mgr = getattr(self.bot, "_martingale_mgr", None) if self.bot else None
+            if not mart_mgr:
+                self.send("Martingale not active — no missed window data.")
+                return
+            all_missed = []
+            for mb in mart_mgr.bots:
+                for m in mb._missed_windows:
+                    all_missed.append(dict(m))
+            label = "SESSION"
 
         if not all_missed:
-            self.send("No missed windows recorded yet.")
+            self.send(f"No missed windows for {label}.")
             return
 
         all_missed.sort(key=lambda r: r.get("ts", ""))
@@ -1592,7 +1660,7 @@ class TelegramCommandBot:
             max_consec = max(max_consec, best)
 
         # --- Build message ---
-        lines = [f"MISSED WINDOWS ANALYSIS ({len(all_missed)} total)"]
+        lines = [f"MISSED WINDOWS — {label} ({len(all_missed)} total)"]
 
         lines.append("\nBy Reason:")
         for reason, cnt in sorted(reason_counts.items(), key=lambda x: -x[1]):
@@ -1835,7 +1903,7 @@ class TelegramCommandBot:
             "/strategies — per-strategy diagnostics\n"
             "/status — bot state, uptime, session info\n"
             "/chart — equity P&L chart (add 'session' for current session)\n"
-            "/missed — missed windows analysis (price/book/balance)\n"
+            "/missed [1D|7D|30D|ALL] — missed windows analysis\n"
             "\n"
             "CONTROL\n"
             "/stop — graceful shutdown\n"
@@ -5166,15 +5234,18 @@ class MartingaleBot(threading.Thread):
         # If _skip_reason is set, the previous window was attempted but
         # no bet was placed.  Record it as a missed window now.
         if self._skip_reason and self._last_window_ts > 0:
-            self._missed_windows.append({
-                "ts": datetime.now(timezone.utc).isoformat(),
+            missed_rec = {
+                "ts": datetime.now().isoformat(),
                 "window_ts": self._last_window_ts,
                 "reason": self._skip_reason,
                 "streak": self.consecutive_losses,
                 "bet_would_be": self.current_bet,
                 "ask_price": self._skip_price,
-                "gap": self._skip_gap,  # "gap_up", "gap_down", or None
-            })
+                "gap": self._skip_gap,
+                "strategy": self.strategy_name,
+            }
+            self._missed_windows.append(missed_rec)
+            _append_missed_window(missed_rec, logger=self.logger)
             self.logger.info(
                 "MARTINGALE [%s]: recorded missed window %d — %s%s",
                 self.strategy_name, self._last_window_ts, self._skip_reason,
