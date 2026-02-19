@@ -1604,14 +1604,53 @@ class TelegramCommandBot:
             label = f"streak {streak}" if streak > 0 else "no streak"
             lines.append(f"  {label}: {cnt} missed")
 
-        # --- Price stats for price-related misses ---
-        prices = [m.get("ask_price") for m in all_missed if m.get("ask_price")]
-        if prices:
-            lines.append("\nAsk Price at Miss:")
+        # --- Gap Up / Gap Down analysis ---
+        gap_ups = [m for m in all_missed if m.get("gap") == "gap_up"]
+        gap_downs = [m for m in all_missed if m.get("gap") == "gap_down"]
+        price_misses = gap_ups + gap_downs
+        non_price = len(all_missed) - len(price_misses)
+
+        if price_misses:
+            lines.append("\nGap Analysis (price misses):")
+            if gap_ups:
+                up_prices = [m["ask_price"] for m in gap_ups if m.get("ask_price")]
+                up_exposure = sum(m.get("bet_would_be", 0) for m in gap_ups)
+                lines.append(
+                    f"  GAP UP (too high): {len(gap_ups)}"
+                    f" ({len(gap_ups) / len(all_missed) * 100:.0f}%)"
+                )
+                if up_prices:
+                    lines.append(
+                        f"    prices: ${min(up_prices):.4f} – "
+                        f"${max(up_prices):.4f} "
+                        f"(avg ${sum(up_prices)/len(up_prices):.4f})"
+                    )
+                    lines.append(f"    exposure missed: ${up_exposure:,.2f}")
+            if gap_downs:
+                dn_prices = [m["ask_price"] for m in gap_downs if m.get("ask_price")]
+                dn_exposure = sum(m.get("bet_would_be", 0) for m in gap_downs)
+                lines.append(
+                    f"  GAP DOWN (too low): {len(gap_downs)}"
+                    f" ({len(gap_downs) / len(all_missed) * 100:.0f}%)"
+                )
+                if dn_prices:
+                    lines.append(
+                        f"    prices: ${min(dn_prices):.4f} – "
+                        f"${max(dn_prices):.4f} "
+                        f"(avg ${sum(dn_prices)/len(dn_prices):.4f})"
+                    )
+                    lines.append(f"    exposure missed: ${dn_exposure:,.2f}")
+            if non_price > 0:
+                lines.append(f"  Other (non-price): {non_price}")
+
+        # --- All ask prices at time of miss ---
+        all_prices = [m.get("ask_price") for m in all_missed if m.get("ask_price")]
+        if all_prices:
+            lines.append("\nAsk Price at Miss (all):")
             lines.append(
-                f"  min ${min(prices):.4f}  |  "
-                f"avg ${sum(prices)/len(prices):.4f}  |  "
-                f"max ${max(prices):.4f}"
+                f"  min ${min(all_prices):.4f}  |  "
+                f"avg ${sum(all_prices)/len(all_prices):.4f}  |  "
+                f"max ${max(all_prices):.4f}"
             )
 
         lines.append(f"\nMax Consecutive Misses: {max_consec}")
@@ -4517,6 +4556,7 @@ class MartingaleBot(threading.Thread):
         self._next_window_cache = None  # pre-fetched market for next window
         self._skip_reason = None        # last reason a window was skipped
         self._skip_price = None         # ask price when last skip occurred
+        self._skip_gap = None           # "gap_up", "gap_down", or None
         self._windows_attempted = 0     # windows where we tried to bet
         self._windows_no_market = 0     # market slug not found on Gamma API
         self._missed_windows = []       # windows skipped due to price/book/balance
@@ -5133,14 +5173,17 @@ class MartingaleBot(threading.Thread):
                 "streak": self.consecutive_losses,
                 "bet_would_be": self.current_bet,
                 "ask_price": self._skip_price,
+                "gap": self._skip_gap,  # "gap_up", "gap_down", or None
             })
             self.logger.info(
-                "MARTINGALE [%s]: recorded missed window %d — %s",
+                "MARTINGALE [%s]: recorded missed window %d — %s%s",
                 self.strategy_name, self._last_window_ts, self._skip_reason,
+                f" ({self._skip_gap})" if self._skip_gap else "",
             )
         # Reset for the new window
         self._skip_reason = None
         self._skip_price = None
+        self._skip_gap = None
 
         now = int(time.time())
         seconds_into = now - current_window_ts
@@ -5239,14 +5282,21 @@ class MartingaleBot(threading.Thread):
                 )
 
         if ask_price < price_min or ask_price > price_max:
+            if ask_price > price_max:
+                gap_dir = "gap_up"
+                gap_label = "GAP UP"
+            else:
+                gap_dir = "gap_down"
+                gap_label = "GAP DOWN"
             self.logger.info(
-                "MARTINGALE [%s]: price $%.4f outside range [$%.2f–$%.2f] "
-                "— will retry (streak=%d)",
-                self.strategy_name, ask_price, price_min, price_max,
-                self.consecutive_losses,
+                "MARTINGALE [%s]: %s — price $%.4f outside range "
+                "[$%.2f–$%.2f] — will retry (streak=%d)",
+                self.strategy_name, gap_label, ask_price, price_min,
+                price_max, self.consecutive_losses,
             )
             self._skip_reason = f"price ${ask_price:.4f} outside [{price_min:.2f}–{price_max:.2f}]"
             self._skip_price = ask_price
+            self._skip_gap = gap_dir
             return False  # don't mark skipped — price might come back
 
         # Check aggregate depth across all ask levels up to price_max.
@@ -5381,6 +5431,7 @@ class MartingaleBot(threading.Thread):
         self._last_window_ts = current_window_ts
         self._skip_reason = None  # bet placed successfully
         self._skip_price = None
+        self._skip_gap = None
         self._windows_attempted += 1
         self._save_state()
 
