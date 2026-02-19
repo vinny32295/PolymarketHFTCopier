@@ -10056,9 +10056,16 @@ class TextHandler(logging.Handler):
 
     def _append(self, msg):
         try:
+            # Only auto-scroll if the user is already at the bottom.
+            # yview() returns (top_fraction, bottom_fraction); if bottom
+            # is >= 0.98 the user hasn't scrolled up to read old logs.
+            _, bottom = self.text_widget.yview()
+            at_bottom = bottom >= 0.98
+
             self.text_widget.configure(state="normal")
             self.text_widget.insert(tk.END, msg)
-            self.text_widget.see(tk.END)
+            if at_bottom:
+                self.text_widget.see(tk.END)
             self.text_widget.configure(state="disabled")
         except Exception:
             pass
