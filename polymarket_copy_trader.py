@@ -1537,7 +1537,7 @@ class TelegramCommandBot:
         reason_counts = {}
         for m in all_missed:
             reason = m.get("reason", "unknown")
-            # Normalize price-related reasons to a single bucket
+            # Normalize reasons to clean buckets
             if "outside" in reason:
                 reason = "price outside range"
             elif "thin book" in reason:
@@ -1548,6 +1548,12 @@ class TelegramCommandBot:
                 reason = "low balance"
             elif "market not found" in reason:
                 reason = "market not found"
+            elif "FOK rejected" in reason:
+                reason = "FOK rejected"
+            elif "order failed" in reason:
+                reason = "order failed"
+            elif "no asks" in reason:
+                reason = "no asks"
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
 
         # --- By streak level at time of miss ---
@@ -1597,6 +1603,16 @@ class TelegramCommandBot:
         for streak, cnt in sorted(streak_at_miss.items()):
             label = f"streak {streak}" if streak > 0 else "no streak"
             lines.append(f"  {label}: {cnt} missed")
+
+        # --- Price stats for price-related misses ---
+        prices = [m.get("ask_price") for m in all_missed if m.get("ask_price")]
+        if prices:
+            lines.append("\nAsk Price at Miss:")
+            lines.append(
+                f"  min ${min(prices):.4f}  |  "
+                f"avg ${sum(prices)/len(prices):.4f}  |  "
+                f"max ${max(prices):.4f}"
+            )
 
         lines.append(f"\nMax Consecutive Misses: {max_consec}")
         lines.append(f"Total Exposure Missed: ${total_missed_exposure:,.2f}")
@@ -4500,6 +4516,7 @@ class MartingaleBot(threading.Thread):
         self._last_window_ts = 0
         self._next_window_cache = None  # pre-fetched market for next window
         self._skip_reason = None        # last reason a window was skipped
+        self._skip_price = None         # ask price when last skip occurred
         self._windows_attempted = 0     # windows where we tried to bet
         self._windows_no_market = 0     # market slug not found on Gamma API
         self._missed_windows = []       # windows skipped due to price/book/balance
@@ -5105,6 +5122,26 @@ class MartingaleBot(threading.Thread):
         if current_window_ts == self._last_window_ts:
             return False  # already bet or skipped this window
 
+        # ── New window detected — check if previous window was missed ──
+        # If _skip_reason is set, the previous window was attempted but
+        # no bet was placed.  Record it as a missed window now.
+        if self._skip_reason and self._last_window_ts > 0:
+            self._missed_windows.append({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "window_ts": self._last_window_ts,
+                "reason": self._skip_reason,
+                "streak": self.consecutive_losses,
+                "bet_would_be": self.current_bet,
+                "ask_price": self._skip_price,
+            })
+            self.logger.info(
+                "MARTINGALE [%s]: recorded missed window %d — %s",
+                self.strategy_name, self._last_window_ts, self._skip_reason,
+            )
+        # Reset for the new window
+        self._skip_reason = None
+        self._skip_price = None
+
         now = int(time.time())
         seconds_into = now - current_window_ts
 
@@ -5113,20 +5150,12 @@ class MartingaleBot(threading.Thread):
             "max_entry_seconds", "martingale_max_entry_seconds", 60,
         ))
         if max_entry > 0 and seconds_into > max_entry:
-            # Record the missed window with whatever skip reason was active
-            reason = self._skip_reason or f"too late ({seconds_into}s > {max_entry}s)"
+            if not self._skip_reason:
+                self._skip_reason = f"too late ({seconds_into}s > {max_entry}s)"
             self.logger.info(
-                "MARTINGALE [%s]: %ds into window > max_entry %ds — skipping (%s)",
-                self.strategy_name, seconds_into, max_entry, reason,
+                "MARTINGALE [%s]: %ds into window > max_entry %ds — skipping",
+                self.strategy_name, seconds_into, max_entry,
             )
-            self._missed_windows.append({
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "window_ts": current_window_ts,
-                "reason": reason,
-                "streak": self.consecutive_losses,
-                "bet_would_be": self.current_bet,
-            })
-            self._skip_reason = reason
             self._last_window_ts = current_window_ts
             self._save_state()
             return False
@@ -5217,6 +5246,7 @@ class MartingaleBot(threading.Thread):
                 self.consecutive_losses,
             )
             self._skip_reason = f"price ${ask_price:.4f} outside [{price_min:.2f}–{price_max:.2f}]"
+            self._skip_price = ask_price
             return False  # don't mark skipped — price might come back
 
         # Check aggregate depth across all ask levels up to price_max.
@@ -5231,8 +5261,7 @@ class MartingaleBot(threading.Thread):
                 self.strategy_name, target_shares, book_depth, price_max,
             )
             self._skip_reason = f"thin book ({book_depth:.0f}/{target_shares:.0f} shares)"
-            # Thin book retries like price-out-of-range; will be caught by
-            # the max_entry_seconds guard and recorded as a missed window.
+            self._skip_price = ask_price
             return False
 
         # Dry run guard
@@ -5296,12 +5325,16 @@ class MartingaleBot(threading.Thread):
                 "MARTINGALE: FOK rejected for %s @ $%.4f — will retry",
                 direction, ask_price,
             )
+            self._skip_reason = f"FOK rejected @ ${ask_price:.4f}"
+            self._skip_price = ask_price
             return False
 
         if not result:
             self.logger.warning(
                 "MARTINGALE: order failed for %s — will retry", direction,
             )
+            self._skip_reason = f"order failed for {direction}"
+            self._skip_price = ask_price
             return False
 
         actual_shares = float(result.get("takingAmount", 0)) or target_shares
@@ -5347,6 +5380,7 @@ class MartingaleBot(threading.Thread):
         }
         self._last_window_ts = current_window_ts
         self._skip_reason = None  # bet placed successfully
+        self._skip_price = None
         self._windows_attempted += 1
         self._save_state()
 
