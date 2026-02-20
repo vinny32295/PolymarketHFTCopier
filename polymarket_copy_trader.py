@@ -4642,6 +4642,7 @@ class MartingaleBot(threading.Thread):
         self._skip_reason = None        # last reason a window was skipped
         self._skip_price = None         # ask price when last skip occurred
         self._skip_gap = None           # "gap_up", "gap_down", or None
+        self._miss_recorded_for_ts = 0  # last window_ts we recorded a miss for (dedup)
         self._windows_attempted = 0     # windows where we tried to bet
         self._windows_no_market = 0     # market slug not found on Gamma API
         self._missed_windows = []       # windows skipped due to price/book/balance
@@ -5394,7 +5395,11 @@ class MartingaleBot(threading.Thread):
         # ── New window detected — check if previous window was missed ──
         # If _skip_reason is set, the previous window was attempted but
         # no bet was placed.  Record it as a missed window now.
-        if self._skip_reason and self._last_window_ts > 0:
+        # Guard: only record once per window (retry paths don't update
+        # _last_window_ts, so this block can fire on every poll).
+        if (self._skip_reason
+                and self._last_window_ts > 0
+                and self._last_window_ts != self._miss_recorded_for_ts):
             missed_rec = {
                 "ts": datetime.now().isoformat(),
                 "window_ts": self._last_window_ts,
@@ -5407,6 +5412,7 @@ class MartingaleBot(threading.Thread):
             }
             self._missed_windows.append(missed_rec)
             _append_missed_window(missed_rec, logger=self.logger)
+            self._miss_recorded_for_ts = self._last_window_ts
             self.logger.info(
                 "MARTINGALE [%s]: recorded missed window %d — %s%s",
                 self.strategy_name, self._last_window_ts, self._skip_reason,

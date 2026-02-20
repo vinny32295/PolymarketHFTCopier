@@ -3045,6 +3045,7 @@ class TestMartingaleBot(unittest.TestCase):
         mb._recovery_candle_ts = 0
         mb._skip_price = None
         mb._skip_gap = None
+        mb._miss_recorded_for_ts = 0
         mb._missed_windows = []
         return mb
 
