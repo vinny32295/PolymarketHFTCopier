@@ -4758,6 +4758,20 @@ class MartingaleBot(threading.Thread):
                 except (ValueError, TypeError):
                     self._streak_paused_at = None
             self._recovery_candles = state.get("recovery_candles", [])
+
+            # On restart while paused, discard stale recovery candles so
+            # the bot re-samples fresh market conditions before resuming.
+            if self._streak_paused and self._recovery_candles:
+                self.logger.info(
+                    "MARTINGALE [%s]: discarding %d stale recovery candles "
+                    "from previous session — will re-sample fresh",
+                    self.strategy_name, len(self._recovery_candles),
+                )
+                self._recovery_candles = []
+                self._recovery_candle_open = None
+                self._recovery_candle_ts = 0
+                self._save_state()
+
             self.logger.info(
                 "Loaded martingale state: bet=$%.2f, streak=%d, pnl=$%.4f, "
                 "dir=%s, last_window_ts=%d, missed=%d%s",
