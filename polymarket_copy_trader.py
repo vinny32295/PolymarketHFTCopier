@@ -1306,18 +1306,18 @@ class TelegramCommandBot:
         if tf == "ALL":
             return history, "ALL TIME"
 
-        # Calendar-day based filtering using LOCAL time (matching how
+        # Rolling window filtering using LOCAL time (matching how
         # trade timestamps are stored via datetime.now().isoformat()).
         from datetime import timedelta
         now = datetime.now()
         if tf == "1D":
-            cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            label = f"TODAY ({cutoff.strftime('%m/%d')})"
+            cutoff = now - timedelta(hours=24)
+            label = "LAST 24 HOURS"
         elif tf == "7D":
-            cutoff = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+            cutoff = now - timedelta(days=7)
             label = "LAST 7 DAYS"
         elif tf == "30D":
-            cutoff = (now - timedelta(days=30)).replace(hour=0, minute=0, second=0, microsecond=0)
+            cutoff = now - timedelta(days=30)
             label = "LAST 30 DAYS"
         else:
             # Unknown — fall back to session
