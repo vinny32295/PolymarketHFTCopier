@@ -4759,18 +4759,43 @@ class MartingaleBot(threading.Thread):
                     self._streak_paused_at = None
             self._recovery_candles = state.get("recovery_candles", [])
 
-            # On restart while paused, discard stale recovery candles so
-            # the bot re-samples fresh market conditions before resuming.
+            # On restart while paused, prune recovery candles that are
+            # outside the lookback window so the bot evaluates recent
+            # market conditions.  Candles within the last N*interval
+            # seconds are kept — the bot only needs to fill the gap
+            # rather than re-collecting all 10 from scratch.
             if self._streak_paused and self._recovery_candles:
-                self.logger.info(
-                    "MARTINGALE [%s]: discarding %d stale recovery candles "
-                    "from previous session — will re-sample fresh",
-                    self.strategy_name, len(self._recovery_candles),
-                )
-                self._recovery_candles = []
+                interval = int(self._scfg(
+                    "recovery_interval", "martingale_recovery_interval", 300))
+                n_candles = int(self._scfg(
+                    "recovery_candles", "martingale_recovery_candles", 10))
+                cutoff = int(time.time()) - (n_candles * interval)
+                before = len(self._recovery_candles)
+                self._recovery_candles = [
+                    c for c in self._recovery_candles if c.get("ts", 0) >= cutoff
+                ]
+                pruned = before - len(self._recovery_candles)
+                # Reset open candle so we start sampling fresh
                 self._recovery_candle_open = None
                 self._recovery_candle_ts = 0
-                self._save_state()
+                if pruned:
+                    self.logger.info(
+                        "MARTINGALE [%s]: pruned %d stale recovery candle(s), "
+                        "kept %d recent — need %d more",
+                        self.strategy_name, pruned,
+                        len(self._recovery_candles),
+                        n_candles - len(self._recovery_candles),
+                    )
+                    self._save_state()
+                green = sum(1 for c in self._recovery_candles if c["green"])
+                self.logger.info(
+                    "MARTINGALE [%s]: recovery status on restart: "
+                    "%d/%d candles (%d green, need %d)",
+                    self.strategy_name, len(self._recovery_candles),
+                    n_candles, green,
+                    int(self._scfg(
+                        "recovery_green", "martingale_recovery_green", 5)),
+                )
 
             self.logger.info(
                 "Loaded martingale state: bet=$%.2f, streak=%d, pnl=$%.4f, "
