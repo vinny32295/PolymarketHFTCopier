@@ -1748,6 +1748,27 @@ class TelegramCommandBot:
 
         self.send("\n".join(lines))
 
+    @staticmethod
+    def _parse_date_range(text):
+        """Parse a date range string like '2/27-2/28' or '02/27-02/28'.
+
+        Returns (start_date, end_date) as datetime.date objects, or None
+        if the text doesn't match a date range pattern.  The year defaults
+        to the current year.  End-date is *inclusive* (the filter will
+        include the entire end day).
+        """
+        import re
+        m = re.match(r"^(\d{1,2})/(\d{1,2})\s*-\s*(\d{1,2})/(\d{1,2})$", text.strip())
+        if not m:
+            return None
+        try:
+            now = datetime.now()
+            start = datetime(now.year, int(m.group(1)), int(m.group(2))).date()
+            end = datetime(now.year, int(m.group(3)), int(m.group(4))).date()
+            return start, end
+        except ValueError:
+            return None
+
     def _cmd_chart(self, args=None):
         """Generate a cumulative P&L equity chart and send it as a photo."""
         try:
@@ -1773,16 +1794,32 @@ class TelegramCommandBot:
 
         history.sort(key=lambda r: r.get("closed_at", ""))
 
-        # Session filter: /chart session
+        # --- Filters: /chart session  OR  /chart M/D-M/D ---
+        filter_label = None
         session_only = args and args[0].lower() == "session"
+        date_range = None
+        if args and not session_only:
+            date_range = self._parse_date_range(" ".join(args))
+
         if session_only and self.bot:
             ss = getattr(self.bot, "_session_start", None)
             if ss:
                 session_start = ss.isoformat() if hasattr(ss, "isoformat") else str(ss)
                 history = [r for r in history if r.get("closed_at", "") >= session_start]
+        elif date_range:
+            start_date, end_date = date_range
+            # Include full end day (up to 23:59:59)
+            start_iso = datetime.combine(start_date, datetime.min.time()).isoformat()
+            end_iso = datetime.combine(end_date, datetime.max.time()).isoformat()
+            history = [
+                r for r in history
+                if start_iso <= r.get("closed_at", "") <= end_iso
+            ]
+            filter_label = f"{start_date.strftime('%m/%d')}–{end_date.strftime('%m/%d')}"
 
         if not history:
-            self.send("No trades in current session.")
+            msg = "No trades in current session." if session_only else "No trades in the selected date range."
+            self.send(msg)
             return
 
         # Build cumulative P&L series
@@ -1905,7 +1942,8 @@ class TelegramCommandBot:
         buf.seek(0)
         png_bytes = buf.read()
 
-        caption = f"Equity Chart | {timestamps[0].strftime('%m/%d %H:%M')} → {timestamps[-1].strftime('%m/%d %H:%M')} | P&L ${final_pnl:+,.2f}"
+        range_str = filter_label or f"{timestamps[0].strftime('%m/%d %H:%M')} → {timestamps[-1].strftime('%m/%d %H:%M')}"
+        caption = f"Equity Chart | {range_str} | P&L ${final_pnl:+,.2f}"
         send_telegram_photo(self.token, self.chat_id, png_bytes, caption=caption, logger=self.logger)
 
     def _cmd_help(self, args=None):
@@ -1919,7 +1957,9 @@ class TelegramCommandBot:
             "/stats [1D|7D|30D|ALL] — W/L, win %, P&L, ROI\n"
             "/strategies — per-strategy diagnostics\n"
             "/status — bot state, uptime, session info\n"
-            "/chart — equity P&L chart (add 'session' for current session)\n"
+            "/chart — equity P&L chart\n"
+            "   /chart session — current session only\n"
+            "   /chart 2/27-2/28 — filter by date range\n"
             "/missed [1D|7D|30D|ALL] — missed windows analysis\n"
             "\n"
             "CONTROL\n"
@@ -11532,6 +11572,24 @@ class CopyTraderGUI:
             variable=self.equity_session_only_var,
             command=self._refresh_equity_chart,
         ).pack(side=tk.LEFT, padx=10)
+
+        # Date range filter controls
+        ttk.Label(ctrl, text="From:", font=("Courier", 9)).pack(side=tk.LEFT, padx=(10, 2))
+        self.equity_from_var = tk.StringVar(value="")
+        from_entry = ttk.Entry(ctrl, textvariable=self.equity_from_var, width=8, font=("Courier", 9))
+        from_entry.pack(side=tk.LEFT)
+        from_entry.insert(0, "")
+        ttk.Label(ctrl, text="To:", font=("Courier", 9)).pack(side=tk.LEFT, padx=(6, 2))
+        self.equity_to_var = tk.StringVar(value="")
+        to_entry = ttk.Entry(ctrl, textvariable=self.equity_to_var, width=8, font=("Courier", 9))
+        to_entry.pack(side=tk.LEFT)
+        ttk.Button(ctrl, text="Filter", command=self._refresh_equity_chart).pack(
+            side=tk.LEFT, padx=(6, 0),
+        )
+        ttk.Button(ctrl, text="Clear", command=self._equity_clear_date_filter).pack(
+            side=tk.LEFT, padx=(4, 0),
+        )
+
         self.equity_info_var = tk.StringVar(value="")
         ttk.Label(ctrl, textvariable=self.equity_info_var, font=("Courier", 10)).pack(
             side=tk.RIGHT,
@@ -11550,6 +11608,12 @@ class CopyTraderGUI:
         self._equity_highlight_id = None
         self.equity_canvas.bind("<Motion>", self._equity_on_hover)
         self.equity_canvas.bind("<Leave>", self._equity_on_leave)
+
+    def _equity_clear_date_filter(self):
+        """Clear the date range entries and refresh the chart."""
+        self.equity_from_var.set("")
+        self.equity_to_var.set("")
+        self._refresh_equity_chart()
 
     def _refresh_equity_chart(self):
         """Redraw the equity chart from trade_history.json data."""
@@ -11590,9 +11654,33 @@ class CopyTraderGUI:
                     if r.get("closed_at", "") >= session_start
                 ]
 
+        # Date range filter (From / To entries, format M/D or MM/DD)
+        from_text = self.equity_from_var.get().strip()
+        to_text = self.equity_to_var.get().strip()
+        if from_text or to_text:
+            import re
+            now = datetime.now()
+            def _parse_md(s):
+                m = re.match(r"^(\d{1,2})/(\d{1,2})$", s.strip())
+                if m:
+                    try:
+                        return datetime(now.year, int(m.group(1)), int(m.group(2))).date()
+                    except ValueError:
+                        pass
+                return None
+            start_d = _parse_md(from_text) if from_text else None
+            end_d = _parse_md(to_text) if to_text else None
+            if start_d or end_d:
+                start_iso = datetime.combine(start_d, datetime.min.time()).isoformat() if start_d else ""
+                end_iso = datetime.combine(end_d, datetime.max.time()).isoformat() if end_d else "9999"
+                history = [
+                    r for r in history
+                    if start_iso <= r.get("closed_at", "") <= end_iso
+                ]
+
         if not history:
             canvas.create_text(
-                w // 2, h // 2, text="No trades in current session",
+                w // 2, h // 2, text="No trades in selected range",
                 fill="#888888", font=("Courier", 14),
             )
             return
