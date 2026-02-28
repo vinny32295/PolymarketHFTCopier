@@ -5327,13 +5327,12 @@ class MartingaleBot(threading.Thread):
         self._recovery_candle_open = None
         self._recovery_candle_ts = 0
         self.consecutive_losses = 0
-        self.current_bet = self.start_bet
         self._save_state()
 
         msg = (
             f"MARTINGALE [{self.strategy_name}] RESUMED: recovery confirmed "
             f"({green_count}/{total} green candles){paused_dur} "
-            f"— reset to ${self.current_bet:.2f}"
+            f"— next bet=${self.current_bet:.2f}"
         )
         self.logger.info(msg)
         if self.notify_callback:
