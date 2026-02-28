@@ -218,6 +218,8 @@ SESSION_TRADES_FILE = "session_trades.json"
 _TRADE_HISTORY_LOCK = threading.Lock()
 STRATEGY_SUMMARY_FILE = "strategy_summary.json"
 MARTINGALE_HISTORY_FILE = "martingale_history.json"
+MISSED_WINDOWS_FILE = "missed_windows.json"
+_MISSED_WINDOWS_LOCK = threading.Lock()
 MARTINGALE_SUMMARY_FILE = "martingale_summary.json"
 USER_CONFIG_FILE = "config.json"  # persists RPC URLs, proxy address, etc.
 
@@ -509,6 +511,9 @@ DEFAULT_CONFIG = {
     "martingale_start_bet": 5.0,       # starting bet size in USDC
     "martingale_max_bet": 0,           # max bet cap in USDC (0 = no limit)
     "martingale_max_streak": 0,        # stop after N consecutive losses (0 = no limit)
+    "martingale_recovery_candles": 10,  # number of candles to evaluate for recovery
+    "martingale_recovery_green": 5,     # how many of those candles must be green to resume
+    "martingale_recovery_interval": 300, # candle interval in seconds for recovery sampling
     "martingale_slug_base": "btc-updown-5m",  # slug prefix for the market
     "martingale_window": 300,          # window size in seconds (300 = 5 min)
     "martingale_poll_seconds": 10,     # how often to check for resolution
@@ -546,6 +551,8 @@ _PERSISTENT_CONFIG_KEYS = [
     "martingale_max_bet", "martingale_max_streak",
     "martingale_slug_base", "martingale_window", "martingale_poll_seconds",
     "martingale_price_min", "martingale_price_max", "martingale_max_entry_seconds",
+    "martingale_recovery_candles", "martingale_recovery_green",
+    "martingale_recovery_interval",
     "martingale_strategies",
 ]
 
@@ -692,6 +699,34 @@ def send_webhook(url, message, logger=None):
 TELEGRAM_API = "https://api.telegram.org/bot{token}"
 
 
+def _append_missed_window(record, logger=None):
+    """Append a missed-window record to missed_windows.json (thread-safe)."""
+    with _MISSED_WINDOWS_LOCK:
+        try:
+            with open(MISSED_WINDOWS_FILE, "r") as fh:
+                history = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            history = []
+        history.append(record)
+        try:
+            tmp = MISSED_WINDOWS_FILE + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(history, fh, indent=2, default=str)
+            os.replace(tmp, MISSED_WINDOWS_FILE)
+        except OSError as exc:
+            if logger:
+                logger.debug("Could not save missed_windows.json: %s", exc)
+
+
+def _load_missed_windows():
+    """Load all missed-window records from missed_windows.json."""
+    try:
+        with open(MISSED_WINDOWS_FILE, "r") as fh:
+            return json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
 def send_telegram(token, chat_id, message, logger=None, parse_mode=None):
     """Fire-and-forget a Telegram message.
 
@@ -722,6 +757,35 @@ def send_telegram(token, chat_id, message, logger=None, parse_mode=None):
     threading.Thread(target=_post, daemon=True).start()
 
 
+def send_telegram_photo(token, chat_id, photo_bytes, caption=None, logger=None):
+    """Fire-and-forget a photo to Telegram.
+
+    *photo_bytes* should be a bytes object (e.g. PNG image).
+    Runs in a daemon thread so it never blocks the bot loop.
+    """
+    if not token or not chat_id or not requests:
+        return
+
+    def _post():
+        try:
+            url = TELEGRAM_API.format(token=token) + "/sendPhoto"
+            files = {"photo": ("chart.png", photo_bytes, "image/png")}
+            data = {"chat_id": chat_id}
+            if caption:
+                data["caption"] = caption[:1024]
+            resp = requests.post(url, data=data, files=files, timeout=30)
+            if resp.status_code >= 400 and logger:
+                logger.debug(
+                    "Telegram sendPhoto returned %d: %s",
+                    resp.status_code, resp.text[:200],
+                )
+        except Exception as exc:
+            if logger:
+                logger.debug("Telegram sendPhoto failed: %s", exc)
+
+    threading.Thread(target=_post, daemon=True).start()
+
+
 class TelegramCommandBot:
     """Long-polls the Telegram Bot API for commands and replies with bot data.
 
@@ -744,9 +808,132 @@ class TelegramCommandBot:
         self._last_update_id = 0
 
     def start(self):
+        if not self._verify_token():
+            return  # token invalid — don't start polling
+        self._delete_webhook()
+        self._flush_old_updates()
+        self._register_commands()
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
         self.logger.info("Telegram command bot started (chat_id=%s)", self.chat_id)
+        self.send("Commands active — type /help for available commands.")
+
+    def _verify_token(self):
+        """Call getMe to verify the bot token is valid."""
+        try:
+            url = TELEGRAM_API.format(token=self.token) + "/getMe"
+            resp = requests.get(url, timeout=10)
+            data = resp.json()
+            if resp.status_code == 200 and data.get("ok"):
+                bot_user = data.get("result", {})
+                self.logger.info(
+                    "Telegram bot verified: @%s (id=%s)",
+                    bot_user.get("username", "?"), bot_user.get("id", "?"),
+                )
+                return True
+            else:
+                self.logger.error(
+                    "Telegram bot token INVALID — getMe returned %d: %s",
+                    resp.status_code, resp.text[:200],
+                )
+                return False
+        except Exception as exc:
+            self.logger.error("Telegram bot token check failed: %s", exc)
+            return False
+
+    def _delete_webhook(self):
+        """Remove any active webhook so getUpdates polling works.
+
+        The Telegram Bot API refuses to deliver updates via getUpdates
+        while a webhook is set — returning 409 Conflict instead.  This
+        silently breaks command handling while notifications (sendMessage)
+        continue to work normally, making the issue hard to diagnose.
+        """
+        try:
+            url = TELEGRAM_API.format(token=self.token) + "/deleteWebhook"
+            resp = requests.post(url, timeout=10)
+            if resp.status_code == 200 and resp.json().get("ok"):
+                self.logger.info("Telegram webhook cleared (getUpdates enabled)")
+            else:
+                self.logger.warning(
+                    "deleteWebhook returned unexpected response: %s", resp.text[:200],
+                )
+        except Exception as exc:
+            self.logger.warning("Could not delete Telegram webhook: %s", exc)
+
+    def _flush_old_updates(self):
+        """Consume all pending updates so the poll loop starts fresh.
+
+        Without this, stale updates from a previous session (or a
+        competing consumer) can desync ``_last_update_id`` and cause
+        the bot to either replay old commands or silently miss new ones.
+        """
+        try:
+            base = TELEGRAM_API.format(token=self.token)
+            resp = requests.get(
+                base + "/getUpdates", params={"offset": -1, "timeout": 0},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                results = resp.json().get("result", [])
+                if results:
+                    self._last_update_id = results[-1]["update_id"]
+                    self.logger.info(
+                        "Telegram: flushed %d stale update(s), "
+                        "resuming from update_id %d",
+                        len(results), self._last_update_id,
+                    )
+                else:
+                    self.logger.info("Telegram: no stale updates to flush")
+        except Exception as exc:
+            self.logger.warning("Telegram flush failed: %s", exc)
+
+    def _register_commands(self):
+        """Register all commands with Telegram via setMyCommands so they
+        appear in the '/' command menu and are recognized by the client."""
+        commands = [
+            ("balance", "Current USDC & MATIC balances"),
+            ("positions", "Open positions with floating P&L"),
+            ("trades", "Recent trade history (last 10)"),
+            ("stats", "Stats by timeframe (1D 7D 30D ALL)"),
+            ("strategies", "Martingale strategy status"),
+            ("status", "Bot state, session P&L, uptime"),
+            ("chart", "Equity P&L chart (add 'session' for current)"),
+            ("missed", "Missed windows (1D 7D 30D ALL)"),
+            ("stop", "Stop the bot gracefully"),
+            ("pause", "Pause trading (keep monitoring)"),
+            ("resume", "Resume trading after pause"),
+            ("kill", "Emergency kill switch"),
+            ("toggle_arb", "Toggle arb mode on/off"),
+            ("toggle_martingale", "Toggle martingale on/off"),
+            ("toggle_copy", "Toggle copy trading on/off"),
+            ("dry_run", "Toggle dry run mode on/off"),
+            ("set_max_bet", "Set max bet size in USDC"),
+            ("set_copy_pct", "Set copy percentage (0-100)"),
+            ("set_max_trade", "Set max trade size in USDC"),
+            ("set_min_edge", "Set minimum arb edge %"),
+            ("set_max_loss", "Set max loss threshold in USDC"),
+            ("set_exit", "Set exit strategy (whale|auto)"),
+            ("sell", "Force sell position(s)"),
+            ("reset_martingale", "Reset streak & bet size"),
+            ("redeem", "Scan & redeem resolved positions"),
+            ("help", "List available commands"),
+        ]
+        try:
+            url = TELEGRAM_API.format(token=self.token) + "/setMyCommands"
+            payload = {
+                "commands": [
+                    {"command": cmd, "description": desc}
+                    for cmd, desc in commands
+                ]
+            }
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.status_code == 200 and resp.json().get("ok"):
+                self.logger.info("Telegram commands registered (%d commands)", len(commands))
+            else:
+                self.logger.warning("Failed to register Telegram commands: %s", resp.text)
+        except Exception as exc:
+            self.logger.warning("Could not register Telegram commands: %s", exc)
 
     def stop(self):
         self._stop_event.set()
@@ -760,10 +947,10 @@ class TelegramCommandBot:
 
     def _poll_loop(self):
         base = TELEGRAM_API.format(token=self.token)
+        _poll_err_count = 0
+        _first_success = True
         while not self._stop_event.is_set():
             try:
-                # Use a short long-poll so the thread can exit quickly
-                # when stop() is called (at most ~5s lag).
                 resp = requests.get(
                     base + "/getUpdates",
                     params={
@@ -773,14 +960,26 @@ class TelegramCommandBot:
                     timeout=10,
                 )
                 if resp.status_code != 200:
+                    _poll_err_count += 1
+                    if _poll_err_count <= 3:
+                        self.logger.warning(
+                            "Telegram getUpdates HTTP %d: %s",
+                            resp.status_code, resp.text[:300],
+                        )
                     self._stop_event.wait(5)
                     continue
+                _poll_err_count = 0
+                if _first_success:
+                    self.logger.info("Telegram poll loop active — listening for commands")
+                    _first_success = False
                 data = resp.json()
                 for update in data.get("result", []):
                     self._last_update_id = update["update_id"]
-                    msg = update.get("message", {})
+                    # Accept both normal messages and edited messages
+                    msg = update.get("message") or update.get("edited_message") or {}
                     # Only respond to our configured chat
-                    if str(msg.get("chat", {}).get("id")) != self.chat_id:
+                    chat_id = str(msg.get("chat", {}).get("id", ""))
+                    if chat_id != self.chat_id:
                         continue
                     text = (msg.get("text") or "").strip()
                     if text.startswith("/"):
@@ -788,7 +987,7 @@ class TelegramCommandBot:
             except requests.exceptions.Timeout:
                 continue
             except Exception as exc:
-                self.logger.debug("Telegram poll error: %s", exc)
+                self.logger.warning("Telegram poll error: %s", exc)
                 self._stop_event.wait(5)
 
     # -- command handlers ---------------------------------------------------
@@ -804,6 +1003,8 @@ class TelegramCommandBot:
             "/stats": self._cmd_stats,
             "/strategies": self._cmd_strategies,
             "/status": self._cmd_status,
+            "/chart": self._cmd_chart,
+            "/missed": self._cmd_missed,
             "/help": self._cmd_help,
             "/start": self._cmd_help,
             # -- Control commands --
@@ -876,15 +1077,29 @@ class TelegramCommandBot:
         if not executor:
             self.send("Bot not running — no position data available.")
             return
+
         positions = dict(executor._positions)
-        if not positions:
+        # Collect arb positions
+        arb_mon = getattr(self.bot, "_arb_monitor", None)
+        arb_positions = dict(arb_mon._active_positions) if arb_mon else {}
+        # Collect martingale active bets
+        mart_mgr = getattr(self.bot, "_martingale_mgr", None)
+        mart_bets = []
+        if mart_mgr:
+            for mb in mart_mgr.bots:
+                if mb._active_bet:
+                    mart_bets.append((mb.strategy_name, mb._active_bet))
+
+        total_count = len(positions) + len(arb_positions) + len(mart_bets)
+        if total_count == 0:
             self.send("No open positions.")
             return
 
-        lines = [f"OPEN POSITIONS ({len(positions)})"]
+        lines = [f"OPEN POSITIONS ({total_count})"]
         total_cost = Decimal("0")
         total_value = Decimal("0")
 
+        # --- Copy / direct positions ---
         for token_id, pos in positions.items():
             tokens = pos.get("tokens", Decimal("0"))
             entry_price = pos.get("entry_price", Decimal("0"))
@@ -920,7 +1135,41 @@ class TelegramCommandBot:
                     f"    {tokens:.1f} shares @ ${entry_price:.4f}"
                 )
 
-        total_pnl = total_value - total_cost
+        # --- Arbitrage positions ---
+        arb_total_profit = Decimal("0")
+        for _cid, apos in arb_positions.items():
+            a_cost = Decimal(str(apos.get("total_cost", 0)))
+            a_profit = Decimal(str(apos.get("locked_profit", 0)))
+            a_yes = Decimal(str(apos.get("yes_shares", 0)))
+            a_no = Decimal(str(apos.get("no_shares", 0)))
+            a_matched = min(a_yes, a_no)
+            a_question = apos.get("question", "Unknown")
+            is_partial = apos.get("partial", False)
+            total_cost += a_cost
+            arb_total_profit += a_profit
+            tag = "ARB" if not is_partial else "ARB!"
+            edge = apos.get("edge_pct", 0)
+            lines.append(
+                f"\n  [{tag}] {a_question[:36]}\n"
+                f"    {a_matched:.1f} matched | cost ${a_cost:.2f}\n"
+                f"    Locked P/L +${a_profit:.4f} (edge {edge:.1f}%)"
+            )
+
+        # --- Martingale active bets ---
+        for strat_name, bet in mart_bets:
+            m_cost = Decimal(str(bet.get("cost", 0)))
+            m_shares = Decimal(str(bet.get("shares", 0)))
+            direction = bet.get("direction", "?")
+            question = bet.get("question", "?")
+            total_cost += m_cost
+            entry_p = m_cost / m_shares if m_shares > 0 else Decimal("0")
+            lines.append(
+                f"\n  [MART-{direction}] {question[:34]}\n"
+                f"    {m_shares:.1f} shares @ ${entry_p:.4f}\n"
+                f"    [{strat_name}] pending resolution"
+            )
+
+        total_pnl = total_value - total_cost + arb_total_profit
         pnl_sign = "+" if total_pnl >= 0 else ""
         lines.append(f"\nTotal: cost ${total_cost:.2f} | value ${total_value:.2f} | {pnl_sign}${total_pnl:.2f}")
         self.send("\n".join(lines))
@@ -945,18 +1194,35 @@ class TelegramCommandBot:
         recent = trades[-10:]  # last 10
         lines = [f"RECENT TRADES (last {len(recent)} of {len(trades)})"]
         for t in reversed(recent):
-            side = t.get("side", "?")
-            amount = t.get("amount_usdc", t.get("cost", 0))
-            price = t.get("price", 0)
-            ts = t.get("timestamp", t.get("ts", ""))
-            status = t.get("status", "")
-            pnl = t.get("pnl_usdc", "")
+            # Three record types:
+            #  1) Copy trade result (in-memory): has side, amount_usdc, price
+            #  2) Closed/resolved position (_log_closed_trade): has market,
+            #     entry_price, cost_basis_usdc, outcome
+            #  3) Martingale (_log_bet): like #2 but reason="martingale"
+            has_entry = "entry_price" in t or "cost_basis_usdc" in t
+            if has_entry:
+                # Types 2 & 3: resolved positions and martingale
+                outcome = t.get("outcome", "")
+                label = t.get("market", outcome or "closed")
+                amount = t.get("cost_basis_usdc", 0)
+                price = t.get("entry_price", 0)
+                ts = t.get("closed_at", "")
+            else:
+                # Type 1: in-memory copy trade result
+                label = t.get("side", "?")
+                amount = t.get("amount_usdc", t.get("cost", 0))
+                price = t.get("price", 0)
+                ts = t.get("timestamp", t.get("ts", ""))
 
-            line = f"  {side} ${float(amount):,.2f} @ {float(price):.4f}"
+            pnl = t.get("pnl_usdc", "")
+            line = f"  {label} ${float(amount):,.2f} @ ${float(price):.4f}"
             if pnl:
                 line += f" | P/L ${float(pnl):+.2f}"
+            slip = t.get("slippage") or {}
+            vs_fair = slip.get("vs_fair", 0)
+            if vs_fair:
+                line += f" | slip {vs_fair:+.4f}"
             if ts:
-                # Show just time portion
                 ts_short = str(ts).split("T")[-1][:8] if "T" in str(ts) else str(ts)[-8:]
                 line += f" [{ts_short}]"
             lines.append(line)
@@ -1005,19 +1271,111 @@ class TelegramCommandBot:
             ]
         return history
 
+    def _load_history_with_timeframe(self, timeframe=None):
+        """Load trade_history.json with optional timeframe filter.
+
+        Supported timeframes: '1D' (today), '7D', '30D', 'ALL', 'session' (default).
+        Returns (filtered_history, label) tuple.
+        """
+        history = []
+        try:
+            history_file = (
+                self.bot.cfg.get("trade_history_file", TRADE_HISTORY_FILE)
+                if self.bot else TRADE_HISTORY_FILE
+            )
+            with open(history_file, "r") as fh:
+                history = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+        if not timeframe or timeframe.lower() == "session":
+            # Default: current session only
+            session_start = None
+            if self.bot:
+                ss = getattr(self.bot, "_session_start", None)
+                if ss:
+                    session_start = ss.isoformat() if hasattr(ss, "isoformat") else str(ss)
+            if session_start:
+                history = [
+                    r for r in history
+                    if r.get("closed_at", "") >= session_start
+                ]
+            return history, "SESSION"
+
+        tf = timeframe.upper()
+        if tf == "ALL":
+            return history, "ALL TIME"
+
+        # Rolling window filtering using LOCAL time (matching how
+        # trade timestamps are stored via datetime.now().isoformat()).
+        from datetime import timedelta
+        now = datetime.now()
+        if tf == "1D":
+            cutoff = now - timedelta(hours=24)
+            label = "LAST 24 HOURS"
+        elif tf == "7D":
+            cutoff = now - timedelta(days=7)
+            label = "LAST 7 DAYS"
+        elif tf == "30D":
+            cutoff = now - timedelta(days=30)
+            label = "LAST 30 DAYS"
+        else:
+            # Unknown — fall back to session
+            session_start = None
+            if self.bot:
+                ss = getattr(self.bot, "_session_start", None)
+                if ss:
+                    session_start = ss.isoformat() if hasattr(ss, "isoformat") else str(ss)
+            if session_start:
+                history = [
+                    r for r in history
+                    if r.get("closed_at", "") >= session_start
+                ]
+            return history, "SESSION"
+
+        # Use naive isoformat (no +00:00 suffix) to match trade timestamps
+        cutoff_str = cutoff.isoformat()
+        history = [
+            r for r in history
+            if r.get("closed_at", "") >= cutoff_str
+        ]
+        return history, label
+
     def _cmd_stats(self, args=None):
-        """Session statistics: bets placed, W/L, win %, total return,
-        plus per-strategy breakdown for martingale."""
-        history = self._load_session_history()
+        """Statistics: bets placed, W/L, win %, total return,
+        plus per-strategy breakdown for martingale.
+
+        Usage: /stats [1D|7D|30D|ALL|session]
+        Defaults to current session if no timeframe given.
+        """
+        timeframe = args[0] if args else None
+        history, label = self._load_history_with_timeframe(timeframe)
 
         if not history:
-            self.send("No trades this session.")
+            self.send(f"No trades for {label}.")
             return
+
+        # -- Session runtime --
+        runtime_str = ""
+        if self.bot:
+            start = getattr(self.bot, "_session_start", None)
+            if start:
+                delta = datetime.now() - start
+                total_s = int(delta.total_seconds())
+                hours, rem = divmod(total_s, 3600)
+                mins, secs = divmod(rem, 60)
+                if hours > 0:
+                    runtime_str = f"{hours}h {mins}m {secs}s"
+                else:
+                    runtime_str = f"{mins}m {secs}s"
 
         # -- Overall totals --
         t = self._bucket_stats(history)
+        header = f"STATS — {label}"
+        if runtime_str:
+            header += f"  (runtime: {runtime_str})"
         lines = [
-            "SESSION STATS",
+            header,
             f"  Bets placed: {t['n']}",
             f"  Won: {t['wins']}  |  Lost: {t['losses']}"
             + (f"  |  Sold: {t['sold']}" if t["sold"] else ""),
@@ -1072,11 +1430,15 @@ class TelegramCommandBot:
             lines += ["", "MARTINGALE"]
             for name, records in strat_buckets.items():
                 s = self._bucket_stats(records)
+                sl = MartingaleBot._aggregate_slippage(records)
+                slip_tag = ""
+                if sl["avg_fill_price"] > 0:
+                    slip_tag = f"  |  avg fill ${sl['avg_fill_price']:.3f} slip ${sl['total_slippage_usdc']:+,.2f}"
                 lines.append(
                     f"  [{name}]  {s['n']} bets  |  "
                     f"W/L {s['wins']}/{s['losses']} ({s['win_pct']:.0f}%)  |  "
                     f"P&L ${s['pnl']:+,.2f}  |  "
-                    f"deployed ${s['cost']:,.2f}"
+                    f"deployed ${s['cost']:,.2f}{slip_tag}"
                 )
 
             # Live bot state (current bet, streak)
@@ -1099,16 +1461,13 @@ class TelegramCommandBot:
             sl = MartingaleBot._aggregate_slippage(slippage_records)
             lines += [
                 "",
-                "SLIPPAGE",
+                "SLIPPAGE (vs $0.50 fair — positive = good)",
                 f"  Bets tracked: {sl['bets_with_slippage_data']}",
-                f"  Total exec slippage: ${sl['total_exec_slippage_usdc']:+,.4f}",
-                f"  Avg slippage vs ask: ${sl['avg_slippage_vs_ask']:+.4f}/sh",
+                f"  Total slippage: ${sl['total_slippage_usdc']:+,.4f}",
+                f"  Avg slippage: {sl['avg_slippage']:+.4f}/sh",
                 f"  Avg fill price: ${sl['avg_fill_price']:.4f}",
-                f"  Favorable fills: {sl['favorable_fills']['count']}"
-                f"  (${sl['favorable_fills']['total_edge_gained_usdc']:,.4f} saved)",
-                f"  Unfavorable fills: {sl['unfavorable_fills']['count']}"
-                f"  (${sl['unfavorable_fills']['total_edge_lost_usdc']:,.4f} lost)",
-                f"  Net edge: ${sl['net_edge_usdc']:+,.4f} ({sl['net_verdict']})",
+                f"  Best fill: {sl['best_fill']:+.4f}/sh",
+                f"  Worst fill: {sl['worst_fill']:+.4f}/sh",
             ]
 
         self.send("\n".join(lines))
@@ -1152,7 +1511,7 @@ class TelegramCommandBot:
                 time_left = bet["window_end"] - now
                 lines.append(
                     f"  ACTIVE: {bet['direction']} ${bet['cost']:.2f} "
-                    f"@ ${bet['price']:.4f}  |  "
+                    f"@ ${bet.get('fill_price', 0):.4f}  |  "
                     f"resolves in {max(time_left, 0)}s"
                 )
             elif mb._skip_reason:
@@ -1190,11 +1549,23 @@ class TelegramCommandBot:
             mgr = getattr(self.bot, "_martingale_mgr", None)
             if mgr:
                 for mg in mgr.bots:
+                    status_extra = ""
+                    if mg._streak_paused:
+                        green = sum(1 for c in mg._recovery_candles if c.get("green"))
+                        total = len(mg._recovery_candles)
+                        n_needed = int(mg._scfg(
+                            "recovery_green", "martingale_recovery_green", 5))
+                        n_candles = int(mg._scfg(
+                            "recovery_candles", "martingale_recovery_candles", 10))
+                        status_extra = (
+                            f" [PAUSED — recovery {green}/{total} "
+                            f"green, need {n_needed}/{n_candles}]"
+                        )
                     lines.append(
                         f"  Martingale [{mg.strategy_name}]: "
                         f"streak={mg.consecutive_losses}, "
                         f"bet=${mg.current_bet:.2f}, "
-                        f"P/L=${mg.session_pnl:+.2f}"
+                        f"P/L=${mg.session_pnl:+.2f}{status_extra}"
                     )
                 modes.append(f"Martingale ({len(mgr.bots)} strat)")
             lines.append(f"  Modes: {', '.join(modes) if modes else 'none'}")
@@ -1205,6 +1576,338 @@ class TelegramCommandBot:
 
         self.send("\n".join(lines))
 
+    def _cmd_missed(self, args=None):
+        """Analyze windows missed due to price out of range / other reasons.
+
+        Usage: /missed [1D|7D|30D|ALL|session]
+        Defaults to current session if no timeframe given.
+        """
+        # Load from persistent file (historical) for non-session queries
+        timeframe = args[0] if args else None
+        tf = (timeframe or "").upper()
+
+        if tf in ("1D", "7D", "30D", "ALL"):
+            all_missed = _load_missed_windows()
+            if tf != "ALL":
+                from datetime import timedelta
+                now = datetime.now()
+                if tf == "1D":
+                    cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                elif tf == "7D":
+                    cutoff = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+                else:  # 30D
+                    cutoff = (now - timedelta(days=30)).replace(hour=0, minute=0, second=0, microsecond=0)
+                cutoff_str = cutoff.isoformat()
+                all_missed = [m for m in all_missed if m.get("ts", "") >= cutoff_str]
+            label = {"1D": "TODAY", "7D": "LAST 7 DAYS", "30D": "LAST 30 DAYS", "ALL": "ALL TIME"}[tf]
+        else:
+            # Default: current session from in-memory bot data
+            mart_mgr = getattr(self.bot, "_martingale_mgr", None) if self.bot else None
+            if not mart_mgr:
+                self.send("Martingale not active — no missed window data.")
+                return
+            all_missed = []
+            for mb in mart_mgr.bots:
+                for m in mb._missed_windows:
+                    all_missed.append(dict(m))
+            label = "SESSION"
+
+        if not all_missed:
+            self.send(f"No missed windows for {label}.")
+            return
+
+        all_missed.sort(key=lambda r: r.get("ts", ""))
+
+        # --- Breakdown by reason ---
+        reason_counts = {}
+        for m in all_missed:
+            reason = m.get("reason", "unknown")
+            # Normalize reasons to clean buckets
+            if "outside" in reason:
+                reason = "price outside range"
+            elif "thin book" in reason:
+                reason = "thin book"
+            elif "too late" in reason:
+                reason = "too late"
+            elif "low balance" in reason:
+                reason = "low balance"
+            elif "market not found" in reason:
+                reason = "market not found"
+            elif "FOK rejected" in reason:
+                reason = "FOK rejected"
+            elif "order failed" in reason:
+                reason = "order failed"
+            elif "no asks" in reason:
+                reason = "no asks"
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+        # --- By streak level at time of miss ---
+        streak_at_miss = {}
+        for m in all_missed:
+            s = m.get("streak", 0)
+            streak_at_miss[s] = streak_at_miss.get(s, 0) + 1
+
+        # --- Estimate capital at risk from missed windows ---
+        total_missed_exposure = sum(m.get("bet_would_be", 0) for m in all_missed)
+
+        # --- Consecutive missed windows ---
+        # Group by strategy and find the worst streak of consecutive misses
+        by_strat = {}
+        for m in all_missed:
+            s = m.get("strategy", "default")
+            by_strat.setdefault(s, []).append(m)
+
+        max_consec = 0
+        for strat, misses in by_strat.items():
+            wts = sorted(set(m.get("window_ts", 0) for m in misses))
+            if len(wts) < 2:
+                max_consec = max(max_consec, len(wts))
+                continue
+            # Infer window size from gaps
+            gaps = [wts[i+1] - wts[i] for i in range(len(wts)-1)]
+            window_s = min(gaps) if gaps else 300
+            consec = 1
+            best = 1
+            for i in range(1, len(wts)):
+                if wts[i] - wts[i-1] == window_s:
+                    consec += 1
+                    best = max(best, consec)
+                else:
+                    consec = 1
+            max_consec = max(max_consec, best)
+
+        # --- Build message ---
+        lines = [f"MISSED WINDOWS — {label} ({len(all_missed)} total)"]
+
+        lines.append("\nBy Reason:")
+        for reason, cnt in sorted(reason_counts.items(), key=lambda x: -x[1]):
+            pct = cnt / len(all_missed) * 100
+            lines.append(f"  {reason}: {cnt} ({pct:.0f}%)")
+
+        lines.append("\nBy Streak at Time of Miss:")
+        for streak, cnt in sorted(streak_at_miss.items()):
+            label = f"streak {streak}" if streak > 0 else "no streak"
+            lines.append(f"  {label}: {cnt} missed")
+
+        # --- Gap Up / Gap Down analysis ---
+        gap_ups = [m for m in all_missed if m.get("gap") == "gap_up"]
+        gap_downs = [m for m in all_missed if m.get("gap") == "gap_down"]
+        price_misses = gap_ups + gap_downs
+        non_price = len(all_missed) - len(price_misses)
+
+        if price_misses:
+            lines.append("\nGap Analysis (price misses):")
+            if gap_ups:
+                up_prices = [m["ask_price"] for m in gap_ups if m.get("ask_price")]
+                up_exposure = sum(m.get("bet_would_be", 0) for m in gap_ups)
+                lines.append(
+                    f"  GAP UP (too high): {len(gap_ups)}"
+                    f" ({len(gap_ups) / len(all_missed) * 100:.0f}%)"
+                )
+                if up_prices:
+                    lines.append(
+                        f"    prices: ${min(up_prices):.4f} – "
+                        f"${max(up_prices):.4f} "
+                        f"(avg ${sum(up_prices)/len(up_prices):.4f})"
+                    )
+                    lines.append(f"    exposure missed: ${up_exposure:,.2f}")
+            if gap_downs:
+                dn_prices = [m["ask_price"] for m in gap_downs if m.get("ask_price")]
+                dn_exposure = sum(m.get("bet_would_be", 0) for m in gap_downs)
+                lines.append(
+                    f"  GAP DOWN (too low): {len(gap_downs)}"
+                    f" ({len(gap_downs) / len(all_missed) * 100:.0f}%)"
+                )
+                if dn_prices:
+                    lines.append(
+                        f"    prices: ${min(dn_prices):.4f} – "
+                        f"${max(dn_prices):.4f} "
+                        f"(avg ${sum(dn_prices)/len(dn_prices):.4f})"
+                    )
+                    lines.append(f"    exposure missed: ${dn_exposure:,.2f}")
+            if non_price > 0:
+                lines.append(f"  Other (non-price): {non_price}")
+
+        # --- All ask prices at time of miss ---
+        all_prices = [m.get("ask_price") for m in all_missed if m.get("ask_price")]
+        if all_prices:
+            lines.append("\nAsk Price at Miss (all):")
+            lines.append(
+                f"  min ${min(all_prices):.4f}  |  "
+                f"avg ${sum(all_prices)/len(all_prices):.4f}  |  "
+                f"max ${max(all_prices):.4f}"
+            )
+
+        lines.append(f"\nMax Consecutive Misses: {max_consec}")
+        lines.append(f"Total Exposure Missed: ${total_missed_exposure:,.2f}")
+
+        # Time range
+        first = all_missed[0].get("ts", "?")[:16].replace("T", " ")
+        last = all_missed[-1].get("ts", "?")[:16].replace("T", " ")
+        lines.append(f"\nPeriod: {first} → {last}")
+
+        self.send("\n".join(lines))
+
+    def _cmd_chart(self, args=None):
+        """Generate a cumulative P&L equity chart and send it as a photo."""
+        try:
+            import matplotlib
+            matplotlib.use("Agg")  # headless backend
+            import matplotlib.pyplot as plt
+            import matplotlib.dates as mdates
+            import io
+        except ImportError:
+            self.send("Chart unavailable — matplotlib not installed.\nRun: pip install matplotlib")
+            return
+
+        # Load trade history
+        try:
+            with open(TRADE_HISTORY_FILE, "r") as fh:
+                history = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            history = []
+
+        if not history:
+            self.send("No trade data yet — chart unavailable.")
+            return
+
+        history.sort(key=lambda r: r.get("closed_at", ""))
+
+        # Session filter: /chart session
+        session_only = args and args[0].lower() == "session"
+        if session_only and self.bot:
+            ss = getattr(self.bot, "_session_start", None)
+            if ss:
+                session_start = ss.isoformat() if hasattr(ss, "isoformat") else str(ss)
+                history = [r for r in history if r.get("closed_at", "") >= session_start]
+
+        if not history:
+            self.send("No trades in current session.")
+            return
+
+        # Build cumulative P&L series
+        timestamps = []
+        cum_pnl = []
+        running = 0.0
+        for rec in history:
+            running += rec.get("pnl_usdc", 0)
+            ts_str = rec.get("closed_at", "")
+            try:
+                dt = datetime.fromisoformat(ts_str)
+            except (ValueError, TypeError):
+                continue
+            timestamps.append(dt)
+            cum_pnl.append(round(running, 2))
+
+        if len(timestamps) < 2:
+            self.send("Not enough data points for a chart.")
+            return
+
+        # Generate chart
+        fig, ax = plt.subplots(figsize=(10, 5))
+        fig.patch.set_facecolor("#1e1e1e")
+        ax.set_facecolor("#1e1e1e")
+
+        final_pnl = cum_pnl[-1]
+        line_color = "#00cc44" if final_pnl >= 0 else "#cc4444"
+        fill_color = "#0a3d0a" if final_pnl >= 0 else "#3d0a0a"
+
+        ax.plot(timestamps, cum_pnl, color=line_color, linewidth=2)
+        ax.fill_between(timestamps, cum_pnl, 0, color=fill_color, alpha=0.5)
+        ax.axhline(y=0, color="#666666", linewidth=0.8)
+
+        # --- Annotate key data points (high, low, latest) ---
+        max_pnl = max(cum_pnl)
+        min_pnl = min(cum_pnl)
+        max_idx = cum_pnl.index(max_pnl)
+        min_idx = cum_pnl.index(min_pnl)
+        pnl_range = max(abs(max_pnl - min_pnl), 1)
+
+        annotated_indices = set()
+
+        # High point
+        if max_pnl != 0:
+            ax.annotate(
+                f"High ${max_pnl:+,.2f}\n{timestamps[max_idx].strftime('%m/%d %H:%M')}",
+                xy=(timestamps[max_idx], max_pnl),
+                xytext=(0, 12), textcoords="offset points",
+                fontsize=7, color="#00ff88", fontweight="bold",
+                ha="center", va="bottom",
+                arrowprops=dict(arrowstyle="-", color="#00ff88", lw=0.8),
+            )
+            ax.plot(timestamps[max_idx], max_pnl, "o", color="#00ff88", markersize=5, zorder=5)
+            annotated_indices.add(max_idx)
+
+        # Low point
+        if min_pnl != 0 and min_idx != max_idx:
+            ax.annotate(
+                f"Low ${min_pnl:+,.2f}\n{timestamps[min_idx].strftime('%m/%d %H:%M')}",
+                xy=(timestamps[min_idx], min_pnl),
+                xytext=(0, -12), textcoords="offset points",
+                fontsize=7, color="#ff6666", fontweight="bold",
+                ha="center", va="top",
+                arrowprops=dict(arrowstyle="-", color="#ff6666", lw=0.8),
+            )
+            ax.plot(timestamps[min_idx], min_pnl, "o", color="#ff6666", markersize=5, zorder=5)
+            annotated_indices.add(min_idx)
+
+        # Latest point
+        last_idx = len(cum_pnl) - 1
+        if last_idx not in annotated_indices:
+            last_color = "#00ff88" if final_pnl >= 0 else "#ff6666"
+            ax.annotate(
+                f"Now ${final_pnl:+,.2f}",
+                xy=(timestamps[last_idx], final_pnl),
+                xytext=(8, 0), textcoords="offset points",
+                fontsize=7, color=last_color, fontweight="bold",
+                ha="left", va="center",
+            )
+            ax.plot(timestamps[last_idx], final_pnl, "o", color=last_color, markersize=5, zorder=5)
+            annotated_indices.add(last_idx)
+
+        # --- Interval labels along the curve ---
+        n_pts = len(cum_pnl)
+        if n_pts > 10:
+            interval = max(n_pts // 8, 1)
+            for i in range(interval, n_pts - interval // 2, interval):
+                if i in annotated_indices:
+                    continue
+                # Alternate above/below to avoid overlap
+                offset_y = 10 if cum_pnl[i] >= 0 else -10
+                va = "bottom" if offset_y > 0 else "top"
+                ax.annotate(
+                    f"${cum_pnl[i]:+,.2f}",
+                    xy=(timestamps[i], cum_pnl[i]),
+                    xytext=(0, offset_y), textcoords="offset points",
+                    fontsize=6, color="#aaaaaa", ha="center", va=va,
+                )
+                ax.plot(timestamps[i], cum_pnl[i], "o", color="#888888", markersize=3, zorder=4)
+
+        ax.set_title(
+            f"Cumulative P&L: ${final_pnl:+,.2f}  ({len(cum_pnl)} trades)",
+            color=line_color, fontsize=13, fontweight="bold",
+        )
+        ax.set_ylabel("P&L ($)", color="#aaaaaa", fontsize=10)
+        ax.tick_params(colors="#aaaaaa", labelsize=8)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_color("#444444")
+        ax.spines["bottom"].set_color("#444444")
+        ax.grid(axis="y", color="#333333", linestyle="--", linewidth=0.5)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d %H:%M"))
+        fig.autofmt_xdate(rotation=30, ha="right")
+        plt.tight_layout()
+
+        # Render to PNG bytes
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=150, facecolor=fig.get_facecolor())
+        plt.close(fig)
+        buf.seek(0)
+        png_bytes = buf.read()
+
+        caption = f"Equity Chart | {timestamps[0].strftime('%m/%d %H:%M')} → {timestamps[-1].strftime('%m/%d %H:%M')} | P&L ${final_pnl:+,.2f}"
+        send_telegram_photo(self.token, self.chat_id, png_bytes, caption=caption, logger=self.logger)
+
     def _cmd_help(self, args=None):
         self.send(
             "Polymarket Bot Commands:\n"
@@ -1213,9 +1916,11 @@ class TelegramCommandBot:
             "/balance — USDC & MATIC balances\n"
             "/positions — open positions with P/L\n"
             "/trades — recent trade history\n"
-            "/stats — session W/L, win %, P&L, ROI\n"
+            "/stats [1D|7D|30D|ALL] — W/L, win %, P&L, ROI\n"
             "/strategies — per-strategy diagnostics\n"
             "/status — bot state, uptime, session info\n"
+            "/chart — equity P&L chart (add 'session' for current session)\n"
+            "/missed [1D|7D|30D|ALL] — missed windows analysis\n"
             "\n"
             "CONTROL\n"
             "/stop — graceful shutdown\n"
@@ -2214,21 +2919,39 @@ class PolymarketCLOBClient:
                         retry_bid = float(retry_bids[0].get("price", 0)) if retry_bids else 0
                         retry_ask = float(retry_asks[0].get("price", 0)) if retry_asks else 0
                         if side.upper() == "BUY" and retry_ask > 0:
-                            retry_price = round(min(retry_ask * 1.005, 0.99), 2)
-                            # Respect arb-imposed price cap to preserve edge
-                            if max_retry_price is not None:
-                                if retry_price > max_retry_price:
-                                    self.logger.warning(
-                                        "FOK retry: refreshed ask $%.4f exceeds "
-                                        "max retry price $%.4f — aborting to "
-                                        "preserve arb edge",
-                                        retry_price, max_retry_price,
-                                    )
-                                    return {"status": "fok_rejected",
-                                            "reason": "retry_price_exceeds_cap"}
-                                retry_price = min(retry_price, max_retry_price)
+                            # Hard ceiling: never pay more than 5% above our
+                            # original price.  The old 0.99 fallback was
+                            # effectively a market buy that could fill at any
+                            # ask on the book — causing massive overpays.
+                            inherent_cap = round(rounded_price * 1.05, 2)
+                            price_cap = min(
+                                inherent_cap,
+                                max_retry_price or inherent_cap,
+                            )
+                            retry_price = round(min(retry_ask * 1.005, price_cap), 2)
+                            if retry_price > price_cap:
+                                self.logger.warning(
+                                    "FOK retry: refreshed ask $%.4f exceeds "
+                                    "price cap $%.4f (original $%.4f) — aborting",
+                                    retry_ask, price_cap, rounded_price,
+                                )
+                                return {"status": "fok_rejected",
+                                        "reason": "retry_price_exceeds_cap"}
                         elif side.upper() == "SELL" and retry_bid > 0:
-                            retry_price = round(max(retry_bid * 0.995, 0.01), 2)
+                            inherent_floor = round(rounded_price * 0.95, 2)
+                            price_floor = max(
+                                inherent_floor,
+                                max_retry_price or inherent_floor,
+                            )
+                            retry_price = round(max(retry_bid * 0.995, price_floor, 0.01), 2)
+                            if retry_price < price_floor:
+                                self.logger.warning(
+                                    "FOK retry: refreshed bid $%.4f below "
+                                    "price floor $%.4f — aborting",
+                                    retry_bid, price_floor,
+                                )
+                                return {"status": "fok_rejected",
+                                        "reason": "retry_price_below_floor"}
                         else:
                             self.logger.warning("FOK retry: no orderbook — aborting")
                             return {"status": "fok_rejected", "reason": str(fok_exc)}
@@ -3917,8 +4640,19 @@ class MartingaleBot(threading.Thread):
         self._last_window_ts = 0
         self._next_window_cache = None  # pre-fetched market for next window
         self._skip_reason = None        # last reason a window was skipped
+        self._skip_price = None         # ask price when last skip occurred
+        self._skip_gap = None           # "gap_up", "gap_down", or None
+        self._miss_recorded_for_ts = 0  # last window_ts we recorded a miss for (dedup)
         self._windows_attempted = 0     # windows where we tried to bet
         self._windows_no_market = 0     # market slug not found on Gamma API
+        self._missed_windows = []       # windows skipped due to price/book/balance
+
+        # Streak-pause recovery state
+        self._streak_paused = False     # True when max_streak hit, waiting for recovery
+        self._streak_paused_at = None   # datetime when pause started
+        self._recovery_candles = []     # list of {"open": px, "close": px, "green": bool}
+        self._recovery_candle_open = None   # price at start of current candle
+        self._recovery_candle_ts = 0    # epoch when current candle opened
 
         # Callbacks (wired by CopyTraderBot)
         self.notify_callback = None
@@ -3992,6 +4726,10 @@ class MartingaleBot(threading.Thread):
             "direction": self.direction,
             "active_bet": self._active_bet,
             "last_window_ts": self._last_window_ts,
+            "missed_windows": self._missed_windows[-500:],  # cap at 500
+            "streak_paused": self._streak_paused,
+            "streak_paused_at": self._streak_paused_at.isoformat() if self._streak_paused_at else None,
+            "recovery_candles": self._recovery_candles[-20:],
         }
         try:
             tmp = self.STATE_FILE + ".tmp"
@@ -4011,11 +4749,61 @@ class MartingaleBot(threading.Thread):
             self.direction = state.get("direction", self.direction)
             self._active_bet = state.get("active_bet")
             self._last_window_ts = int(state.get("last_window_ts", 0))
+            self._missed_windows = state.get("missed_windows", [])
+            self._streak_paused = bool(state.get("streak_paused", False))
+            paused_at_str = state.get("streak_paused_at")
+            if paused_at_str:
+                try:
+                    self._streak_paused_at = datetime.fromisoformat(paused_at_str)
+                except (ValueError, TypeError):
+                    self._streak_paused_at = None
+            self._recovery_candles = state.get("recovery_candles", [])
+
+            # On restart while paused, prune recovery candles that are
+            # outside the lookback window so the bot evaluates recent
+            # market conditions.  Candles within the last N*interval
+            # seconds are kept — the bot only needs to fill the gap
+            # rather than re-collecting all 10 from scratch.
+            if self._streak_paused and self._recovery_candles:
+                interval = int(self._scfg(
+                    "recovery_interval", "martingale_recovery_interval", 300))
+                n_candles = int(self._scfg(
+                    "recovery_candles", "martingale_recovery_candles", 10))
+                cutoff = int(time.time()) - (n_candles * interval)
+                before = len(self._recovery_candles)
+                self._recovery_candles = [
+                    c for c in self._recovery_candles if c.get("ts", 0) >= cutoff
+                ]
+                pruned = before - len(self._recovery_candles)
+                # Reset open candle so we start sampling fresh
+                self._recovery_candle_open = None
+                self._recovery_candle_ts = 0
+                if pruned:
+                    self.logger.info(
+                        "MARTINGALE [%s]: pruned %d stale recovery candle(s), "
+                        "kept %d recent — need %d more",
+                        self.strategy_name, pruned,
+                        len(self._recovery_candles),
+                        n_candles - len(self._recovery_candles),
+                    )
+                    self._save_state()
+                green = sum(1 for c in self._recovery_candles if c["green"])
+                self.logger.info(
+                    "MARTINGALE [%s]: recovery status on restart: "
+                    "%d/%d candles (%d green, need %d)",
+                    self.strategy_name, len(self._recovery_candles),
+                    n_candles, green,
+                    int(self._scfg(
+                        "recovery_green", "martingale_recovery_green", 5)),
+                )
+
             self.logger.info(
                 "Loaded martingale state: bet=$%.2f, streak=%d, pnl=$%.4f, "
-                "dir=%s, last_window_ts=%d",
+                "dir=%s, last_window_ts=%d, missed=%d%s",
                 self.current_bet, self.consecutive_losses,
                 self.session_pnl, self.direction, self._last_window_ts,
+                len(self._missed_windows),
+                " [PAUSED — waiting for recovery]" if self._streak_paused else "",
             )
 
             # Discard stale active bets from a previous session.
@@ -4045,6 +4833,11 @@ class MartingaleBot(threading.Thread):
         self.session_pnl = 0.0
         self._active_bet = None
         self._last_window_ts = 0
+        self._streak_paused = False
+        self._streak_paused_at = None
+        self._recovery_candles = []
+        self._recovery_candle_open = None
+        self._recovery_candle_ts = 0
         try:
             os.remove(self.STATE_FILE)
         except OSError:
@@ -4139,11 +4932,22 @@ class MartingaleBot(threading.Thread):
                 elif o and str(o).lower() == "down":
                     down_idx = i
 
+            # Detect neg_risk — needed for correct exchange approval
+            neg_risk = False
+            neg = market.get("neg_risk")
+            if isinstance(neg, bool):
+                neg_risk = neg
+            elif isinstance(neg, str):
+                neg_risk = neg.lower() in ("true", "1", "yes")
+            if not neg_risk:
+                neg_risk = bool(market.get("neg_risk_market_id"))
+
             return {
                 "condition_id": cid,
                 "up_token": token_ids[up_idx],
                 "down_token": token_ids[down_idx],
                 "question": market.get("question", slug),
+                "neg_risk": neg_risk,
             }
         except Exception as exc:
             self.logger.warning("Failed to fetch market '%s': %s", slug, exc)
@@ -4411,9 +5215,10 @@ class MartingaleBot(threading.Thread):
     def _prefetch_next_window(self):
         """Pre-fetch the next window's market so we're ready to bet instantly.
 
-        Called in the final 15s of the current window.  Stores the slug,
+        Called in the final 30s of the current window.  Stores the slug,
         market data, and token ID so ``_try_place_bet`` can skip the
-        expensive Gamma API call.
+        expensive Gamma API call.  Also pre-runs balance check and USDC
+        approval so they don't block the critical order path.
         """
         try:
             window = int(self._scfg("window", "martingale_window", 300))
@@ -4432,11 +5237,39 @@ class MartingaleBot(threading.Thread):
                 market["up_token"] if direction == "Up" else market["down_token"]
             )
 
+            # Pre-run USDC approval so it's not on the critical path.
+            # Use the next bet size (current_bet after potential doubling).
+            neg_risk = market.get("neg_risk", False)
+            try:
+                raw_amount = int(self.current_bet * 2 * 1_000_000)  # approve 2x for headroom
+                self.clob_client.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
+                if neg_risk:
+                    self.clob_client.ensure_usdc_approval(
+                        NEG_RISK_CTF_EXCHANGE_ADDRESS, raw_amount,
+                    )
+            except Exception as exc:
+                self.logger.debug("MARTINGALE: prefetch approval failed (%s)", exc)
+
+            # Pre-check balance so we know early if we're short.
+            balance_ok = True
+            try:
+                usdc_bal = float(self.clob_client.get_usdc_balance(max_age_seconds=0))
+                if usdc_bal < self.current_bet:
+                    self.logger.warning(
+                        "MARTINGALE: prefetch balance warning — $%.2f < next bet $%.2f",
+                        usdc_bal, self.current_bet,
+                    )
+                    balance_ok = False
+            except Exception:
+                pass
+
             self._next_window_cache = {
                 "window_ts": next_window_ts,
                 "slug": slug,
                 "market": market,
                 "token_id": token_id,
+                "approval_done": True,
+                "balance_ok": balance_ok,
             }
             self.logger.info(
                 "MARTINGALE: pre-cached next window market '%s' (token=%s..)",
@@ -4445,6 +5278,108 @@ class MartingaleBot(threading.Thread):
         except Exception as exc:
             self.logger.debug("MARTINGALE: prefetch failed: %s", exc)
 
+    # -- streak recovery (candle sampling) ------------------------------------
+
+    def _check_streak_recovery(self):
+        """Sample price to build candles and check if market has recovered.
+
+        Called each cycle while ``_streak_paused`` is True.  Returns True
+        when the recovery condition is met (N out of M candles are green),
+        meaning the bot should resume trading.
+
+        A "candle" is simply the price at the start and end of each
+        *recovery_interval* period.  Green = close >= open.
+        """
+        interval = int(self._scfg(
+            "recovery_interval", "martingale_recovery_interval", 300))
+        n_candles = int(self._scfg(
+            "recovery_candles", "martingale_recovery_candles", 10))
+        n_green = int(self._scfg(
+            "recovery_green", "martingale_recovery_green", 5))
+
+        # Get a token_id to sample — use the current window's market
+        slug = self._generate_slug()
+        market = self._fetch_market(slug)
+        if not market:
+            return False  # can't sample yet
+
+        direction = self._scfg("direction", "martingale_direction", self.direction)
+        token_id = (
+            market["up_token"] if direction == "Up"
+            else market["down_token"]
+        )
+        price, _ = self._get_best_ask(token_id)
+        if not price or price <= 0:
+            return False  # no asks — can't sample
+
+        now = int(time.time())
+
+        # Start a new candle if none open or interval elapsed
+        if self._recovery_candle_ts == 0 or (now - self._recovery_candle_ts) >= interval:
+            # Close the previous candle if one was open
+            if self._recovery_candle_open is not None and self._recovery_candle_ts > 0:
+                candle = {
+                    "open": self._recovery_candle_open,
+                    "close": price,
+                    "green": price >= self._recovery_candle_open,
+                    "ts": self._recovery_candle_ts,
+                }
+                self._recovery_candles.append(candle)
+                # Keep only the last N candles
+                self._recovery_candles = self._recovery_candles[-n_candles:]
+                self._save_state()
+
+                green_count = sum(1 for c in self._recovery_candles if c["green"])
+                total = len(self._recovery_candles)
+                color = "GREEN" if candle["green"] else "RED"
+                self.logger.info(
+                    "MARTINGALE [%s] recovery candle: %s (%.4f → %.4f) "
+                    "— %d/%d green (%d needed from %d candles)",
+                    self.strategy_name, color, candle["open"], candle["close"],
+                    green_count, total, n_green, n_candles,
+                )
+
+                # Check recovery condition
+                if total >= n_candles and green_count >= n_green:
+                    return True
+
+            # Open a new candle
+            self._recovery_candle_open = price
+            self._recovery_candle_ts = now
+
+        return False
+
+    def _resume_from_streak_pause(self):
+        """Resume trading after streak recovery is confirmed."""
+        paused_dur = ""
+        if self._streak_paused_at:
+            delta = datetime.now() - self._streak_paused_at
+            mins = int(delta.total_seconds() // 60)
+            paused_dur = f" (paused for {mins}m)"
+
+        green_count = sum(1 for c in self._recovery_candles if c["green"])
+        total = len(self._recovery_candles)
+
+        self._streak_paused = False
+        self._streak_paused_at = None
+        self._recovery_candles = []
+        self._recovery_candle_open = None
+        self._recovery_candle_ts = 0
+        self.consecutive_losses = 0
+        self._save_state()
+
+        msg = (
+            f"MARTINGALE [{self.strategy_name}] RESUMED: recovery confirmed "
+            f"({green_count}/{total} green candles){paused_dur} "
+            f"— next bet=${self.current_bet:.2f}"
+        )
+        self.logger.info(msg)
+        if self.notify_callback:
+            try:
+                self.notify_callback(msg)
+            except Exception:
+                pass
+
     # -- bet placement & result handling ------------------------------------
 
     def _try_place_bet(self):
@@ -4452,15 +5387,34 @@ class MartingaleBot(threading.Thread):
 
         Returns ``True`` if a bet was placed, ``False`` otherwise.
         """
-        # Safety: max streak
+        # Safety: max streak — pause and wait for bullish recovery
         max_streak = int(self._scfg("max_streak", "martingale_max_streak", 0))
-        if max_streak > 0 and self.consecutive_losses >= max_streak:
-            self.logger.warning(
-                "MARTINGALE [%s] STOPPED: max streak of %d losses reached",
-                self.strategy_name, max_streak,
+        if max_streak > 0 and self.consecutive_losses >= max_streak and not self._streak_paused:
+            self._streak_paused = True
+            self._streak_paused_at = datetime.now()
+            self._recovery_candles = []
+            self._recovery_candle_open = None
+            self._recovery_candle_ts = 0
+            self._save_state()
+            n_candles = int(self._scfg(
+                "recovery_candles", "martingale_recovery_candles", 10))
+            n_green = int(self._scfg(
+                "recovery_green", "martingale_recovery_green", 5))
+            msg = (
+                f"MARTINGALE [{self.strategy_name}] PAUSED: max streak of "
+                f"{max_streak} losses reached — waiting for {n_green}/{n_candles} "
+                f"green candles before resuming"
             )
-            self.stop()
+            self.logger.warning(msg)
+            if self.notify_callback:
+                try:
+                    self.notify_callback(msg)
+                except Exception:
+                    pass
             return False
+
+        if self._streak_paused:
+            return False  # recovery check happens in _cycle()
 
         # Safety: max bet
         max_bet = float(self._scfg("max_bet", "martingale_max_bet", 0))
@@ -4478,6 +5432,37 @@ class MartingaleBot(threading.Thread):
         if current_window_ts == self._last_window_ts:
             return False  # already bet or skipped this window
 
+        # ── New window detected — check if previous window was missed ──
+        # If _skip_reason is set, the previous window was attempted but
+        # no bet was placed.  Record it as a missed window now.
+        # Guard: only record once per window (retry paths don't update
+        # _last_window_ts, so this block can fire on every poll).
+        if (self._skip_reason
+                and self._last_window_ts > 0
+                and self._last_window_ts != self._miss_recorded_for_ts):
+            missed_rec = {
+                "ts": datetime.now().isoformat(),
+                "window_ts": self._last_window_ts,
+                "reason": self._skip_reason,
+                "streak": self.consecutive_losses,
+                "bet_would_be": self.current_bet,
+                "ask_price": self._skip_price,
+                "gap": self._skip_gap,
+                "strategy": self.strategy_name,
+            }
+            self._missed_windows.append(missed_rec)
+            _append_missed_window(missed_rec, logger=self.logger)
+            self._miss_recorded_for_ts = self._last_window_ts
+            self.logger.info(
+                "MARTINGALE [%s]: recorded missed window %d — %s%s",
+                self.strategy_name, self._last_window_ts, self._skip_reason,
+                f" ({self._skip_gap})" if self._skip_gap else "",
+            )
+        # Reset for the new window
+        self._skip_reason = None
+        self._skip_price = None
+        self._skip_gap = None
+
         now = int(time.time())
         seconds_into = now - current_window_ts
 
@@ -4486,12 +5471,14 @@ class MartingaleBot(threading.Thread):
             "max_entry_seconds", "martingale_max_entry_seconds", 60,
         ))
         if max_entry > 0 and seconds_into > max_entry:
+            if not self._skip_reason:
+                self._skip_reason = f"too late ({seconds_into}s > {max_entry}s)"
             self.logger.info(
                 "MARTINGALE [%s]: %ds into window > max_entry %ds — skipping",
                 self.strategy_name, seconds_into, max_entry,
             )
-            self._skip_reason = f"too late ({seconds_into}s > {max_entry}s)"
             self._last_window_ts = current_window_ts
+            self._save_state()
             return False
 
         # Allow runtime direction toggle via config (must happen before
@@ -4501,10 +5488,14 @@ class MartingaleBot(threading.Thread):
 
         # Use pre-fetched cache if it matches this window
         cache = self._next_window_cache
+        prefetch_approval_done = False
+        prefetch_balance_ok = None
         if cache and cache["window_ts"] == current_window_ts:
             slug = cache["slug"]
             market = cache["market"]
             token_id = cache["token_id"]
+            prefetch_approval_done = cache.get("approval_done", False)
+            prefetch_balance_ok = cache.get("balance_ok")
             self._next_window_cache = None  # consumed
             self.logger.info(
                 "MARTINGALE: using pre-cached market for '%s'", slug,
@@ -4540,13 +5531,50 @@ class MartingaleBot(threading.Thread):
         # Price range check — only bet when price is within the target range
         price_min = float(self._scfg("price_min", "martingale_price_min", 0.40))
         price_max = float(self._scfg("price_max", "martingale_price_max", 0.55))
+
+        # Dynamic price_max escalation based on loss streak.
+        # At higher streaks, the bet is much larger so missing the window
+        # entirely is worse than paying a few cents more per share.
+        #
+        # Config: price_max_streak = {4: 0.60, 5: 0.65, 6: 0.70}
+        # — keys are streak thresholds, values are the new price_max.
+        # The highest matching threshold wins.
+        streak_overrides = self._scfg(
+            "price_max_streak", "martingale_price_max_streak",
+            {4: 0.60, 5: 0.65, 6: 0.70},
+        )
+        base_price_max = price_max
+        if streak_overrides and self.consecutive_losses > 0:
+            # Find the highest streak threshold that applies
+            best_threshold = 0
+            for threshold_str, cap in streak_overrides.items():
+                threshold = int(threshold_str)
+                if self.consecutive_losses >= threshold > best_threshold:
+                    best_threshold = threshold
+                    price_max = max(price_max, float(cap))
+            if price_max > base_price_max:
+                self.logger.info(
+                    "MARTINGALE [%s]: streak %d — price cap raised $%.2f → $%.2f",
+                    self.strategy_name, self.consecutive_losses,
+                    base_price_max, price_max,
+                )
+
         if ask_price < price_min or ask_price > price_max:
+            if ask_price > price_max:
+                gap_dir = "gap_up"
+                gap_label = "GAP UP"
+            else:
+                gap_dir = "gap_down"
+                gap_label = "GAP DOWN"
             self.logger.info(
-                "MARTINGALE [%s]: price $%.4f outside range [$%.2f–$%.2f] "
-                "— will retry",
-                self.strategy_name, ask_price, price_min, price_max,
+                "MARTINGALE [%s]: %s — price $%.4f outside range "
+                "[$%.2f–$%.2f] — will retry (streak=%d)",
+                self.strategy_name, gap_label, ask_price, price_min,
+                price_max, self.consecutive_losses,
             )
             self._skip_reason = f"price ${ask_price:.4f} outside [{price_min:.2f}–{price_max:.2f}]"
+            self._skip_price = ask_price
+            self._skip_gap = gap_dir
             return False  # don't mark skipped — price might come back
 
         # Check aggregate depth across all ask levels up to price_max.
@@ -4561,6 +5589,7 @@ class MartingaleBot(threading.Thread):
                 self.strategy_name, target_shares, book_depth, price_max,
             )
             self._skip_reason = f"thin book ({book_depth:.0f}/{target_shares:.0f} shares)"
+            self._skip_price = ask_price
             return False
 
         # Dry run guard
@@ -4572,12 +5601,49 @@ class MartingaleBot(threading.Thread):
             self._last_window_ts = current_window_ts
             return False
 
+        # Pre-trade balance check — skip if prefetch already verified.
+        if prefetch_balance_ok is False:
+            self.logger.warning(
+                "MARTINGALE [%s]: prefetch flagged low balance — skipping",
+                self.strategy_name,
+            )
+            self._skip_reason = "low balance (prefetch)"
+            return False
+        if prefetch_balance_ok is None:
+            # No prefetch data — check now
+            try:
+                usdc_bal = float(self.clob_client.get_usdc_balance(max_age_seconds=0))
+                if usdc_bal < self.current_bet:
+                    self.logger.warning(
+                        "MARTINGALE [%s]: USDC balance $%.2f < bet $%.2f — skipping",
+                        self.strategy_name, usdc_bal, self.current_bet,
+                    )
+                    self._skip_reason = f"low balance (${usdc_bal:.2f} < ${self.current_bet:.2f})"
+                    return False
+            except Exception as exc:
+                self.logger.debug("MARTINGALE: balance check failed (%s) — proceeding", exc)
+
+        # Ensure USDC approval — skip if prefetch already handled it.
+        neg_risk = market.get("neg_risk", False)
+        if not prefetch_approval_done:
+            try:
+                raw_amount = int(self.current_bet * 1_000_000)
+                self.clob_client.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
+                if neg_risk:
+                    self.clob_client.ensure_usdc_approval(
+                        NEG_RISK_CTF_EXCHANGE_ADDRESS, raw_amount,
+                    )
+            except Exception as exc:
+                self.logger.warning("MARTINGALE: approval failed (%s) — proceeding", exc)
+
         result = self.clob_client.place_order(
             token_id=token_id,
             side="BUY",
             size_usdc=self.current_bet,
             price=ask_price,
             use_fok=True,
+            max_retry_price=price_max,
+            neg_risk=neg_risk,
         )
 
         if isinstance(result, dict) and (
@@ -4587,26 +5653,38 @@ class MartingaleBot(threading.Thread):
                 "MARTINGALE: FOK rejected for %s @ $%.4f — will retry",
                 direction, ask_price,
             )
+            self._skip_reason = f"FOK rejected @ ${ask_price:.4f}"
+            self._skip_price = ask_price
             return False
 
         if not result:
             self.logger.warning(
                 "MARTINGALE: order failed for %s — will retry", direction,
             )
+            self._skip_reason = f"order failed for {direction}"
+            self._skip_price = ask_price
             return False
 
         actual_shares = float(result.get("takingAmount", 0)) or target_shares
         actual_cost = float(result.get("makingAmount", 0)) or self.current_bet
 
-        # -- Slippage calculation --
-        # fill_price: what we actually paid per share
-        # ask_price:  best ask at order time (what we expected to pay)
-        # fair_price: 0.50 for a 50/50 binary — deviation from this is the
-        #             theoretical edge we're giving up
+        # -- Slippage: how far our fill deviated from $0.50 fair --
+        # Positive = bought below fair (good), negative = bought above (bad)
         fill_price = round(actual_cost / actual_shares, 6) if actual_shares > 0 else ask_price
-        slippage_vs_ask = round(fill_price - ask_price, 6)          # execution slippage
-        slippage_vs_fair = round(fill_price - 0.50, 6)              # edge slippage (cost above fair)
-        slippage_usdc = round(slippage_vs_ask * actual_shares, 6)   # total $ execution slippage
+        slippage = round(0.50 - fill_price, 6)
+        slippage_usdc = round(slippage * actual_shares, 6)
+
+        # -- Post-fill sanity check --
+        # If the fill price is wildly different from the ask we checked,
+        # the book moved between our check and the execution.
+        fill_deviation = abs(fill_price - ask_price)
+        if fill_deviation > 0.10:
+            self.logger.warning(
+                "MARTINGALE [%s]: FILL PRICE DEVIATION — expected ~$%.4f "
+                "(ask), got $%.4f (fill), deviation $%.4f. "
+                "Book moved between check and execution.",
+                self.strategy_name, ask_price, fill_price, fill_deviation,
+            )
 
         opposite_token = (
             market["down_token"] if direction == "Up"
@@ -4619,12 +5697,10 @@ class MartingaleBot(threading.Thread):
             "opposite_token_id": opposite_token,
             "direction": direction,
             "bet_size": self.current_bet,
-            "price": ask_price,
             "fill_price": fill_price,
             "shares": actual_shares,
             "cost": actual_cost,
-            "slippage_vs_ask": slippage_vs_ask,
-            "slippage_vs_fair": slippage_vs_fair,
+            "slippage": slippage,
             "slippage_usdc": slippage_usdc,
             "question": market["question"],
             "window_end": self._get_window_end(),
@@ -4632,22 +5708,27 @@ class MartingaleBot(threading.Thread):
         }
         self._last_window_ts = current_window_ts
         self._skip_reason = None  # bet placed successfully
+        self._skip_price = None
+        self._skip_gap = None
         self._windows_attempted += 1
         self._save_state()
 
         slip_tag = ""
-        if abs(slippage_vs_ask) >= 0.0001:
-            slip_tag = f" | slip ${slippage_usdc:+.4f} ({slippage_vs_ask:+.4f}/sh)"
+        if abs(slippage) >= 0.0001:
+            slip_tag = f" | slip {slippage:+.4f} (${slippage_usdc:+.4f})"
         self.logger.info(
-            "MARTINGALE BET [%s]: %s $%.2f @ ask $%.4f fill $%.4f "
+            "MARTINGALE BET [%s]: %s $%.2f @ $%.4f "
             "(%.1f shares) — streak: %d%s",
-            self.strategy_name, direction, actual_cost, ask_price,
-            fill_price, actual_shares, self.consecutive_losses, slip_tag,
+            self.strategy_name, direction, actual_cost, fill_price,
+            actual_shares, self.consecutive_losses, slip_tag,
         )
         if self.notify_callback:
+            tg_slip = ""
+            if abs(slippage) >= 0.0001:
+                tg_slip = f" | slip {slippage:+.4f}"
             self.notify_callback(
                 f"{self.strategy_name} BET ${actual_cost:.2f} "
-                f"@ ${fill_price:.4f} (ask ${ask_price:.4f}) "
+                f"@ ${fill_price:.4f}{tg_slip} "
                 f"| streak: {self.consecutive_losses}"
             )
         return True
@@ -4656,18 +5737,10 @@ class MartingaleBot(threading.Thread):
         profit = bet["shares"] - bet["cost"]
         self.session_pnl += profit
 
-        # Slippage impact relative to fair value ($0.50).
-        # Negative = favorable (bought below fair, extra edge gained).
-        # Positive = unfavorable (bought above fair, edge lost).
-        slip_fair = bet.get("slippage_vs_fair", 0)
+        slip = bet.get("slippage", 0)
         slip_info = ""
-        if abs(slip_fair) >= 0.0001:
-            edge_usdc = slip_fair * bet["shares"]
-            tag = "edge lost" if slip_fair > 0 else "edge gained"
-            slip_info = (
-                f" | fill ${bet.get('fill_price', 0):.4f} vs "
-                f"$0.50 fair → ${abs(edge_usdc):.4f} {tag}"
-            )
+        if abs(slip) >= 0.0001:
+            slip_info = f" | slip {slip:+.4f} (${bet.get('slippage_usdc', 0):+.4f})"
 
         self.logger.info(
             "MARTINGALE WIN: %s +$%.4f (shares=%.1f, cost=$%.2f) — "
@@ -4678,8 +5751,11 @@ class MartingaleBot(threading.Thread):
 
         self._log_bet(bet, won=True, profit=profit)
         if self.notify_callback:
+            tg_slip = ""
+            if abs(slip) >= 0.0001:
+                tg_slip = f" | fill ${bet.get('fill_price', 0):.4f} slip {slip:+.4f}"
             self.notify_callback(
-                f"{self.strategy_name} WIN +${profit:.4f} | "
+                f"{self.strategy_name} WIN +${profit:.4f}{tg_slip} | "
                 f"reset to ${self.start_bet:.2f}"
             )
 
@@ -4719,12 +5795,10 @@ class MartingaleBot(threading.Thread):
                 "MARTINGALE [%s]: bet capped at max $%.2f", self.strategy_name, max_bet,
             )
 
-        slip_fair = bet.get("slippage_vs_fair", 0)
+        slip = bet.get("slippage", 0)
         slip_info = ""
-        if abs(slip_fair) >= 0.0001:
-            extra = slip_fair * bet["shares"]
-            tag = "overpaid" if slip_fair > 0 else "underpaid"
-            slip_info = f" | {tag} ${abs(extra):.4f} vs $0.50 fair"
+        if abs(slip) >= 0.0001:
+            slip_info = f" | slip {slip:+.4f} (${bet.get('slippage_usdc', 0):+.4f})"
 
         self.logger.info(
             "MARTINGALE LOSS: %s -$%.2f (fill $%.4f) — next bet $%.2f "
@@ -4736,8 +5810,11 @@ class MartingaleBot(threading.Thread):
 
         self._log_bet(bet, won=False, profit=-loss)
         if self.notify_callback:
+            tg_slip = ""
+            if abs(slip) >= 0.0001:
+                tg_slip = f" | fill ${bet.get('fill_price', 0):.4f} slip {slip:+.4f}"
             self.notify_callback(
-                f"{self.strategy_name} LOSS -${loss:.2f} | "
+                f"{self.strategy_name} LOSS -${loss:.2f}{tg_slip} | "
                 f"next ${self.current_bet:.2f} (streak: {self.consecutive_losses})"
             )
 
@@ -4745,13 +5822,8 @@ class MartingaleBot(threading.Thread):
         self._save_state()
 
     def _log_bet(self, bet, won, profit):
-        if not self.log_trade_callback:
-            return
-
         fill_price = bet.get("fill_price", 0)
-        ask_price = bet.get("price", 0)
-        slippage_vs_ask = bet.get("slippage_vs_ask", 0)
-        slippage_vs_fair = bet.get("slippage_vs_fair", 0)
+        slippage = bet.get("slippage", 0)
         slippage_usdc = bet.get("slippage_usdc", 0)
 
         record = {
@@ -4767,10 +5839,8 @@ class MartingaleBot(threading.Thread):
             "outcome": "won" if won else "lost",
             "reason": "martingale",
             "slippage": {
-                "ask_price": ask_price,
                 "fill_price": fill_price,
-                "vs_ask": slippage_vs_ask,
-                "vs_fair": slippage_vs_fair,
+                "vs_fair": slippage,
                 "total_usdc": slippage_usdc,
             },
             "martingale_details": {
@@ -4781,10 +5851,19 @@ class MartingaleBot(threading.Thread):
                 "session_pnl": round(self.session_pnl, 6),
             },
         }
-        try:
-            self.log_trade_callback(record)
-        except Exception as exc:
-            self.logger.debug("Failed to log martingale trade: %s", exc)
+
+        if self.log_trade_callback:
+            try:
+                self.log_trade_callback(record)
+            except Exception as exc:
+                self.logger.warning("Failed to log martingale trade to history: %s", exc)
+        else:
+            self.logger.warning(
+                "MARTINGALE [%s]: log_trade_callback not set — trade record "
+                "will not appear in trade_history.json (persisting to "
+                "martingale_history.json only)",
+                self.strategy_name,
+            )
 
         # --- Persist to dedicated martingale history & summary ---
         self._persist_martingale_record(record)
@@ -4793,57 +5872,28 @@ class MartingaleBot(threading.Thread):
     def _aggregate_slippage(records):
         """Compute slippage stats from a list of trade records.
 
-        Splits into favorable (bought below $0.50 fair) and unfavorable
-        (bought above $0.50 fair) so you can see exactly how much edge
-        you're gaining or losing to price execution.
+        Slippage = $0.50 - fill_price.
+        Positive = bought below fair (good), negative = bought above (bad).
         """
-        slips_vs_ask = []
-        slips_vs_fair = []
+        slippages = []
         total_slip_usdc = 0.0
         fill_prices = []
-        favorable_usdc = 0.0     # total $ saved by buying below fair
-        unfavorable_usdc = 0.0   # total $ lost by buying above fair
-        favorable_count = 0
-        unfavorable_count = 0
         for r in records:
             s = r.get("slippage") or {}
             if s:
-                vs_ask = s.get("vs_ask", 0)
                 vs_fair = s.get("vs_fair", 0)
-                slip_usdc = s.get("total_usdc", 0)
-                slips_vs_ask.append(vs_ask)
-                slips_vs_fair.append(vs_fair)
-                total_slip_usdc += slip_usdc
+                slippages.append(vs_fair)
+                total_slip_usdc += s.get("total_usdc", 0)
                 if s.get("fill_price"):
                     fill_prices.append(s["fill_price"])
-                    shares = r.get("shares", 0)
-                    edge_usdc = vs_fair * shares
-                    if vs_fair < 0:
-                        favorable_usdc += abs(edge_usdc)
-                        favorable_count += 1
-                    elif vs_fair > 0:
-                        unfavorable_usdc += edge_usdc
-                        unfavorable_count += 1
-        n = len(slips_vs_ask) or 1
-        net_edge = favorable_usdc - unfavorable_usdc
+        n = len(slippages) or 1
         return {
-            "total_exec_slippage_usdc": round(total_slip_usdc, 6),
-            "avg_slippage_vs_ask": round(sum(slips_vs_ask) / n, 6) if slips_vs_ask else 0,
+            "total_slippage_usdc": round(total_slip_usdc, 6),
+            "avg_slippage": round(sum(slippages) / n, 6) if slippages else 0,
             "avg_fill_price": round(sum(fill_prices) / len(fill_prices), 6) if fill_prices else 0,
-            "avg_slippage_vs_fair": round(sum(slips_vs_fair) / n, 6) if slips_vs_fair else 0,
-            "max_overpay_vs_ask": round(max(slips_vs_ask), 6) if slips_vs_ask else 0,
-            "best_underpay_vs_ask": round(min(slips_vs_ask), 6) if slips_vs_ask else 0,
-            "favorable_fills": {
-                "count": favorable_count,
-                "total_edge_gained_usdc": round(favorable_usdc, 6),
-            },
-            "unfavorable_fills": {
-                "count": unfavorable_count,
-                "total_edge_lost_usdc": round(unfavorable_usdc, 6),
-            },
-            "net_edge_usdc": round(net_edge, 6),
-            "net_verdict": "favorable" if net_edge > 0 else ("unfavorable" if net_edge < 0 else "neutral"),
-            "bets_with_slippage_data": len(slips_vs_ask),
+            "best_fill": round(max(slippages), 6) if slippages else 0,
+            "worst_fill": round(min(slippages), 6) if slippages else 0,
+            "bets_with_slippage_data": len(slippages),
         }
 
     def _persist_martingale_record(self, record):
@@ -4921,7 +5971,7 @@ class MartingaleBot(threading.Thread):
                     json.dump(summary, fh, indent=2)
                 os.replace(tmp_sf, MARTINGALE_SUMMARY_FILE)
         except Exception as exc:
-            self.logger.debug("Could not persist martingale record: %s", exc)
+            self.logger.warning("Could not persist martingale record: %s", exc)
 
     # -- main loop ----------------------------------------------------------
 
@@ -4936,11 +5986,11 @@ class MartingaleBot(threading.Thread):
             bet = self._active_bet
             now = int(time.time())
 
-            # Pre-cache next window's market in the final 15s of the
+            # Pre-cache next window's market in the final 30s of the
             # current window so we're ready to bet immediately after
             # resolution.
             time_left = bet["window_end"] - now
-            if 0 < time_left <= 15 and not self._next_window_cache:
+            if 0 < time_left <= 30 and not self._next_window_cache:
                 self._prefetch_next_window()
 
             # While the window is still open, slow-poll is fine
@@ -4950,10 +6000,10 @@ class MartingaleBot(threading.Thread):
             # === WINDOW HAS ENDED — fast-poll from here on ===
             elapsed = now - bet["window_end"]
 
-            # Small buffer (3s) before checking to let the orderbook
+            # Small buffer (1s) before checking to let the orderbook
             # settle, but use fast poll so we retry quickly.
-            if elapsed < 3:
-                return False  # fast poll — check again in 2s
+            if elapsed < 1:
+                return False  # fast poll — check again soon
 
             # --- Orderbook is fastest — check it FIRST ---
             resolved = False
@@ -4985,6 +6035,11 @@ class MartingaleBot(threading.Thread):
                 self._handle_loss(bet)
             return False  # resolved — fast poll for next bet
         else:
+            # While paused for streak recovery, sample candles instead of betting
+            if self._streak_paused:
+                if self._check_streak_recovery():
+                    self._resume_from_streak_pause()
+                return False  # keep fast-polling to sample prices
             placed = self._try_place_bet()
             return placed  # fast poll until placed, then slow poll
 
@@ -4996,7 +6051,7 @@ class MartingaleBot(threading.Thread):
         )
 
         poll_slow = max(float(self._scfg("poll_seconds", "martingale_poll_seconds", 10)), 1)
-        poll_fast = 2.0  # aggressive polling when looking for next bet
+        poll_fast = 1.0  # aggressive polling when looking for next bet
 
         while not self._stop_event.is_set():
             try:
@@ -7471,13 +8526,15 @@ class TradeExecutor:
             "Scanning %d token IDs for proxy-held positions...", len(token_ids),
         )
 
-        results = []
+        # ── Phase 1: resolve condition_id + neg_risk from cache/API ──
+        # This is cheap (mostly cache hits), so run sequentially.
+        token_meta = {}  # token_id -> (condition_id, neg_risk, market)
         for token_id in token_ids:
             try:
-                # Use persisted condition_id if available; fall back to API
                 existing_pos = self._positions.get(token_id)
                 condition_id = existing_pos.get("condition_id") if existing_pos else None
                 neg_risk = existing_pos.get("neg_risk", False) if existing_pos else False
+                market = None
 
                 if not condition_id:
                     market = self.clob_client.get_market_by_token(token_id)
@@ -7485,10 +8542,8 @@ class TradeExecutor:
                         condition_id = market.get("condition_id")
                         if condition_id:
                             neg_risk = self._is_neg_risk_market(market)
-                            # Cache neg_risk for future fallback lookups
                             self.clob_client._token_to_neg_risk[token_id] = neg_risk
 
-                    # Fallback: use cached condition_id from activity data
                     if not condition_id:
                         cached_cid = self.clob_client._token_to_condition.get(token_id)
                         if cached_cid:
@@ -7499,15 +8554,46 @@ class TradeExecutor:
                         else:
                             continue
 
-                # Check token balance on the correct contract for the proxy
-                ct_balance = self._get_token_balance(
-                    proxy_address, token_id, neg_risk=neg_risk,
+                token_meta[token_id] = (condition_id, neg_risk, market)
+            except Exception as exc:
+                self.logger.info(
+                    "Error resolving proxy token %s: %s", token_id[:16] + "...", exc,
                 )
-                if ct_balance == 0:
-                    continue
 
-                # On-chain resolution check — tries the API's condition_id
-                # directly, then derives the real CTF conditionId.
+        # ── Phase 2: parallel balance check (the expensive part) ──
+        # Most tokens will have 0 balance; parallelizing cuts ~12s to ~1-2s.
+        held_tokens = {}  # token_id -> balance (only non-zero)
+
+        def _check_balance(tid):
+            cid, nr, _mkt = token_meta[tid]
+            bal = self._get_token_balance(proxy_address, tid, neg_risk=nr)
+            return tid, bal
+
+        scan_workers = min(10, len(token_meta))
+        if scan_workers > 0:
+            with ThreadPoolExecutor(max_workers=scan_workers) as pool:
+                futures = {pool.submit(_check_balance, tid): tid for tid in token_meta}
+                for fut in futures:
+                    try:
+                        tid, bal = fut.result(timeout=10)
+                        if bal > 0:
+                            held_tokens[tid] = bal
+                    except Exception as exc:
+                        tid = futures[fut]
+                        self.logger.info(
+                            "Balance check failed for %s: %s", tid[:16] + "...", exc,
+                        )
+
+        self.logger.info(
+            "Balance scan done: %d/%d tokens have holdings",
+            len(held_tokens), len(token_meta),
+        )
+
+        # ── Phase 3: resolve + redeem only the tokens with balance ──
+        results = []
+        for token_id, ct_balance in held_tokens.items():
+            condition_id, neg_risk, market = token_meta[token_id]
+            try:
                 resolved_cid, payout_denom = self._resolve_condition_id(
                     condition_id, neg_risk=neg_risk,
                 )
@@ -7518,7 +8604,7 @@ class TradeExecutor:
                     )
                     continue
 
-                question = market.get("question", "unknown")
+                question = (market or {}).get("question", "unknown")
                 self.logger.info(
                     "PROXY REDEEM: Resolved position — token %s, "
                     "question: %s, proxy balance: %d, neg_risk: %s",
@@ -8286,7 +9372,7 @@ class CopyTraderBot:
                     pass
 
         except Exception as exc:
-            self.logger.debug("Could not append trade history: %s", exc)
+            self.logger.warning("Could not append trade history: %s", exc)
 
     def _save_session_trades(self):
         """Persist session trades to disk immediately (crash-safe).
@@ -8915,11 +10001,10 @@ class CopyTraderBot:
                                 self._save_session_trades()
                                 if result.get("status") == "submitted":
                                     self._notify(
-                                        "TRADE %s $%.2f @ %.4f (whale @ %.4f) — %s" % (
+                                        "TRADE %s $%.2f @ $%.4f — %s" % (
                                             result.get("side", "?"),
                                             result.get("amount_usdc", 0),
                                             result.get("price", 0),
-                                            result.get("whale_price", 0),
                                             result.get("token_id", "")[:16] + "...",
                                         )
                                     )
@@ -9183,9 +10268,16 @@ class TextHandler(logging.Handler):
 
     def _append(self, msg):
         try:
+            # Only auto-scroll if the user is already at the bottom.
+            # yview() returns (top_fraction, bottom_fraction); if bottom
+            # is >= 0.98 the user hasn't scrolled up to read old logs.
+            _, bottom = self.text_widget.yview()
+            at_bottom = bottom >= 0.98
+
             self.text_widget.configure(state="normal")
             self.text_widget.insert(tk.END, msg)
-            self.text_widget.see(tk.END)
+            if at_bottom:
+                self.text_widget.see(tk.END)
             self.text_widget.configure(state="disabled")
         except Exception:
             pass
@@ -9275,7 +10367,12 @@ class CopyTraderGUI:
         notebook.add(history_frame, text="Trade History")
         self._build_history_tab(history_frame)
 
-        # Tab 6: Log / Status
+        # Tab 7: Equity Chart
+        equity_frame = ttk.Frame(notebook, padding=10)
+        notebook.add(equity_frame, text="Equity")
+        self._build_equity_tab(equity_frame)
+
+        # Tab 8: Log / Status
         log_frame = ttk.Frame(notebook, padding=10)
         notebook.add(log_frame, text="Log")
         self._build_log_tab(log_frame)
@@ -9682,13 +10779,13 @@ class CopyTraderGUI:
                 m_pnl = ms.get("lifetime_pnl_usdc", 0)
                 m_wr = ms.get("win_rate_pct", 0)
                 slip = ms.get("slippage") or {}
-                net_edge = slip.get("net_edge_usdc", 0)
                 avg_fill = slip.get("avg_fill_price", 0)
+                total_slip = slip.get("total_slippage_usdc", 0)
                 edge_tag = ""
                 if avg_fill > 0:
                     edge_tag = (
                         f" avg ${avg_fill:.3f}"
-                        f" edge ${net_edge:+,.2f}"
+                        f" slip ${total_slip:+,.2f}"
                     )
                 mart_label = (
                     f"  |  Mart: W/L {m_wins}/{m_losses} "
@@ -10417,6 +11514,342 @@ class CopyTraderGUI:
         self._mart_selected_idx = idx
         self._mart_on_select()
 
+    # ------------------------------------------------------------------
+    # Equity Chart tab
+    # ------------------------------------------------------------------
+
+    def _build_equity_tab(self, parent):
+        """Build an hourly cumulative P&L chart using tkinter Canvas."""
+        # Controls bar
+        ctrl = ttk.Frame(parent)
+        ctrl.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(ctrl, text="Refresh", command=self._refresh_equity_chart).pack(
+            side=tk.LEFT,
+        )
+        self.equity_session_only_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            ctrl, text="Current Session Only",
+            variable=self.equity_session_only_var,
+            command=self._refresh_equity_chart,
+        ).pack(side=tk.LEFT, padx=10)
+        self.equity_info_var = tk.StringVar(value="")
+        ttk.Label(ctrl, textvariable=self.equity_info_var, font=("Courier", 10)).pack(
+            side=tk.RIGHT,
+        )
+
+        # Canvas
+        self.equity_canvas = tk.Canvas(
+            parent, bg="#1e1e1e", highlightthickness=0,
+        )
+        self.equity_canvas.pack(fill=tk.BOTH, expand=True)
+        self.equity_canvas.bind("<Configure>", lambda e: self._refresh_equity_chart())
+
+        # Hover tooltip state
+        self._equity_points = []       # [(px, py, ts_str, pnl), ...]
+        self._equity_tooltip_id = None  # canvas item id for tooltip
+        self._equity_highlight_id = None
+        self.equity_canvas.bind("<Motion>", self._equity_on_hover)
+        self.equity_canvas.bind("<Leave>", self._equity_on_leave)
+
+    def _refresh_equity_chart(self):
+        """Redraw the equity chart from trade_history.json data."""
+        canvas = self.equity_canvas
+        canvas.delete("all")
+        self._equity_points = []
+        w = canvas.winfo_width()
+        h = canvas.winfo_height()
+        if w < 80 or h < 80:
+            return
+
+        # ── Load & filter trade records ──
+        try:
+            with open(TRADE_HISTORY_FILE, "r") as fh:
+                history = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            history = []
+
+        if not history:
+            canvas.create_text(
+                w // 2, h // 2, text="No trade data yet",
+                fill="#888888", font=("Courier", 14),
+            )
+            return
+
+        history.sort(key=lambda r: r.get("closed_at", ""))
+
+        # Session filter
+        if self.equity_session_only_var.get():
+            session_start = None
+            if hasattr(self, "bot") and self.bot:
+                ss = getattr(self.bot, "_session_start", None)
+                if ss:
+                    session_start = ss.isoformat() if hasattr(ss, "isoformat") else str(ss)
+            if session_start:
+                history = [
+                    r for r in history
+                    if r.get("closed_at", "") >= session_start
+                ]
+
+        if not history:
+            canvas.create_text(
+                w // 2, h // 2, text="No trades in current session",
+                fill="#888888", font=("Courier", 14),
+            )
+            return
+
+        # ── Compute cumulative P&L at each trade ──
+        cum_pnl = []
+        running = 0.0
+        for rec in history:
+            running += rec.get("pnl_usdc", 0)
+            ts_str = rec.get("closed_at", "")
+            cum_pnl.append((ts_str, round(running, 2)))
+
+        # ── Group into hourly buckets for the X-axis ──
+        # Keep the last P&L value for each hour bucket.
+        hourly = {}
+        for ts_str, pnl in cum_pnl:
+            hour_key = ts_str[:13]  # "2026-02-17 14" or "2026-02-17T14"
+            hourly[hour_key] = pnl
+        # Also keep individual trade points for plotting
+        trade_points = cum_pnl
+
+        # ── Chart geometry ──
+        margin_l = 70   # left margin for Y-axis labels
+        margin_r = 20
+        margin_t = 25
+        margin_b = 50   # bottom margin for X-axis labels
+        chart_w = w - margin_l - margin_r
+        chart_h = h - margin_t - margin_b
+        if chart_w < 40 or chart_h < 40:
+            return
+
+        # ── Data range ──
+        pnl_values = [p for _, p in trade_points]
+        pnl_min = min(min(pnl_values), 0)
+        pnl_max = max(max(pnl_values), 0)
+        pnl_range = pnl_max - pnl_min
+        if pnl_range == 0:
+            pnl_range = 10  # avoid division by zero
+        # Add 10% padding
+        pnl_min -= pnl_range * 0.1
+        pnl_max += pnl_range * 0.1
+        pnl_range = pnl_max - pnl_min
+
+        def y_px(val):
+            return margin_t + chart_h * (1 - (val - pnl_min) / pnl_range)
+
+        def x_px(idx):
+            n = len(trade_points)
+            if n <= 1:
+                return margin_l + chart_w // 2
+            return margin_l + chart_w * idx / (n - 1)
+
+        # ── Draw grid lines & Y-axis labels ──
+        # Choose nice Y-axis tick spacing
+        raw_step = pnl_range / 6
+        magnitude = 10 ** int(f"{raw_step:.0e}".split("e")[1]) if raw_step > 0 else 1
+        nice_step = max(magnitude, 1)
+        for mult in [1, 2, 5, 10, 20, 50, 100]:
+            if magnitude * mult >= raw_step:
+                nice_step = magnitude * mult
+                break
+
+        tick = nice_step * (int(pnl_min / nice_step))
+        while tick <= pnl_max:
+            if pnl_min <= tick <= pnl_max:
+                yp = y_px(tick)
+                color = "#333333"
+                if tick == 0:
+                    color = "#555555"
+                canvas.create_line(
+                    margin_l, yp, w - margin_r, yp, fill=color, dash=(2, 4),
+                )
+                canvas.create_text(
+                    margin_l - 5, yp, text=f"${tick:+,.0f}",
+                    fill="#aaaaaa", font=("Courier", 8), anchor=tk.E,
+                )
+            tick += nice_step
+
+        # ── Zero line (prominent) ──
+        zero_y = y_px(0)
+        canvas.create_line(
+            margin_l, zero_y, w - margin_r, zero_y,
+            fill="#666666", width=1,
+        )
+
+        # ── Draw filled area + line ──
+        if len(trade_points) >= 2:
+            # Build polygon points for filled area (from zero line)
+            fill_above = []  # green segments (P&L > 0)
+            fill_below = []  # red segments (P&L < 0)
+
+            # Simple approach: draw the line and a filled polygon
+            line_coords = []
+            for i, (_, pnl) in enumerate(trade_points):
+                px = x_px(i)
+                py = y_px(pnl)
+                line_coords.extend([px, py])
+
+            # Filled polygon from line to zero
+            poly_coords = [x_px(0), zero_y]
+            for i, (_, pnl) in enumerate(trade_points):
+                poly_coords.extend([x_px(i), y_px(pnl)])
+            poly_coords.extend([x_px(len(trade_points) - 1), zero_y])
+
+            # Determine dominant color
+            final_pnl = trade_points[-1][1]
+            fill_color = "#0a3d0a" if final_pnl >= 0 else "#3d0a0a"
+            line_color = "#00cc44" if final_pnl >= 0 else "#cc4444"
+
+            canvas.create_polygon(
+                poly_coords, fill=fill_color, outline="",
+            )
+            canvas.create_line(
+                line_coords, fill=line_color, width=2, smooth=True,
+            )
+
+            # ── Dot markers at each trade point ──
+            self._equity_points = []
+            for i, (ts_str, pnl) in enumerate(trade_points):
+                px = x_px(i)
+                py = y_px(pnl)
+                dot_color = "#00ff55" if pnl >= 0 else "#ff4444"
+                r = 2 if len(trade_points) > 30 else 3
+                canvas.create_oval(
+                    px - r, py - r, px + r, py + r,
+                    fill=dot_color, outline="",
+                )
+                self._equity_points.append((px, py, ts_str, pnl))
+        elif len(trade_points) == 1:
+            self._equity_points = []
+            px = x_px(0)
+            py = y_px(trade_points[0][1])
+            dot_color = "#00ff55" if trade_points[0][1] >= 0 else "#ff4444"
+            canvas.create_oval(px - 5, py - 5, px + 5, py + 5, fill=dot_color, outline="")
+            self._equity_points.append((px, py, trade_points[0][0], trade_points[0][1]))
+
+        # ── X-axis time labels ──
+        # Show a subset of labels to avoid overlap
+        n = len(trade_points)
+        max_labels = max(chart_w // 90, 2)
+        step = max(n // max_labels, 1)
+        for i in range(0, n, step):
+            ts_str = trade_points[i][0]
+            # Extract "HH:MM" or "MM/DD HH:MM"
+            label = ts_str[11:16] if len(ts_str) >= 16 else ts_str[:10]
+            # Add date prefix if data spans multiple days
+            if i == 0 or (i > 0 and trade_points[i][0][:10] != trade_points[i - 1][0][:10]):
+                label = ts_str[5:10] + "\n" + ts_str[11:16] if len(ts_str) >= 16 else ts_str[:10]
+            px = x_px(i)
+            canvas.create_text(
+                px, h - margin_b + 15, text=label,
+                fill="#aaaaaa", font=("Courier", 7), anchor=tk.N,
+            )
+
+        # ── Axis borders ──
+        canvas.create_line(
+            margin_l, margin_t, margin_l, h - margin_b, fill="#666666",
+        )
+        canvas.create_line(
+            margin_l, h - margin_b, w - margin_r, h - margin_b, fill="#666666",
+        )
+
+        # ── Title + info label ──
+        final_pnl = trade_points[-1][1] if trade_points else 0
+        title_color = "#00cc44" if final_pnl >= 0 else "#cc4444"
+        canvas.create_text(
+            margin_l + 10, margin_t - 8,
+            text=f"Cumulative P&L: ${final_pnl:+,.2f}  ({len(trade_points)} trades)",
+            fill=title_color, font=("Courier", 10, "bold"), anchor=tk.W,
+        )
+
+        first_ts = trade_points[0][0][:16].replace("T", " ") if trade_points else ""
+        last_ts = trade_points[-1][0][:16].replace("T", " ") if trade_points else ""
+        self.equity_info_var.set(f"{first_ts}  →  {last_ts}")
+
+    def _equity_on_hover(self, event):
+        """Show tooltip when hovering near a data point on the equity chart."""
+        canvas = self.equity_canvas
+        # Clear previous tooltip
+        self._equity_clear_tooltip()
+
+        if not self._equity_points:
+            return
+
+        mx, my = event.x, event.y
+        # Find the nearest point within a reasonable radius
+        best_dist = float("inf")
+        best = None
+        for px, py, ts_str, pnl in self._equity_points:
+            dist = ((mx - px) ** 2 + (my - py) ** 2) ** 0.5
+            if dist < best_dist:
+                best_dist = dist
+                best = (px, py, ts_str, pnl)
+
+        # Snap threshold — must be within 20px of a data point
+        if best is None or best_dist > 20:
+            return
+
+        px, py, ts_str, pnl = best
+        ts_label = ts_str[:19].replace("T", " ") if len(ts_str) >= 16 else ts_str
+        pnl_label = f"${pnl:+,.2f}"
+
+        # Highlight the point
+        r = 5
+        self._equity_highlight_id = canvas.create_oval(
+            px - r, py - r, px + r, py + r,
+            outline="#ffffff", width=2, fill="",
+        )
+
+        # Tooltip background + text
+        text = f"{ts_label}\nP&L: {pnl_label}"
+        # Position tooltip above and to the right; flip if near edges
+        tx = px + 12
+        ty = py - 12
+        anchor = tk.SW
+        cw = canvas.winfo_width()
+        if tx + 120 > cw:
+            tx = px - 12
+            anchor = tk.SE
+        if ty < 30:
+            ty = py + 12
+            anchor = tk.NW if anchor == tk.SW else tk.NE
+
+        bg_color = "#2a2a2a"
+        text_color = "#00ff88" if pnl >= 0 else "#ff6666"
+
+        # Draw tooltip text (use a tag so we can delete it)
+        self._equity_tooltip_id = canvas.create_text(
+            tx, ty, text=text, fill=text_color,
+            font=("Courier", 9, "bold"), anchor=anchor,
+            tags=("tooltip",),
+        )
+        # Draw background rectangle behind text
+        bbox = canvas.bbox(self._equity_tooltip_id)
+        if bbox:
+            pad = 4
+            bg = canvas.create_rectangle(
+                bbox[0] - pad, bbox[1] - pad,
+                bbox[2] + pad, bbox[3] + pad,
+                fill=bg_color, outline="#555555",
+                tags=("tooltip_bg",),
+            )
+            canvas.tag_raise(self._equity_tooltip_id, bg)
+
+    def _equity_on_leave(self, event):
+        """Clear tooltip when mouse leaves the canvas."""
+        self._equity_clear_tooltip()
+
+    def _equity_clear_tooltip(self):
+        canvas = self.equity_canvas
+        canvas.delete("tooltip")
+        canvas.delete("tooltip_bg")
+        if self._equity_highlight_id:
+            canvas.delete(self._equity_highlight_id)
+            self._equity_highlight_id = None
+        self._equity_tooltip_id = None
+
     def _build_log_tab(self, parent):
         self.log_area = scrolledtext.ScrolledText(
             parent, state="disabled", wrap=tk.WORD, font=("Courier", 9), height=25
@@ -10427,7 +11860,7 @@ class CopyTraderGUI:
     def _build_history_tab(self, parent):
         columns = (
             "closed_at", "market", "shares", "entry_price",
-            "exit_price", "pnl_usdc", "outcome", "reason",
+            "exit_price", "pnl_usdc", "slip_usdc", "outcome", "reason",
         )
         col_headings = {
             "closed_at": "Closed At",
@@ -10436,13 +11869,14 @@ class CopyTraderGUI:
             "entry_price": "Entry",
             "exit_price": "Exit",
             "pnl_usdc": "P&L ($)",
+            "slip_usdc": "Slip ($)",
             "outcome": "Result",
             "reason": "Reason",
         }
         col_widths = {
             "closed_at": 145, "market": 150, "shares": 70,
             "entry_price": 70, "exit_price": 70, "pnl_usdc": 85,
-            "outcome": 55, "reason": 85,
+            "slip_usdc": 75, "outcome": 55, "reason": 85,
         }
 
         tree_frame = ttk.Frame(parent)
@@ -10457,16 +11891,20 @@ class CopyTraderGUI:
 
         for col in columns:
             self.history_tree.heading(col, text=col_headings[col])
-            anchor = tk.E if col in ("shares", "entry_price", "exit_price", "pnl_usdc") else tk.W
+            anchor = tk.E if col in ("shares", "entry_price", "exit_price", "pnl_usdc", "slip_usdc") else tk.W
             self.history_tree.column(col, width=col_widths.get(col, 80), anchor=anchor)
 
         self.history_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Summary label
+        # Summary labels
         self.history_summary_var = tk.StringVar(value="")
         ttk.Label(parent, textvariable=self.history_summary_var, font=("Courier", 10)).pack(
             anchor=tk.W, pady=(5, 0),
+        )
+        self.history_fill_var = tk.StringVar(value="")
+        ttk.Label(parent, textvariable=self.history_fill_var, font=("Courier", 10)).pack(
+            anchor=tk.W, pady=(1, 0),
         )
 
         btn_frame = ttk.Frame(parent)
@@ -10516,6 +11954,10 @@ class CopyTraderGUI:
 
         total_cost = 0.0
         total_proceeds = 0.0
+        total_slip_usdc = 0.0
+        total_slip_shares = 0.0       # shares-weighted for avg fill calc
+        total_slip_cost = 0.0         # cost of trades with slippage data
+        slip_count = 0
         wins = losses = 0
         for rec in reversed(history):  # newest first
             pnl = rec.get("pnl_usdc", 0)
@@ -10526,6 +11968,19 @@ class CopyTraderGUI:
                 wins += 1
             elif outcome in ("lost", "loss"):
                 losses += 1
+
+            # Per-trade slippage (martingale records only)
+            slip = rec.get("slippage") or {}
+            slip_usdc = slip.get("total_usdc", 0)
+            fill_price = slip.get("fill_price", 0)
+            shares = rec.get("shares", 0)
+            if slip and fill_price:
+                total_slip_usdc += slip_usdc
+                total_slip_shares += shares
+                total_slip_cost += rec.get("cost_basis_usdc", 0)
+                slip_count += 1
+            slip_display = f"{slip_usdc:+.2f}" if slip_usdc else ""
+
             closed_at = rec.get("closed_at", "")
             # Shorten the ISO timestamp for display
             if "T" in closed_at:
@@ -10546,6 +12001,7 @@ class CopyTraderGUI:
                 f"{rec.get('entry_price', 0):.4f}",
                 f"{rec.get('exit_price', 0):.4f}",
                 f"{pnl:+.4f}",
+                slip_display,
                 outcome.upper() if outcome else rec.get("reason", ""),
                 rec.get("reason", ""),
             ))
@@ -10559,6 +12015,24 @@ class CopyTraderGUI:
             f"P&L: ${total_pnl:+,.2f}  |  "
             f"W/L: {wins}/{losses} ({win_rate})"
         )
+
+        # Fill-cost analysis line (only shown when slippage data exists)
+        if slip_count > 0:
+            avg_fill = total_slip_cost / total_slip_shares if total_slip_shares else 0
+            # total_slip_usdc: positive = net saved (bought below .50),
+            #                  negative = net overpaid (bought above .50)
+            if total_slip_usdc >= 0:
+                net_label = f"saved ${total_slip_usdc:,.2f}"
+            else:
+                net_label = f"overpaid ${abs(total_slip_usdc):,.2f}"
+            self.history_fill_var.set(
+                f"Fill Analysis ({slip_count} trades):  "
+                f"Avg Fill: ${avg_fill:.4f}  |  "
+                f"Net vs $0.50 Fair: {net_label}  |  "
+                f"on ${total_slip_cost:,.2f} deployed"
+            )
+        else:
+            self.history_fill_var.set("")
 
     def _export_history_csv(self):
         """Export trade history to a CSV file."""
