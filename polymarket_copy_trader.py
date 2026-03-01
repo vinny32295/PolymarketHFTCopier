@@ -2944,10 +2944,37 @@ class PolymarketCLOBClient:
                     )
                     return resp
                 except Exception as fok_exc:
-                    # FOK failed — the market has moved away from our price.
-                    # Retry ONCE with a refreshed orderbook price before
-                    # giving up.  This catches cases where our smart price
-                    # was slightly stale by the time the order hit the book.
+                    # Classify: network error (order may have been matched
+                    # on the exchange but response lost) vs clean API
+                    # rejection (order definitely not matched).
+                    _exc_s = str(fok_exc)
+                    _is_net = (
+                        getattr(fok_exc, 'status_code', -1) is None
+                        or "Request exception" in _exc_s
+                        or "timeout" in _exc_s.lower()
+                        or "connection" in _exc_s.lower()
+                        or isinstance(fok_exc, (
+                            ConnectionError, TimeoutError, OSError))
+                    )
+                    if _is_net:
+                        # Network error — do NOT retry; the original order
+                        # may have been matched.  Let the caller check for
+                        # a phantom fill before re-submitting.
+                        self.logger.warning(
+                            "FOK network error (%s) — NOT retrying "
+                            "(order may have been matched)",
+                            fok_exc,
+                        )
+                        return {
+                            "status": "network_error",
+                            "reason": str(fok_exc),
+                            "token_id": token_id,
+                            "side": side.upper(),
+                            "amount": round(actual_usdc, 2),
+                            "price": rounded_price,
+                        }
+                    # Clean API rejection — safe to retry with refreshed
+                    # price (the order was definitely not matched).
                     self.logger.warning(
                         "FOK rejected (%s) — retrying with refreshed price",
                         fok_exc,
@@ -3023,6 +3050,29 @@ class PolymarketCLOBClient:
                         )
                         return resp2
                     except Exception as retry_exc:
+                        _rexc_s = str(retry_exc)
+                        _is_net2 = (
+                            getattr(retry_exc, 'status_code', -1) is None
+                            or "Request exception" in _rexc_s
+                            or "timeout" in _rexc_s.lower()
+                            or "connection" in _rexc_s.lower()
+                            or isinstance(retry_exc, (
+                                ConnectionError, TimeoutError, OSError))
+                        )
+                        if _is_net2:
+                            self.logger.warning(
+                                "FOK retry network error (%s) — aborting "
+                                "(order may have been matched)",
+                                retry_exc,
+                            )
+                            return {
+                                "status": "network_error",
+                                "reason": str(retry_exc),
+                                "token_id": token_id,
+                                "side": side.upper(),
+                                "amount": retry_usdc,
+                                "price": retry_price,
+                            }
                         self.logger.warning(
                             "FOK retry also rejected (%s) — aborting",
                             retry_exc,
@@ -5690,6 +5740,50 @@ class MartingaleBot(threading.Thread):
             neg_risk=neg_risk,
         )
 
+        # --- Phantom-fill protection ---
+        # If the FOK got a network error, the API may have matched the
+        # order but the HTTP response was lost.  Check on-chain balance
+        # before retrying to avoid placing a duplicate bet.
+        if isinstance(result, dict) and result.get("status") == "network_error":
+            self.logger.warning(
+                "MARTINGALE: FOK network error for %s @ $%.4f — "
+                "checking for phantom fill on-chain",
+                direction, ask_price,
+            )
+            time.sleep(2)  # allow on-chain settlement
+            raw_balance = self._check_phantom_fill(
+                token_id, neg_risk=neg_risk,
+            )
+            if raw_balance > 0:
+                actual_shares = float(
+                    Decimal(raw_balance) / Decimal("1000000")
+                )
+                actual_cost = round(actual_shares * ask_price, 6)
+                self.logger.warning(
+                    "MARTINGALE: PHANTOM FILL DETECTED — %.1f shares of "
+                    "token %s on-chain (expected ~%.1f). "
+                    "Treating as successful fill.",
+                    actual_shares, token_id[:16] + "...", target_shares,
+                )
+                # Synthetic result so the success path below works
+                result = {
+                    "takingAmount": str(actual_shares),
+                    "makingAmount": str(actual_cost),
+                    "status": "matched",
+                    "success": True,
+                    "_phantom_fill": True,
+                }
+            else:
+                self.logger.info(
+                    "MARTINGALE: no phantom fill (balance=0) — "
+                    "will retry next poll",
+                )
+                self._skip_reason = (
+                    f"network error (no phantom fill) @ ${ask_price:.4f}"
+                )
+                self._skip_price = ask_price
+                return False
+
         if isinstance(result, dict) and (
             result.get("status") == "fok_rejected" or result.get("error")
         ):
@@ -5864,6 +5958,24 @@ class MartingaleBot(threading.Thread):
 
         self._active_bet = None
         self._save_state()
+
+    def _check_phantom_fill(self, token_id, neg_risk=False):
+        """Check on-chain token balance after a FOK network error.
+
+        If the balance is non-zero for the given token, the FOK was
+        matched on the exchange despite the network error — a phantom
+        fill.  Returns the token balance in raw units (int), or 0.
+        """
+        if not self.executor:
+            return 0
+        try:
+            balance = self.executor._get_token_balance(
+                self.executor.address, token_id, neg_risk=neg_risk,
+            )
+            return balance
+        except Exception as exc:
+            self.logger.warning("Phantom-fill balance check failed: %s", exc)
+            return 0
 
     def _log_bet(self, bet, won, profit):
         fill_price = bet.get("fill_price", 0)
