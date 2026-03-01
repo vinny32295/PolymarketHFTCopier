@@ -3017,8 +3017,12 @@ class TestMartingaleBot(unittest.TestCase):
         logger = logging.getLogger("test_martingale")
         logger.handlers = [logging.NullHandler()]
         clob = MagicMock()
+        executor = MagicMock()
+        executor.get_usdc_balance = MagicMock(return_value=Decimal("1000"))
+        executor.ensure_usdc_approval = MagicMock()
         mb = bot.MartingaleBot.__new__(bot.MartingaleBot)
         mb.clob_client = clob
+        mb.executor = executor
         mb.cfg = cfg
         mb.logger = logger
         mb._stop_event = MagicMock()

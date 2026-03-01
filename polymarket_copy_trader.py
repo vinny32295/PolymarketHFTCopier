@@ -4644,7 +4644,8 @@ class MartingaleBot(threading.Thread):
 
     STATE_FILE = "martingale_state.json"
 
-    def __init__(self, clob_client, cfg, logger=None, strategy=None):
+    def __init__(self, clob_client, cfg, logger=None, strategy=None,
+                 executor=None):
         self.strategy = strategy or {}
         self.strategy_name = self.strategy.get("name", "default")
 
@@ -4660,6 +4661,7 @@ class MartingaleBot(threading.Thread):
         super().__init__(daemon=True, name=thread_name)
 
         self.clob_client = clob_client
+        self.executor = executor  # TradeExecutor for on-chain ops (approval, balance)
         self.cfg = cfg
         self.logger = logger or logging.getLogger("martingale")
         self._stop_event = threading.Event()
@@ -5280,28 +5282,30 @@ class MartingaleBot(threading.Thread):
             # Pre-run USDC approval so it's not on the critical path.
             # Use the next bet size (current_bet after potential doubling).
             neg_risk = market.get("neg_risk", False)
-            try:
-                raw_amount = int(self.current_bet * 2 * 1_000_000)  # approve 2x for headroom
-                self.clob_client.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
-                if neg_risk:
-                    self.clob_client.ensure_usdc_approval(
-                        NEG_RISK_CTF_EXCHANGE_ADDRESS, raw_amount,
-                    )
-            except Exception as exc:
-                self.logger.debug("MARTINGALE: prefetch approval failed (%s)", exc)
+            if self.executor:
+                try:
+                    raw_amount = int(self.current_bet * 2 * 1_000_000)  # approve 2x for headroom
+                    self.executor.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
+                    if neg_risk:
+                        self.executor.ensure_usdc_approval(
+                            NEG_RISK_CTF_EXCHANGE_ADDRESS, raw_amount,
+                        )
+                except Exception as exc:
+                    self.logger.debug("MARTINGALE: prefetch approval failed (%s)", exc)
 
             # Pre-check balance so we know early if we're short.
             balance_ok = True
-            try:
-                usdc_bal = float(self.clob_client.get_usdc_balance(max_age_seconds=0))
-                if usdc_bal < self.current_bet:
-                    self.logger.warning(
-                        "MARTINGALE: prefetch balance warning — $%.2f < next bet $%.2f",
-                        usdc_bal, self.current_bet,
-                    )
-                    balance_ok = False
-            except Exception:
-                pass
+            if self.executor:
+                try:
+                    usdc_bal = float(self.executor.get_usdc_balance(max_age_seconds=0))
+                    if usdc_bal < self.current_bet:
+                        self.logger.warning(
+                            "MARTINGALE: prefetch balance warning — $%.2f < next bet $%.2f",
+                            usdc_bal, self.current_bet,
+                        )
+                        balance_ok = False
+                except Exception:
+                    pass
 
             self._next_window_cache = {
                 "window_ts": next_window_ts,
@@ -5649,10 +5653,10 @@ class MartingaleBot(threading.Thread):
             )
             self._skip_reason = "low balance (prefetch)"
             return False
-        if prefetch_balance_ok is None:
+        if prefetch_balance_ok is None and self.executor:
             # No prefetch data — check now
             try:
-                usdc_bal = float(self.clob_client.get_usdc_balance(max_age_seconds=0))
+                usdc_bal = float(self.executor.get_usdc_balance(max_age_seconds=0))
                 if usdc_bal < self.current_bet:
                     self.logger.warning(
                         "MARTINGALE [%s]: USDC balance $%.2f < bet $%.2f — skipping",
@@ -5665,12 +5669,12 @@ class MartingaleBot(threading.Thread):
 
         # Ensure USDC approval — skip if prefetch already handled it.
         neg_risk = market.get("neg_risk", False)
-        if not prefetch_approval_done:
+        if not prefetch_approval_done and self.executor:
             try:
                 raw_amount = int(self.current_bet * 1_000_000)
-                self.clob_client.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
+                self.executor.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
                 if neg_risk:
-                    self.clob_client.ensure_usdc_approval(
+                    self.executor.ensure_usdc_approval(
                         NEG_RISK_CTF_EXCHANGE_ADDRESS, raw_amount,
                     )
             except Exception as exc:
@@ -6143,8 +6147,9 @@ class MartingaleManager:
         ]
     """
 
-    def __init__(self, clob_client, cfg, logger=None):
+    def __init__(self, clob_client, cfg, logger=None, executor=None):
         self.clob_client = clob_client
+        self.executor = executor  # TradeExecutor for on-chain ops
         self.cfg = cfg
         self.logger = logger or logging.getLogger("martingale")
         self._bots = []  # list[MartingaleBot]
@@ -6171,6 +6176,7 @@ class MartingaleManager:
         for strat in strategies:
             bot = MartingaleBot(
                 clob_client, cfg, logger=self.logger, strategy=strat,
+                executor=executor,
             )
             self._bots.append(bot)
 
@@ -9688,6 +9694,7 @@ class CopyTraderBot:
         if self.cfg.get("martingale_enabled") and self.clob_client:
             self._martingale_mgr = MartingaleManager(
                 self.clob_client, self.cfg, self.logger,
+                executor=self.executor,
             )
             self._martingale_mgr.set_notify_callback(self._notify)
             self._martingale_mgr.set_log_trade_callback(self._append_trade_history)
