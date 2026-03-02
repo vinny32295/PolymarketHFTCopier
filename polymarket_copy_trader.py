@@ -4735,6 +4735,8 @@ class MartingaleBot(threading.Thread):
         self._skip_price = None         # ask price when last skip occurred
         self._skip_gap = None           # "gap_up", "gap_down", or None
         self._miss_recorded_for_ts = 0  # last window_ts we recorded a miss for (dedup)
+        self._fok_retry_count = 0       # FOK rejection retries within current window
+        self._fok_retry_window_ts = 0   # window_ts the retry counter belongs to
         self._windows_attempted = 0     # windows where we tried to bet
         self._windows_no_market = 0     # market slug not found on Gamma API
         self._missed_windows = []       # windows skipped due to price/book/balance
@@ -4925,6 +4927,8 @@ class MartingaleBot(threading.Thread):
         self.session_pnl = 0.0
         self._active_bet = None
         self._last_window_ts = 0
+        self._fok_retry_count = 0
+        self._fok_retry_window_ts = 0
         self._streak_paused = False
         self._streak_paused_at = None
         self._recovery_candles = []
@@ -5787,17 +5791,63 @@ class MartingaleBot(threading.Thread):
         if isinstance(result, dict) and (
             result.get("status") == "fok_rejected" or result.get("error")
         ):
+            # Track per-window FOK retries to avoid unlimited retry loops
+            if self._fok_retry_window_ts != current_window_ts:
+                self._fok_retry_count = 0
+                self._fok_retry_window_ts = current_window_ts
+            self._fok_retry_count += 1
+            max_fok_retries = int(self._scfg(
+                "max_fok_retries", "martingale_max_fok_retries", 3,
+            ))
+            if self._fok_retry_count >= max_fok_retries:
+                self.logger.warning(
+                    "MARTINGALE: FOK rejected %d/%d times for %s @ $%.4f "
+                    "— giving up on window %d",
+                    self._fok_retry_count, max_fok_retries,
+                    direction, ask_price, current_window_ts,
+                )
+                self._skip_reason = (
+                    f"FOK rejected {self._fok_retry_count}x @ ${ask_price:.4f}"
+                )
+                self._skip_price = ask_price
+                self._last_window_ts = current_window_ts
+                self._save_state()
+                return False
             self.logger.warning(
-                "MARTINGALE: FOK rejected for %s @ $%.4f — will retry",
+                "MARTINGALE: FOK rejected for %s @ $%.4f — retry %d/%d",
                 direction, ask_price,
+                self._fok_retry_count, max_fok_retries,
             )
             self._skip_reason = f"FOK rejected @ ${ask_price:.4f}"
             self._skip_price = ask_price
             return False
 
         if not result:
+            # Reuse the same per-window retry counter as FOK rejections
+            if self._fok_retry_window_ts != current_window_ts:
+                self._fok_retry_count = 0
+                self._fok_retry_window_ts = current_window_ts
+            self._fok_retry_count += 1
+            max_fok_retries = int(self._scfg(
+                "max_fok_retries", "martingale_max_fok_retries", 3,
+            ))
+            if self._fok_retry_count >= max_fok_retries:
+                self.logger.warning(
+                    "MARTINGALE: order failed %d/%d times for %s "
+                    "— giving up on window %d",
+                    self._fok_retry_count, max_fok_retries,
+                    direction, current_window_ts,
+                )
+                self._skip_reason = (
+                    f"order failed {self._fok_retry_count}x for {direction}"
+                )
+                self._skip_price = ask_price
+                self._last_window_ts = current_window_ts
+                self._save_state()
+                return False
             self.logger.warning(
-                "MARTINGALE: order failed for %s — will retry", direction,
+                "MARTINGALE: order failed for %s — retry %d/%d",
+                direction, self._fok_retry_count, max_fok_retries,
             )
             self._skip_reason = f"order failed for {direction}"
             self._skip_price = ask_price
