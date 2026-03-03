@@ -511,6 +511,7 @@ DEFAULT_CONFIG = {
     "martingale_start_bet": 5.0,       # starting bet size in USDC
     "martingale_max_bet": 0,           # max bet cap in USDC (0 = no limit)
     "martingale_max_streak": 0,        # stop after N consecutive losses (0 = no limit)
+    "martingale_streak_reset": True,   # reset bet to start_bet when streak recovery completes
     "martingale_recovery_candles": 10,  # number of candles to evaluate for recovery
     "martingale_recovery_green": 5,     # how many of those candles must be green to resume
     "martingale_recovery_interval": 300, # candle interval in seconds for recovery sampling
@@ -5464,6 +5465,15 @@ class MartingaleBot(threading.Thread):
         self._recovery_candle_open = None
         self._recovery_candle_ts = 0
         self.consecutive_losses = 0
+
+        # Optionally reset bet to initial size on streak recovery
+        streak_reset = self._scfg("streak_reset", "martingale_streak_reset", True)
+        # Accept truthy strings from config as well
+        if isinstance(streak_reset, str):
+            streak_reset = streak_reset.lower() in ("1", "true", "yes")
+        if streak_reset:
+            self.current_bet = self.start_bet
+
         self._save_state()
 
         msg = (
@@ -11584,10 +11594,19 @@ class CopyTraderGUI:
             entry.grid(row=row, column=1, sticky=tk.W, padx=2, pady=2)
             self._mart_entries[attr] = entry
 
+        # Checkbox: reset bet to initial when streak recovery completes
+        next_row = len(fields)
+        self.mart_e_streak_reset_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            edit_frame,
+            text="Reset bet to initial on streak recovery",
+            variable=self.mart_e_streak_reset_var,
+        ).grid(row=next_row, column=0, columnspan=2, sticky=tk.W, padx=2, pady=4)
+
         ttk.Button(
             edit_frame, text="Apply to Selected",
             command=self._mart_apply_edit,
-        ).grid(row=len(fields), column=0, columnspan=2, pady=(10, 0))
+        ).grid(row=next_row + 1, column=0, columnspan=2, pady=(10, 0))
 
         # --- Bottom: status + reset ---
         status_frame = ttk.Frame(parent)
@@ -11642,6 +11661,8 @@ class CopyTraderGUI:
             entry = self._mart_entries[attr]
             entry.delete(0, tk.END)
             entry.insert(0, str(s.get(key, default)))
+        # Load streak_reset checkbox
+        self.mart_e_streak_reset_var.set(s.get("streak_reset", True))
 
     def _mart_apply_edit(self):
         """Write the edit fields back into the selected strategy dict."""
@@ -11666,6 +11687,8 @@ class CopyTraderGUI:
                 s[key] = conv(self._mart_entries[attr].get().strip())
             except (ValueError, TypeError):
                 pass
+        # Save streak_reset checkbox
+        s["streak_reset"] = self.mart_e_streak_reset_var.get()
         self._mart_refresh_listbox()
         # Re-select the same index
         if idx < self.mart_listbox.size():
@@ -11682,6 +11705,7 @@ class CopyTraderGUI:
             "start_bet": 5.0,
             "max_bet": 0,
             "max_streak": 0,
+            "streak_reset": True,
             "poll_seconds": 10,
             "price_min": 0.40,
             "price_max": 0.55,

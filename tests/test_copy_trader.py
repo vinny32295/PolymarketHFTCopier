@@ -3683,5 +3683,34 @@ class TestMartingaleBot(unittest.TestCase):
         self.assertIn("Streak: 2", summary)
 
 
+    # -- streak_reset option --
+
+    def test_resume_from_streak_pause_resets_bet_when_streak_reset_true(self):
+        """When streak_reset is True, resuming after streak should reset bet to start_bet."""
+        mb = self._make_bot({"martingale_streak_reset": True})
+        mb.start_bet = 5.0
+        mb.current_bet = 80.0  # elevated from losses
+        mb.consecutive_losses = 4
+        mb._streak_paused = True
+        mb._streak_paused_at = None
+        mb._recovery_candles = [{"open": 0.5, "close": 0.6, "green": True}]
+        mb._resume_from_streak_pause()
+        self.assertEqual(mb.current_bet, 5.0)
+        self.assertEqual(mb.consecutive_losses, 0)
+
+    def test_resume_from_streak_pause_keeps_bet_when_streak_reset_false(self):
+        """When streak_reset is False, resuming after streak should keep the elevated bet."""
+        mb = self._make_bot({"martingale_streak_reset": False})
+        mb.start_bet = 5.0
+        mb.current_bet = 80.0
+        mb.consecutive_losses = 4
+        mb._streak_paused = True
+        mb._streak_paused_at = None
+        mb._recovery_candles = [{"open": 0.5, "close": 0.6, "green": True}]
+        mb._resume_from_streak_pause()
+        self.assertEqual(mb.current_bet, 80.0)
+        self.assertEqual(mb.consecutive_losses, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
