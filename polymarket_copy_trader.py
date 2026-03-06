@@ -2608,9 +2608,16 @@ class PolymarketCLOBClient:
         Uses a lazy-initialized web3 connection from ``rpc_url`` in config.
         This allows the CLOB client to handle approvals even when no
         TradeExecutor is available.
+
+        Returns the tx receipt on new approval, ``True`` if already approved,
+        or raises ``RuntimeError`` on failure so callers can distinguish
+        "approval succeeded" from "approval could not be set".
         """
         if not self._ensure_w3():
-            return None
+            raise RuntimeError(
+                "Web3 not available — configure rpc_url in config.json "
+                "for on-chain USDC approvals"
+            )
         try:
             spender = Web3.to_checksum_address(spender)
             usdc = self._w3.eth.contract(
@@ -2620,7 +2627,7 @@ class PolymarketCLOBClient:
                 self._account.address, spender,
             ).call()
             if current >= amount_raw:
-                return None  # already approved
+                return True  # already approved
 
             self.logger.info("Approving USDC spend for %s ...", spender)
             nonce = self._w3.eth.get_transaction_count(
@@ -2644,9 +2651,10 @@ class PolymarketCLOBClient:
                 receipt.transactionHash.hex(), receipt.status,
             )
             return receipt
+        except RuntimeError:
+            raise
         except Exception as exc:
-            self.logger.warning("ensure_usdc_approval failed: %s", exc)
-            return None
+            raise RuntimeError(f"ensure_usdc_approval failed: {exc}") from exc
 
     def ensure_ct_approval(self, neg_risk=False):
         """Approve CTF Exchange to transfer conditional tokens (ERC1155)."""
@@ -4911,37 +4919,114 @@ class MartingaleBot(threading.Thread):
         return default
 
     def _do_usdc_approval(self, spender, amount_raw, neg_risk=False):
-        """Try USDC approval via executor, then fall back to clob_client."""
-        approver = self.executor or self.clob_client
-        if not approver or not hasattr(approver, "ensure_usdc_approval"):
+        """Try USDC approval via executor, then fall back to clob_client.
+
+        Returns True only when approval is confirmed (on-chain allowance
+        is sufficient).  Returns False with a WARNING log when approval
+        could not be verified.
+        """
+        # Build ordered list of approvers to try
+        approvers = []
+        if self.executor and hasattr(self.executor, "ensure_usdc_approval"):
+            approvers.append(("TradeExecutor", self.executor))
+        if self.clob_client and hasattr(self.clob_client, "ensure_usdc_approval"):
+            approvers.append(("PolymarketCLOBClient", self.clob_client))
+
+        if not approvers:
+            self.logger.warning(
+                "MARTINGALE: no approver available — neither executor nor "
+                "clob_client has ensure_usdc_approval.  Configure rpc_url "
+                "in config.json to enable on-chain approvals."
+            )
             return False
-        try:
-            approver.ensure_usdc_approval(spender, amount_raw)
-            if neg_risk:
-                approver.ensure_usdc_approval(
-                    NEG_RISK_CTF_EXCHANGE_ADDRESS, amount_raw,
-                )
-            return True
-        except Exception as exc:
-            self.logger.debug("MARTINGALE: approval via %s failed (%s)",
-                              type(approver).__name__, exc)
-            # If executor failed, try clob_client as fallback
-            if approver is not self.clob_client and hasattr(
-                self.clob_client, "ensure_usdc_approval"
-            ):
-                try:
-                    self.clob_client.ensure_usdc_approval(spender, amount_raw)
-                    if neg_risk:
-                        self.clob_client.ensure_usdc_approval(
-                            NEG_RISK_CTF_EXCHANGE_ADDRESS, amount_raw,
-                        )
-                    return True
-                except Exception as exc2:
-                    self.logger.debug(
-                        "MARTINGALE: clob_client approval fallback failed (%s)",
-                        exc2,
+
+        last_err = None
+        for name, approver in approvers:
+            try:
+                approver.ensure_usdc_approval(spender, amount_raw)
+                if neg_risk:
+                    approver.ensure_usdc_approval(
+                        NEG_RISK_CTF_EXCHANGE_ADDRESS, amount_raw,
                     )
-            return False
+                return True
+            except Exception as exc:
+                last_err = exc
+                self.logger.warning(
+                    "MARTINGALE: approval via %s failed (%s)", name, exc,
+                )
+
+        self.logger.warning(
+            "MARTINGALE: all approval attempts failed — last error: %s. "
+            "Orders will likely fail with 'not enough balance / allowance'.",
+            last_err,
+        )
+        return False
+
+    def _diagnose_allowance(self, spender, amount_raw):
+        """Check on-chain USDC balance & allowance for diagnostics.
+
+        Returns a human-readable string describing the wallet state so
+        the log message is actionable.
+        """
+        # Try via executor first, then clob_client
+        w3 = None
+        account = None
+        for src_name, src in [("executor", self.executor),
+                              ("clob_client", self.clob_client)]:
+            if src is None:
+                continue
+            _w3 = getattr(src, "_w3", None) or getattr(src, "w3", None)
+            _acct = getattr(src, "_account", None) or getattr(src, "account", None)
+            if _w3 and _acct:
+                w3, account = _w3, _acct
+                break
+            # For clob_client, try to init web3 on the fly
+            if hasattr(src, "_ensure_w3"):
+                try:
+                    src._ensure_w3()
+                    _w3 = getattr(src, "_w3", None)
+                    _acct = getattr(src, "_account", None)
+                    if _w3 and _acct:
+                        w3, account = _w3, _acct
+                        break
+                except Exception:
+                    pass
+
+        if not w3 or not account:
+            return ("Cannot diagnose — no Web3 connection. "
+                    "Set rpc_url in config.json.")
+
+        try:
+            if Web3 is None:
+                return "Cannot diagnose — web3 package not installed."
+            usdc = w3.eth.contract(
+                address=Web3.to_checksum_address(USDC_ADDRESS), abi=ERC20_ABI,
+            )
+            balance = usdc.functions.balanceOf(account.address).call()
+            allowance = usdc.functions.allowance(
+                account.address, Web3.to_checksum_address(spender),
+            ).call()
+            bal_usdc = balance / 1_000_000
+            allow_usdc = allowance / 1_000_000
+            need_usdc = amount_raw / 1_000_000
+            parts = []
+            if balance < amount_raw:
+                parts.append(
+                    f"BALANCE TOO LOW: ${bal_usdc:.2f} USDC "
+                    f"(need ${need_usdc:.2f})"
+                )
+            else:
+                parts.append(f"Balance OK: ${bal_usdc:.2f} USDC")
+            if allowance < amount_raw:
+                parts.append(
+                    f"ALLOWANCE TOO LOW: ${allow_usdc:.2f} approved "
+                    f"(need ${need_usdc:.2f}) for {spender[:10]}..."
+                )
+            else:
+                parts.append(f"Allowance OK: ${allow_usdc:.2f}")
+            return " | ".join(parts)
+        except Exception as exc:
+            return f"Diagnosis failed: {exc}"
 
     # -- config validation --------------------------------------------------
 
@@ -5896,10 +5981,15 @@ class MartingaleBot(threading.Thread):
         if not prefetch_approval_done:
             raw_amount = int(self.current_bet * 1_000_000)
             if not self._do_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount, neg_risk=neg_risk):
+                # Approval definitively failed — diagnose the cause.
+                diag = self._diagnose_allowance(CTF_EXCHANGE_ADDRESS, raw_amount)
                 self.logger.warning(
-                    "MARTINGALE: USDC approval could not be set — order may fail. "
-                    "Configure rpc_url in config.json for on-chain approvals."
+                    "MARTINGALE [%s]: USDC approval NOT set — skipping order. %s "
+                    "Configure rpc_url in config.json for on-chain approvals.",
+                    self.strategy_name, diag,
                 )
+                self._skip_reason = "USDC approval failed"
+                return False
 
         result = self.clob_client.place_order(
             token_id=token_id,
@@ -6432,11 +6522,12 @@ class MartingaleBot(threading.Thread):
                 self.strategy_name, max_bet,
             )
         else:
+            diag = self._diagnose_allowance(CTF_EXCHANGE_ADDRESS, startup_raw)
             self.logger.warning(
                 "MARTINGALE [%s]: Could not set USDC approval at startup — "
-                "orders may fail with 'not enough balance / allowance'. "
+                "orders WILL fail. %s  "
                 "Configure rpc_url in config.json to enable on-chain approvals.",
-                self.strategy_name,
+                self.strategy_name, diag,
             )
 
         poll_slow = max(float(self._scfg("poll_seconds", "martingale_poll_seconds", 10)), 1)
@@ -9133,11 +9224,15 @@ class TradeExecutor:
         return max(amount, Decimal("0"))
 
     def ensure_usdc_approval(self, spender, amount_raw):
-        """Approve the spender for at least *amount_raw* USDC if needed."""
+        """Approve the spender for at least *amount_raw* USDC if needed.
+
+        Returns ``True`` if already approved, or the tx receipt on new
+        approval.  Raises on failure.
+        """
         spender = Web3.to_checksum_address(spender)
         current = self.usdc.functions.allowance(self.address, spender).call()
         if current >= amount_raw:
-            return None  # Already approved
+            return True  # Already approved
 
         self.logger.info("Approving USDC spend for %s ...", spender)
         tx = self.usdc.functions.approve(
