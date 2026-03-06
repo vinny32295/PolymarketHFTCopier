@@ -5096,6 +5096,12 @@ class MartingaleBot(threading.Thread):
             self.session_pnl = float(state.get("session_pnl", 0.0))
             self.direction = state.get("direction", self.direction)
             self._active_bet = state.get("active_bet")
+            # Re-register the token with the executor so the portfolio
+            # scan / auto-exit logic knows not to touch it.
+            if self._active_bet and self.executor:
+                tid = self._active_bet.get("token_id")
+                if tid:
+                    self.executor._martingale_token_ids.add(tid)
             self._last_window_ts = int(state.get("last_window_ts", 0))
             self._missed_windows = state.get("missed_windows", [])
             self._streak_paused = bool(state.get("streak_paused", False))
@@ -6151,6 +6157,10 @@ class MartingaleBot(threading.Thread):
             "window_end": self._get_window_end(),
             "ts": datetime.now().isoformat(),
         }
+        # Tell the executor this token belongs to us so it won't
+        # trigger auto-exit take-profit before the market resolves.
+        if self.executor:
+            self.executor._martingale_token_ids.add(token_id)
         self._last_window_ts = current_window_ts
         self._skip_reason = None  # bet placed successfully
         self._skip_price = None
@@ -6206,6 +6216,8 @@ class MartingaleBot(threading.Thread):
 
         self.current_bet = self.start_bet
         self.consecutive_losses = 0
+        if self.executor:
+            self.executor._martingale_token_ids.discard(bet.get("token_id"))
         self._active_bet = None
         self._save_state()
 
@@ -6263,6 +6275,8 @@ class MartingaleBot(threading.Thread):
                 f"next ${self.current_bet:.2f} (streak: {self.consecutive_losses})"
             )
 
+        if self.executor:
+            self.executor._martingale_token_ids.discard(bet.get("token_id"))
         self._active_bet = None
         self._save_state()
 
@@ -6719,6 +6733,11 @@ class TradeExecutor:
         self._proxy_address = None
         self._proxy_discovery_done = False
         self._proxy_is_safe = False  # True when proxy is a Gnosis Safe
+
+        # Token IDs currently owned by the martingale bot — skip in
+        # check_exit_conditions() and portfolio-scan seeding so the
+        # martingale bot handles its own resolution logic.
+        self._martingale_token_ids = set()
 
         # Position tracker: token_id -> {tokens, entry_price, neg_risk,
         #   condition_id, collateral_token, parent_collection_id, index_sets}
@@ -7259,6 +7278,10 @@ class TradeExecutor:
             if tokens <= 0:
                 continue
 
+            # Martingale bot owns this token — let it handle resolution
+            if token_id in self._martingale_token_ids:
+                continue
+
             current_price = self.clob_client.get_last_trade_price(token_id)
             if current_price is None:
                 self.logger.warning(
@@ -7750,6 +7773,10 @@ class TradeExecutor:
 
                 if payout_denom == 0:
                     # Not resolved on-chain — seed as active position
+                    # Skip tokens owned by the martingale bot
+                    if token_id in self._martingale_token_ids:
+                        active_seeded += 1
+                        continue
                     if token_id not in self._positions:
                         tokens = Decimal(ct_balance) / Decimal("1000000")
                         # Use the user's actual VWAP buy price from
