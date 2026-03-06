@@ -4712,6 +4712,19 @@ class MartingaleBot(threading.Thread):
         super().__init__(daemon=True, name=thread_name)
 
         self.clob_client = clob_client
+        # Validate executor type — must be a TradeExecutor (or at least have
+        # ensure_usdc_approval).  A misconfiguration can pass the clob_client
+        # as executor, which silently breaks on-chain approval calls.
+        if executor is not None and not hasattr(executor, "ensure_usdc_approval"):
+            _log = logger or logging.getLogger("martingale")
+            _log.error(
+                "MARTINGALE: executor is %s (expected TradeExecutor) — "
+                "on-chain approval/balance checks will be disabled. "
+                "Ensure an RPC URL is configured so the TradeExecutor "
+                "can be initialized.",
+                type(executor).__name__,
+            )
+            executor = None
         self.executor = executor  # TradeExecutor for on-chain ops (approval, balance)
         self.cfg = cfg
         self.logger = logger or logging.getLogger("martingale")
@@ -6321,6 +6334,16 @@ class MartingaleManager:
 
     def __init__(self, clob_client, cfg, logger=None, executor=None):
         self.clob_client = clob_client
+        # Validate executor — same guard as MartingaleBot.
+        if executor is not None and not hasattr(executor, "ensure_usdc_approval"):
+            _log = logger or logging.getLogger("martingale")
+            _log.error(
+                "MARTINGALE MANAGER: executor is %s (expected TradeExecutor) "
+                "— disabling on-chain ops.  Check that an RPC URL is "
+                "configured.",
+                type(executor).__name__,
+            )
+            executor = None
         self.executor = executor  # TradeExecutor for on-chain ops
         self.cfg = cfg
         self.logger = logger or logging.getLogger("martingale")
@@ -9864,6 +9887,13 @@ class CopyTraderBot:
 
         # ---- Start Martingale Bot(s) (independent of copy trading) ----
         if self.cfg.get("martingale_enabled") and self.clob_client:
+            if not self.executor:
+                self.logger.warning(
+                    "MARTINGALE: no TradeExecutor available — on-chain USDC "
+                    "approval cannot be set automatically.  Orders may fail "
+                    "with 'not enough balance / allowance'.  Configure an "
+                    "RPC URL (rpc_url or ws_rpc_url) to enable on-chain ops."
+                )
             self._martingale_mgr = MartingaleManager(
                 self.clob_client, self.cfg, self.logger,
                 executor=self.executor,
