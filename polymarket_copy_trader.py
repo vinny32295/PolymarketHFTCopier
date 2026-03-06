@@ -2491,6 +2491,7 @@ class PolymarketCLOBClient:
 
     def __init__(self, cfg, private_key="", logger=None):
         self.cfg = cfg
+        self._private_key = private_key  # stored for on-chain approvals
         self.base_url = CLOB_API_BASE.rstrip("/")
         self.gamma_url = GAMMA_API_BASE.rstrip("/")
         self.data_url = DATA_API_BASE.rstrip("/")
@@ -2501,6 +2502,10 @@ class PolymarketCLOBClient:
         self._token_to_neg_risk = {}  # token_id -> neg_risk flag from activity/API
         self._token_to_slug = {}  # token_id -> market slug from activity
         self._token_to_avg_entry = {}  # token_id -> VWAP entry price from activity
+
+        # Lazy-init web3 for on-chain approvals (populated by ensure_usdc_approval)
+        self._w3 = None
+        self._account = None
 
         # Authenticated CLOB client (py-clob-client SDK)
         self.clob_sdk = None
@@ -2568,6 +2573,123 @@ class PolymarketCLOBClient:
                 self.logger.info("CLOB SDK fully initialized with derived credentials")
             except Exception as exc:
                 self.logger.error("Failed to derive CLOB API credentials: %s", exc)
+
+    # ------------------------------------------------------------------
+    # On-chain USDC approval (lazy web3 init)
+    # ------------------------------------------------------------------
+
+    def _ensure_w3(self):
+        """Lazily initialize a web3 connection for on-chain approvals."""
+        if self._w3 is not None:
+            return True
+        if Web3 is None:
+            self.logger.debug("web3 not installed — cannot approve on-chain")
+            return False
+        if not self._private_key:
+            self.logger.debug("No private key — cannot approve on-chain")
+            return False
+        rpc_url = self.cfg.get("rpc_url", "")
+        if not rpc_url:
+            self.logger.debug("No rpc_url configured — cannot approve on-chain")
+            return False
+        try:
+            self._w3 = Web3(Web3.HTTPProvider(rpc_url))
+            self._w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+            self._account = self._w3.eth.account.from_key(self._private_key)
+            return True
+        except Exception as exc:
+            self.logger.warning("Failed to init web3 for approvals: %s", exc)
+            self._w3 = None
+            return False
+
+    def ensure_usdc_approval(self, spender, amount_raw):
+        """Approve *spender* to transfer USDC on behalf of the wallet.
+
+        Uses a lazy-initialized web3 connection from ``rpc_url`` in config.
+        This allows the CLOB client to handle approvals even when no
+        TradeExecutor is available.
+        """
+        if not self._ensure_w3():
+            return None
+        try:
+            spender = Web3.to_checksum_address(spender)
+            usdc = self._w3.eth.contract(
+                address=Web3.to_checksum_address(USDC_ADDRESS), abi=ERC20_ABI,
+            )
+            current = usdc.functions.allowance(
+                self._account.address, spender,
+            ).call()
+            if current >= amount_raw:
+                return None  # already approved
+
+            self.logger.info("Approving USDC spend for %s ...", spender)
+            nonce = self._w3.eth.get_transaction_count(
+                self._account.address, "pending",
+            )
+            tx = usdc.functions.approve(
+                spender, 2**256 - 1,  # max approval
+            ).build_transaction({
+                "chainId": 137,
+                "from": self._account.address,
+                "nonce": nonce,
+                "gas": 80_000,
+                "maxFeePerGas": self._w3.to_wei(50, "gwei"),
+                "maxPriorityFeePerGas": self._w3.to_wei(30, "gwei"),
+            })
+            signed = self._account.sign_transaction(tx)
+            tx_hash = self._w3.eth.send_raw_transaction(signed.raw_transaction)
+            receipt = self._w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            self.logger.info(
+                "USDC approval tx confirmed: %s (status=%s)",
+                receipt.transactionHash.hex(), receipt.status,
+            )
+            return receipt
+        except Exception as exc:
+            self.logger.warning("ensure_usdc_approval failed: %s", exc)
+            return None
+
+    def ensure_ct_approval(self, neg_risk=False):
+        """Approve CTF Exchange to transfer conditional tokens (ERC1155)."""
+        if not self._ensure_w3():
+            return None
+        try:
+            ctf_address = Web3.to_checksum_address(CONDITIONAL_TOKENS_ADDRESS)
+            ctf = self._w3.eth.contract(address=ctf_address, abi=CONDITIONAL_TOKENS_ABI)
+            exchange = (
+                NEG_RISK_CTF_EXCHANGE_ADDRESS if neg_risk
+                else CTF_EXCHANGE_ADDRESS
+            )
+            exchange = Web3.to_checksum_address(exchange)
+            if ctf.functions.isApprovedForAll(
+                self._account.address, exchange,
+            ).call():
+                return None  # already approved
+
+            self.logger.info("Approving CTF for %s ...", exchange)
+            nonce = self._w3.eth.get_transaction_count(
+                self._account.address, "pending",
+            )
+            tx = ctf.functions.setApprovalForAll(
+                exchange, True,
+            ).build_transaction({
+                "chainId": 137,
+                "from": self._account.address,
+                "nonce": nonce,
+                "gas": 80_000,
+                "maxFeePerGas": self._w3.to_wei(50, "gwei"),
+                "maxPriorityFeePerGas": self._w3.to_wei(30, "gwei"),
+            })
+            signed = self._account.sign_transaction(tx)
+            tx_hash = self._w3.eth.send_raw_transaction(signed.raw_transaction)
+            receipt = self._w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            self.logger.info(
+                "CTF approval tx confirmed: %s (status=%s)",
+                receipt.transactionHash.hex(), receipt.status,
+            )
+            return receipt
+        except Exception as exc:
+            self.logger.warning("ensure_ct_approval failed: %s", exc)
+            return None
 
     def _get_public(self, url, params=None, retries=3, backoff=2):
         """HTTP GET for public (unauthenticated) endpoints with retries."""
@@ -4788,6 +4910,39 @@ class MartingaleBot(threading.Thread):
             return self.cfg.get(config_key, default)
         return default
 
+    def _do_usdc_approval(self, spender, amount_raw, neg_risk=False):
+        """Try USDC approval via executor, then fall back to clob_client."""
+        approver = self.executor or self.clob_client
+        if not approver or not hasattr(approver, "ensure_usdc_approval"):
+            return False
+        try:
+            approver.ensure_usdc_approval(spender, amount_raw)
+            if neg_risk:
+                approver.ensure_usdc_approval(
+                    NEG_RISK_CTF_EXCHANGE_ADDRESS, amount_raw,
+                )
+            return True
+        except Exception as exc:
+            self.logger.debug("MARTINGALE: approval via %s failed (%s)",
+                              type(approver).__name__, exc)
+            # If executor failed, try clob_client as fallback
+            if approver is not self.clob_client and hasattr(
+                self.clob_client, "ensure_usdc_approval"
+            ):
+                try:
+                    self.clob_client.ensure_usdc_approval(spender, amount_raw)
+                    if neg_risk:
+                        self.clob_client.ensure_usdc_approval(
+                            NEG_RISK_CTF_EXCHANGE_ADDRESS, amount_raw,
+                        )
+                    return True
+                except Exception as exc2:
+                    self.logger.debug(
+                        "MARTINGALE: clob_client approval fallback failed (%s)",
+                        exc2,
+                    )
+            return False
+
     # -- config validation --------------------------------------------------
 
     # Map common timeframe suffixes in slug_base → expected window seconds
@@ -5350,16 +5505,8 @@ class MartingaleBot(threading.Thread):
             # Pre-run USDC approval so it's not on the critical path.
             # Use the next bet size (current_bet after potential doubling).
             neg_risk = market.get("neg_risk", False)
-            if self.executor:
-                try:
-                    raw_amount = int(self.current_bet * 2 * 1_000_000)  # approve 2x for headroom
-                    self.executor.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
-                    if neg_risk:
-                        self.executor.ensure_usdc_approval(
-                            NEG_RISK_CTF_EXCHANGE_ADDRESS, raw_amount,
-                        )
-                except Exception as exc:
-                    self.logger.debug("MARTINGALE: prefetch approval failed (%s)", exc)
+            raw_amount = int(self.current_bet * 2 * 1_000_000)  # approve 2x for headroom
+            self._do_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount, neg_risk=neg_risk)
 
             # Pre-check balance so we know early if we're short.
             balance_ok = True
@@ -5746,16 +5893,13 @@ class MartingaleBot(threading.Thread):
 
         # Ensure USDC approval — skip if prefetch already handled it.
         neg_risk = market.get("neg_risk", False)
-        if not prefetch_approval_done and self.executor:
-            try:
-                raw_amount = int(self.current_bet * 1_000_000)
-                self.executor.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
-                if neg_risk:
-                    self.executor.ensure_usdc_approval(
-                        NEG_RISK_CTF_EXCHANGE_ADDRESS, raw_amount,
-                    )
-            except Exception as exc:
-                self.logger.warning("MARTINGALE: approval failed (%s) — proceeding", exc)
+        if not prefetch_approval_done:
+            raw_amount = int(self.current_bet * 1_000_000)
+            if not self._do_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount, neg_risk=neg_risk):
+                self.logger.warning(
+                    "MARTINGALE: USDC approval could not be set — order may fail. "
+                    "Configure rpc_url in config.json for on-chain approvals."
+                )
 
         result = self.clob_client.place_order(
             token_id=token_id,
@@ -6278,6 +6422,22 @@ class MartingaleBot(threading.Thread):
             self.strategy_name, self.direction, self.current_bet,
             self.consecutive_losses,
         )
+
+        # One-time max USDC approval at startup so per-bet approvals are no-ops.
+        max_bet = float(self._scfg("max_bet", "martingale_max_bet", 0)) or 10_000
+        startup_raw = int(max_bet * 1_000_000)
+        if self._do_usdc_approval(CTF_EXCHANGE_ADDRESS, startup_raw, neg_risk=True):
+            self.logger.info(
+                "MARTINGALE [%s]: USDC approval set at startup (up to $%.0f)",
+                self.strategy_name, max_bet,
+            )
+        else:
+            self.logger.warning(
+                "MARTINGALE [%s]: Could not set USDC approval at startup — "
+                "orders may fail with 'not enough balance / allowance'. "
+                "Configure rpc_url in config.json to enable on-chain approvals.",
+                self.strategy_name,
+            )
 
         poll_slow = max(float(self._scfg("poll_seconds", "martingale_poll_seconds", 10)), 1)
         poll_fast = 1.0  # aggressive polling when looking for next bet
