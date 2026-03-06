@@ -7314,6 +7314,32 @@ class TradeExecutor:
             if reason is None:
                 continue
 
+            # --- Skip resolved markets — redemption at $1.00 beats selling ---
+            # When take-profit fires (price near $1.00), the market may have
+            # already resolved.  Selling at $0.99 minus slippage loses money
+            # vs. redeeming at $1.00.  Do a quick on-chain check if we have
+            # the condition_id cached.
+            if reason == "take-profit":
+                cond_id = pos.get("condition_id")
+                if cond_id and hasattr(self, "_resolve_condition_id"):
+                    try:
+                        _, payout_denom = self._resolve_condition_id(
+                            cond_id, neg_risk=pos.get("neg_risk", False),
+                        )
+                        if payout_denom > 0:
+                            self.logger.info(
+                                "Skipping auto-exit for %s — market already "
+                                "resolved (payoutDenom=%d), redemption will "
+                                "handle it at $1.00",
+                                token_id[:16] + "...", payout_denom,
+                            )
+                            continue
+                    except Exception as res_exc:
+                        self.logger.debug(
+                            "Resolution check failed for %s: %s",
+                            token_id[:16] + "...", res_exc,
+                        )
+
             sell_usdc = float(tokens * current_price_d)
             market_label = pos.get("market_name") or (token_id[:16] + "...")
             self.logger.warning(
@@ -10336,25 +10362,9 @@ class CopyTraderBot:
                             "Order monitor error: %s", mon_exc,
                         )
 
-                # --- Auto-exit positions at take-profit / stop-loss ---
-                # Runs even while paused so we protect existing positions.
-                # Uses its own faster timer (default 5s) independent of
-                # the poll interval to catch price moves quickly.
-                now_exit = time.time()
-                if (
-                    self.executor
-                    and now_exit - _last_exit_check >= exit_check_interval
-                ):
-                    _last_exit_check = now_exit
-                    try:
-                        self.executor.check_exit_conditions()
-                    except Exception as exit_exc:
-                        self.logger.warning(
-                            "Exit condition check error: %s", exit_exc,
-                            exc_info=True,
-                        )
-
                 # --- Auto-redeem settled positions back to USDC ---
+                # Runs BEFORE auto-exit so resolved markets get redeemed
+                # at $1.00 instead of being sold at $0.99 minus slippage.
                 # When paused (low balance) we check every 30 s so we
                 # can redeem as trades resolve and resume quickly.
                 # Otherwise checks every 5 min.
@@ -10382,6 +10392,24 @@ class CopyTraderBot:
                     except Exception as redeem_exc:
                         self.logger.warning(
                             "Redemption check error: %s", redeem_exc,
+                            exc_info=True,
+                        )
+
+                # --- Auto-exit positions at take-profit / stop-loss ---
+                # Runs even while paused so we protect existing positions.
+                # Uses its own faster timer (default 5s) independent of
+                # the poll interval to catch price moves quickly.
+                now_exit = time.time()
+                if (
+                    self.executor
+                    and now_exit - _last_exit_check >= exit_check_interval
+                ):
+                    _last_exit_check = now_exit
+                    try:
+                        self.executor.check_exit_conditions()
+                    except Exception as exit_exc:
+                        self.logger.warning(
+                            "Exit condition check error: %s", exit_exc,
                             exc_info=True,
                         )
 

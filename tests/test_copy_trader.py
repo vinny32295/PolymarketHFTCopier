@@ -1027,6 +1027,53 @@ class TestAutoExitConditions(unittest.TestCase):
         self.assertEqual(bot.TAKE_PROFIT_PRICE, Decimal("0.99"))
         self.assertEqual(bot.STOP_LOSS_PCT, Decimal("0"))
 
+    def test_take_profit_skips_resolved_market(self):
+        """When take-profit fires but the market is already resolved on-chain,
+        skip the sell and let redemption handle it at $1.00."""
+        executor = self._make_executor()
+        executor._positions["tok1"] = {
+            "tokens": Decimal("10"),
+            "entry_price": Decimal("0.50"),
+            "condition_id": "0x" + "ab" * 16,
+            "neg_risk": False,
+        }
+        executor.clob_client.get_last_trade_price.return_value = 0.99
+
+        # Mock _resolve_condition_id to say the market IS resolved
+        executor._resolve_condition_id = MagicMock(
+            return_value=("0x" + "ab" * 16, 2)
+        )
+
+        results = executor.check_exit_conditions()
+
+        # Should NOT sell — market is resolved, redemption will pay $1.00
+        self.assertEqual(results, [])
+        executor.clob_client.place_order.assert_not_called()
+        # Position should still exist for the redemption pass
+        self.assertIn("tok1", executor._positions)
+
+    def test_take_profit_sells_unresolved_market(self):
+        """When take-profit fires and the market is NOT resolved, sell normally."""
+        executor = self._make_executor()
+        executor._positions["tok1"] = {
+            "tokens": Decimal("10"),
+            "entry_price": Decimal("0.50"),
+            "condition_id": "0x" + "ab" * 16,
+            "neg_risk": False,
+        }
+        executor.clob_client.get_last_trade_price.return_value = 0.99
+
+        # Mock _resolve_condition_id to say the market is NOT resolved
+        executor._resolve_condition_id = MagicMock(
+            return_value=("0x" + "ab" * 16, 0)
+        )
+
+        results = executor.check_exit_conditions()
+
+        # Should sell — market not resolved yet
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["reason"], "take-profit")
+
 
 class TestLowBalancePauseResume(unittest.TestCase):
     """Test that the bot pauses when balance is too low and resumes at the configured threshold."""
