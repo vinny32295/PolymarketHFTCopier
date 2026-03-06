@@ -1074,6 +1074,23 @@ class TestAutoExitConditions(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["reason"], "take-profit")
 
+    def test_martingale_mode_disables_all_auto_exit(self):
+        """When martingale_enabled=True, auto-exit should never sell — wait for resolution."""
+        executor = self._make_executor()
+        executor.cfg["martingale_enabled"] = True
+        executor._positions["tok1"] = {
+            "tokens": Decimal("10"),
+            "entry_price": Decimal("0.50"),
+        }
+        executor.clob_client.get_last_trade_price.return_value = 0.99
+
+        results = executor.check_exit_conditions()
+
+        self.assertEqual(results, [])
+        executor.clob_client.place_order.assert_not_called()
+        executor.clob_client.get_last_trade_price.assert_not_called()
+        self.assertIn("tok1", executor._positions)
+
 
 class TestLowBalancePauseResume(unittest.TestCase):
     """Test that the bot pauses when balance is too low and resumes at the configured threshold."""

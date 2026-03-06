@@ -7262,6 +7262,12 @@ class TradeExecutor:
         if not self._positions:
             return []
 
+        # Martingale mode: never sell — all positions resolve on-chain.
+        # The martingale bot handles its own win/loss logic via resolution
+        # checks, and non-martingale positions should also just redeem.
+        if self.cfg.get("martingale_enabled", False):
+            return []
+
         exit_mode = self.cfg.get("exit_mode", "whale")
 
         # Read thresholds from config (fall back to module-level defaults)
