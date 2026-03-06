@@ -6216,8 +6216,10 @@ class MartingaleBot(threading.Thread):
 
         self.current_bet = self.start_bet
         self.consecutive_losses = 0
-        if self.executor:
-            self.executor._martingale_token_ids.discard(bet.get("token_id"))
+        # Keep the token in _martingale_token_ids until the position is
+        # actually redeemed/removed from _positions.  Removing it here
+        # created a window where auto-exit could try to sell the resolved
+        # position before the portfolio scan redeemed it on-chain.
         self._active_bet = None
         self._save_state()
 
@@ -6275,8 +6277,8 @@ class MartingaleBot(threading.Thread):
                 f"next ${self.current_bet:.2f} (streak: {self.consecutive_losses})"
             )
 
-        if self.executor:
-            self.executor._martingale_token_ids.discard(bet.get("token_id"))
+        # Keep the token in _martingale_token_ids until the position is
+        # actually redeemed/removed from _positions (same as _handle_win).
         self._active_bet = None
         self._save_state()
 
@@ -7958,6 +7960,14 @@ class TradeExecutor:
                 )
 
         redeemed = sum(1 for r in results if r["status"] == "redeemed")
+
+        # Prune stale entries from _martingale_token_ids: remove token IDs
+        # that are no longer tracked in _positions (already redeemed/removed).
+        if self._martingale_token_ids:
+            stale = self._martingale_token_ids - set(self._positions.keys())
+            if stale:
+                self._martingale_token_ids -= stale
+
         self.logger.info(
             "Portfolio scan complete: %d token(s) scanned — "
             "%d zero-balance, %d no-market-info, %d error(s), "
@@ -10405,9 +10415,11 @@ class CopyTraderBot:
                 # Runs even while paused so we protect existing positions.
                 # Uses its own faster timer (default 5s) independent of
                 # the poll interval to catch price moves quickly.
+                # Martingale mode: skip entirely — positions resolve on-chain.
                 now_exit = time.time()
                 if (
                     self.executor
+                    and not self.cfg.get("martingale_enabled", False)
                     and now_exit - _last_exit_check >= exit_check_interval
                 ):
                     _last_exit_check = now_exit
