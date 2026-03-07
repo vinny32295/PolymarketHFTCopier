@@ -7383,6 +7383,19 @@ class TradeExecutor:
                 })
                 continue
 
+            # Final safety: never sell a martingale-owned token even if
+            # we somehow got past the earlier guards.
+            if (token_id in self._martingale_token_ids
+                    or self.cfg.get("martingale_enabled", False)):
+                self.logger.warning(
+                    "AUTO-EXIT BLOCKED (martingale): refusing to sell %s "
+                    "(in _martingale_token_ids=%s, martingale_enabled=%s)",
+                    token_id[:16] + "...",
+                    token_id in self._martingale_token_ids,
+                    self.cfg.get("martingale_enabled", False),
+                )
+                continue
+
             # Place a SELL order for the full position
             slippage_mult = Decimal(str(self.slippage_bps)) / Decimal("10000")
             adjusted_price = float(current_price_d * (Decimal("1") - slippage_mult))
