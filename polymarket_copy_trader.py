@@ -7329,6 +7329,20 @@ class TradeExecutor:
             # the condition_id cached.
             if reason == "take-profit":
                 cond_id = pos.get("condition_id")
+                # Try to look up condition_id if not cached in position
+                if not cond_id and self.clob_client:
+                    cond_id = getattr(
+                        self.clob_client, "_token_to_condition", {},
+                    ).get(token_id)
+                if not cond_id:
+                    try:
+                        mkt = self.clob_client.get_market_by_token(token_id)
+                        if mkt:
+                            cond_id = mkt.get("condition_id")
+                            if cond_id:
+                                pos["condition_id"] = cond_id
+                    except Exception:
+                        pass
                 if cond_id and hasattr(self, "_resolve_condition_id"):
                     try:
                         _, payout_denom = self._resolve_condition_id(
@@ -7484,6 +7498,16 @@ class TradeExecutor:
                         "Auto-exit %s order failed for token %s",
                         reason, token_id[:16] + "...",
                     )
+                    # When a take-profit sell fails (e.g. market already
+                    # resolved, balance/allowance issues), fall back to
+                    # on-chain redemption which pays out at $1.00.
+                    if reason == "take-profit":
+                        redeemed = self._try_onchain_redeem(
+                            token_id, pos, reason,
+                        )
+                        if redeemed:
+                            results.append(redeemed)
+                            continue
 
         return results
 
