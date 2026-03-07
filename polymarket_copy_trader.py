@@ -2364,6 +2364,18 @@ class TelegramCommandBot:
 
     def _force_sell_position(self, executor, token_id, pos):
         """Place a market sell for a single position. Returns True on success."""
+        # Never sell martingale-owned tokens — they resolve on-chain.
+        if (token_id in executor._martingale_token_ids
+                or self.bot.cfg.get("martingale_enabled", False)):
+            self.logger.warning(
+                "FORCE SELL BLOCKED (martingale): refusing to sell %s",
+                token_id[:16] + "...",
+            )
+            self.send(
+                f"Cannot sell {pos.get('market_name') or token_id[:16]}... "
+                f"— owned by martingale strategy (resolves on-chain)."
+            )
+            return False
         tokens = pos.get("tokens", Decimal("0"))
         if tokens <= 0:
             return False
@@ -7362,6 +7374,19 @@ class TradeExecutor:
                             token_id[:16] + "...", res_exc,
                         )
 
+            # Final safety: never sell a martingale-owned token even if
+            # we somehow got past the earlier guards (covers dry_run too).
+            if (token_id in self._martingale_token_ids
+                    or self.cfg.get("martingale_enabled", False)):
+                self.logger.warning(
+                    "AUTO-EXIT BLOCKED (martingale): refusing to sell %s "
+                    "(in _martingale_token_ids=%s, martingale_enabled=%s)",
+                    token_id[:16] + "...",
+                    token_id in self._martingale_token_ids,
+                    self.cfg.get("martingale_enabled", False),
+                )
+                continue
+
             sell_usdc = float(tokens * current_price_d)
             market_label = pos.get("market_name") or (token_id[:16] + "...")
             self.logger.warning(
@@ -7395,19 +7420,6 @@ class TradeExecutor:
                     "token_id": token_id,
                     "price": float(current_price_d),
                 })
-                continue
-
-            # Final safety: never sell a martingale-owned token even if
-            # we somehow got past the earlier guards.
-            if (token_id in self._martingale_token_ids
-                    or self.cfg.get("martingale_enabled", False)):
-                self.logger.warning(
-                    "AUTO-EXIT BLOCKED (martingale): refusing to sell %s "
-                    "(in _martingale_token_ids=%s, martingale_enabled=%s)",
-                    token_id[:16] + "...",
-                    token_id in self._martingale_token_ids,
-                    self.cfg.get("martingale_enabled", False),
-                )
                 continue
 
             # Place a SELL order for the full position
@@ -9548,6 +9560,20 @@ class TradeExecutor:
                         price_f, MIN_ORDER_SIZE_TOKENS, MIN_ORDER_NOTIONAL_USDC,
                     )
                     copy_amount = Decimal(str(round(min_viable_usdc, 6)))
+
+            # --- SELL guard: never sell martingale-owned tokens ---
+            if side == "SELL" and (
+                token_id in self._martingale_token_ids
+                or self.cfg.get("martingale_enabled", False)
+            ):
+                self.logger.warning(
+                    "COPY SELL BLOCKED (martingale): refusing to sell %s "
+                    "(in _martingale_token_ids=%s, martingale_enabled=%s)",
+                    token_id[:16] + "...",
+                    token_id in self._martingale_token_ids,
+                    self.cfg.get("martingale_enabled", False),
+                )
+                return None
 
             # --- SELL guard: only sell tokens we actually hold ---
             if side == "SELL":

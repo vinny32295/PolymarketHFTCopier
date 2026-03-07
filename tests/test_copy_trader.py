@@ -1091,6 +1091,63 @@ class TestAutoExitConditions(unittest.TestCase):
         executor.clob_client.get_last_trade_price.assert_not_called()
         self.assertIn("tok1", executor._positions)
 
+    def test_martingale_token_blocks_auto_exit_even_in_dry_run(self):
+        """Martingale-owned tokens must not appear in dry_run exit results."""
+        executor = self._make_executor(dry_run=True)
+        executor._martingale_token_ids.add("tok1")
+        executor._positions["tok1"] = {
+            "tokens": Decimal("10"),
+            "entry_price": Decimal("0.50"),
+        }
+        executor.clob_client.get_last_trade_price.return_value = 0.99
+
+        results = executor.check_exit_conditions()
+
+        self.assertEqual(results, [])
+        executor.clob_client.place_order.assert_not_called()
+        self.assertIn("tok1", executor._positions)
+
+    def test_copy_sell_blocked_for_martingale_token(self):
+        """execute_copy_trade must refuse to SELL a martingale-owned token."""
+        executor = self._make_executor()
+        executor._martingale_token_ids.add("tok_mart")
+        executor._positions["tok_mart"] = {
+            "tokens": Decimal("10"),
+            "entry_price": Decimal("0.50"),
+        }
+        trade_info = {
+            "asset": "tok_mart",
+            "side": "SELL",
+            "size": 5.0,
+            "price": 0.60,
+        }
+
+        result = executor.execute_copy_trade(trade_info)
+
+        self.assertIsNone(result)
+        executor.clob_client.place_order.assert_not_called()
+        self.assertIn("tok_mart", executor._positions)
+
+    def test_copy_sell_blocked_when_martingale_enabled(self):
+        """execute_copy_trade must refuse to SELL when martingale_enabled=True."""
+        executor = self._make_executor()
+        executor.cfg["martingale_enabled"] = True
+        executor._positions["tok1"] = {
+            "tokens": Decimal("10"),
+            "entry_price": Decimal("0.50"),
+        }
+        trade_info = {
+            "asset": "tok1",
+            "side": "SELL",
+            "size": 5.0,
+            "price": 0.60,
+        }
+
+        result = executor.execute_copy_trade(trade_info)
+
+        self.assertIsNone(result)
+        executor.clob_client.place_order.assert_not_called()
+
 
 class TestLowBalancePauseResume(unittest.TestCase):
     """Test that the bot pauses when balance is too low and resumes at the configured threshold."""
