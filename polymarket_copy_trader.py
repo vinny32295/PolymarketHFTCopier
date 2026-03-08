@@ -5105,6 +5105,22 @@ class MartingaleBot(threading.Thread):
                 state = json.load(fh)
             self.current_bet = float(state.get("current_bet", self.start_bet))
             self.consecutive_losses = int(state.get("consecutive_losses", 0))
+            # Consistency guard: current_bet must match start_bet × 2^streak.
+            # A stale state file can leave these out of sync (e.g. $48 at
+            # streak 0), causing wildly wrong bet sizes.
+            expected_bet = round(self.start_bet * (2 ** self.consecutive_losses), 2)
+            max_bet = float(self._scfg("max_bet", "martingale_max_bet", 0))
+            if max_bet > 0:
+                expected_bet = min(expected_bet, max_bet)
+            if abs(self.current_bet - expected_bet) > 0.01:
+                self.logger.warning(
+                    "MARTINGALE [%s]: state mismatch — loaded bet=$%.2f but "
+                    "expected $%.2f (start=$%.2f × 2^%d) — correcting",
+                    self.strategy_name, self.current_bet, expected_bet,
+                    self.start_bet, self.consecutive_losses,
+                )
+                self.current_bet = expected_bet
+                self._save_state()
             self.session_pnl = float(state.get("session_pnl", 0.0))
             self.direction = state.get("direction", self.direction)
             self._active_bet = state.get("active_bet")
@@ -5728,14 +5744,10 @@ class MartingaleBot(threading.Thread):
         self._recovery_candle_open = None
         self._recovery_candle_ts = 0
         self.consecutive_losses = 0
-
-        # Optionally reset bet to initial size on streak recovery
-        streak_reset = self._scfg("streak_reset", "martingale_streak_reset", True)
-        # Accept truthy strings from config as well
-        if isinstance(streak_reset, str):
-            streak_reset = streak_reset.lower() in ("1", "true", "yes")
-        if streak_reset:
-            self.current_bet = self.start_bet
+        # Always reset bet to start_bet when streak resets to 0 —
+        # otherwise current_bet and consecutive_losses go out of sync
+        # (e.g. betting $48 at streak 0 instead of $3).
+        self.current_bet = self.start_bet
 
         self._save_state()
 
