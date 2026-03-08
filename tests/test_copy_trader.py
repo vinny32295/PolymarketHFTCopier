@@ -3172,6 +3172,17 @@ class TestMartingaleBot(unittest.TestCase):
         mb._skip_gap = None
         mb._miss_recorded_for_ts = 0
         mb._missed_windows = []
+        mb._bet_placed_at = None
+        mb._window_open_at = None
+        mb._last_heartbeat = 0
+        mb._heartbeat_interval = 300
+        mb._session_wins = 0
+        mb._session_losses = 0
+        mb._total_resolution_time = 0.0
+        mb._resolution_count = 0
+        mb._fok_retry_count = 0
+        mb._fok_retry_window_ts = 0
+        mb.STATE_FILE = "martingale_state.json"
         return mb
 
     # -- slug generation --

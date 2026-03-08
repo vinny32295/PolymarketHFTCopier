@@ -221,6 +221,8 @@ MARTINGALE_HISTORY_FILE = "martingale_history.json"
 MISSED_WINDOWS_FILE = "missed_windows.json"
 _MISSED_WINDOWS_LOCK = threading.Lock()
 MARTINGALE_SUMMARY_FILE = "martingale_summary.json"
+MARTINGALE_EVENTS_FILE = "martingale_events.json"
+_MARTINGALE_EVENTS_LOCK = threading.Lock()
 USER_CONFIG_FILE = "config.json"  # persists RPC URLs, proxy address, etc.
 
 # Polymarket Proxy Wallet Factory on Polygon
@@ -4904,6 +4906,16 @@ class MartingaleBot(threading.Thread):
         self._recovery_candle_open = None   # price at start of current candle
         self._recovery_candle_ts = 0    # epoch when current candle opened
 
+        # Timing metrics
+        self._bet_placed_at = None          # time.time() when bet was placed
+        self._window_open_at = None         # time.time() when we first saw the new window
+        self._last_heartbeat = 0            # time.time() of last periodic summary log
+        self._heartbeat_interval = 300      # seconds between heartbeat logs
+        self._session_wins = 0              # win count this session
+        self._session_losses = 0            # loss count this session
+        self._total_resolution_time = 0.0   # cumulative resolution wait seconds
+        self._resolution_count = 0          # number of resolved bets (for avg calc)
+
         # Callbacks (wired by CopyTraderBot)
         self.notify_callback = None
         self.log_trade_callback = None
@@ -5075,6 +5087,88 @@ class MartingaleBot(threading.Thread):
             # Auto-correct in the strategy dict so all downstream code
             # uses the right window.
             self.strategy["window"] = inferred
+
+    # -- structured event logging -------------------------------------------
+
+    def _log_event(self, event_type, **kwargs):
+        """Append a structured event to the martingale events log.
+
+        Each event is a JSON object with a timestamp, strategy name,
+        event type, and type-specific fields.  This provides a complete,
+        machine-parseable audit trail of all martingale activity.
+        """
+        event = {
+            "ts": datetime.now().isoformat(),
+            "epoch": int(time.time()),
+            "strategy": self.strategy_name,
+            "event": event_type,
+            "streak": self.consecutive_losses,
+            "current_bet": self.current_bet,
+            "session_pnl": round(self.session_pnl, 6),
+        }
+        event.update(kwargs)
+
+        try:
+            with _MARTINGALE_EVENTS_LOCK:
+                try:
+                    with open(MARTINGALE_EVENTS_FILE, "r") as fh:
+                        events = json.load(fh)
+                except (FileNotFoundError, json.JSONDecodeError):
+                    events = []
+                events.append(event)
+                # Cap at 2000 events to prevent unbounded growth
+                if len(events) > 2000:
+                    events = events[-2000:]
+                tmp = MARTINGALE_EVENTS_FILE + ".tmp"
+                with open(tmp, "w") as fh:
+                    json.dump(events, fh, indent=2, default=str)
+                os.replace(tmp, MARTINGALE_EVENTS_FILE)
+        except OSError as exc:
+            self.logger.debug("Could not write martingale event: %s", exc)
+
+    def _log_heartbeat(self):
+        """Periodically log a summary of bot health and performance.
+
+        Called each cycle; only emits a log entry every
+        ``_heartbeat_interval`` seconds.
+        """
+        now = time.time()
+        if now - self._last_heartbeat < self._heartbeat_interval:
+            return
+        self._last_heartbeat = now
+
+        avg_res = (
+            round(self._total_resolution_time / self._resolution_count, 1)
+            if self._resolution_count > 0 else 0
+        )
+        win_rate = (
+            round(self._session_wins / (self._session_wins + self._session_losses) * 100, 1)
+            if (self._session_wins + self._session_losses) > 0 else 0
+        )
+
+        status = "PAUSED" if self._streak_paused else (
+            "IN_POSITION" if self._active_bet else "HUNTING"
+        )
+
+        self.logger.info(
+            "MARTINGALE [%s] HEARTBEAT: status=%s | W/L=%d/%d (%.1f%%) | "
+            "P&L=$%.4f | bet=$%.2f | streak=%d | avg_resolution=%.1fs | "
+            "windows_attempted=%d | missed=%d",
+            self.strategy_name, status, self._session_wins,
+            self._session_losses, win_rate, self.session_pnl,
+            self.current_bet, self.consecutive_losses, avg_res,
+            self._windows_attempted, len(self._missed_windows),
+        )
+
+        self._log_event("heartbeat",
+            status=status,
+            session_wins=self._session_wins,
+            session_losses=self._session_losses,
+            win_rate_pct=win_rate,
+            avg_resolution_seconds=avg_res,
+            windows_attempted=self._windows_attempted,
+            windows_missed=len(self._missed_windows),
+        )
 
     # -- persistence --------------------------------------------------------
 
@@ -5751,12 +5845,24 @@ class MartingaleBot(threading.Thread):
 
         self._save_state()
 
+        pause_minutes = 0
+        if paused_dur:
+            try:
+                pause_minutes = int(paused_dur.strip(" ()").replace("paused for ", "").replace("m", ""))
+            except (ValueError, AttributeError):
+                pass
+
         msg = (
             f"MARTINGALE [{self.strategy_name}] RESUMED: recovery confirmed "
             f"({green_count}/{total} green candles){paused_dur} "
             f"— next bet=${self.current_bet:.2f}"
         )
         self.logger.info(msg)
+        self._log_event("streak_resume",
+            green_candles=green_count,
+            total_candles=total,
+            pause_minutes=pause_minutes,
+        )
         if self.notify_callback:
             try:
                 self.notify_callback(msg)
@@ -5789,6 +5895,11 @@ class MartingaleBot(threading.Thread):
                 f"green candles before resuming"
             )
             self.logger.warning(msg)
+            self._log_event("streak_pause",
+                max_streak=max_streak,
+                recovery_candles_needed=n_candles,
+                recovery_green_needed=n_green,
+            )
             if self.notify_callback:
                 try:
                     self.notify_callback(msg)
@@ -5840,6 +5951,12 @@ class MartingaleBot(threading.Thread):
                 "MARTINGALE [%s]: recorded missed window %d — %s%s",
                 self.strategy_name, self._last_window_ts, self._skip_reason,
                 f" ({self._skip_gap})" if self._skip_gap else "",
+            )
+            self._log_event("window_missed",
+                window_ts=self._last_window_ts,
+                reason=self._skip_reason,
+                ask_price=self._skip_price,
+                gap=self._skip_gap,
             )
         # Reset for the new window
         self._skip_reason = None
@@ -6190,6 +6307,9 @@ class MartingaleBot(threading.Thread):
         self._skip_price = None
         self._skip_gap = None
         self._windows_attempted += 1
+        self._bet_placed_at = time.time()
+        # Compute time from window open to bet placement
+        entry_latency = round(self._bet_placed_at - current_window_ts, 1)
         self._save_state()
 
         slip_tag = ""
@@ -6197,9 +6317,22 @@ class MartingaleBot(threading.Thread):
             slip_tag = f" | slip {slippage:+.4f} (${slippage_usdc:+.4f})"
         self.logger.info(
             "MARTINGALE BET [%s]: %s $%.2f @ $%.4f "
-            "(%.1f shares) — streak: %d%s",
+            "(%.1f shares) — streak: %d | entry %.1fs into window%s",
             self.strategy_name, direction, actual_cost, fill_price,
-            actual_shares, self.consecutive_losses, slip_tag,
+            actual_shares, self.consecutive_losses, entry_latency, slip_tag,
+        )
+
+        self._log_event("bet_placed",
+            direction=direction,
+            cost=round(actual_cost, 6),
+            fill_price=fill_price,
+            shares=round(actual_shares, 1),
+            ask_price=ask_price,
+            slippage=slippage,
+            slippage_usdc=slippage_usdc,
+            slug=slug,
+            entry_latency_seconds=entry_latency,
+            neg_risk=neg_risk,
         )
         if self.notify_callback:
             tg_slip = ""
@@ -6215,6 +6348,14 @@ class MartingaleBot(threading.Thread):
     def _handle_win(self, bet):
         profit = bet["shares"] - bet["cost"]
         self.session_pnl += profit
+        self._session_wins += 1
+
+        # Timing: how long from bet placement to resolution
+        resolution_seconds = 0.0
+        if self._bet_placed_at:
+            resolution_seconds = round(time.time() - self._bet_placed_at, 1)
+            self._total_resolution_time += resolution_seconds
+            self._resolution_count += 1
 
         slip = bet.get("slippage", 0)
         slip_info = ""
@@ -6223,9 +6364,20 @@ class MartingaleBot(threading.Thread):
 
         self.logger.info(
             "MARTINGALE WIN: %s +$%.4f (shares=%.1f, cost=$%.2f) — "
-            "resetting to $%.2f | session P&L: $%.4f%s",
+            "resetting to $%.2f | session P&L: $%.4f | resolved in %.1fs%s",
             bet["direction"], profit, bet["shares"], bet["cost"],
-            self.start_bet, self.session_pnl, slip_info,
+            self.start_bet, self.session_pnl, resolution_seconds, slip_info,
+        )
+
+        self._log_event("win",
+            direction=bet["direction"],
+            profit=round(profit, 6),
+            shares=round(bet["shares"], 1),
+            cost=round(bet["cost"], 6),
+            fill_price=bet.get("fill_price", 0),
+            slug=bet.get("slug", ""),
+            resolution_seconds=resolution_seconds,
+            slippage=slip,
         )
 
         self._log_bet(bet, won=True, profit=profit)
@@ -6250,6 +6402,7 @@ class MartingaleBot(threading.Thread):
     def _handle_loss(self, bet):
         loss = bet["cost"]
         self.session_pnl -= loss
+        self._session_losses += 1
         self.consecutive_losses += 1
         # Use geometric doubling from start_bet to keep the martingale
         # progression clean and predictable: start_bet × 2^streak.
@@ -6283,12 +6436,31 @@ class MartingaleBot(threading.Thread):
         if abs(slip) >= 0.0001:
             slip_info = f" | slip {slip:+.4f} (${bet.get('slippage_usdc', 0):+.4f})"
 
+        # Timing: how long from bet placement to resolution
+        resolution_seconds = 0.0
+        if self._bet_placed_at:
+            resolution_seconds = round(time.time() - self._bet_placed_at, 1)
+            self._total_resolution_time += resolution_seconds
+            self._resolution_count += 1
+
         self.logger.info(
             "MARTINGALE LOSS: %s -$%.2f (fill $%.4f) — next bet $%.2f "
-            "(start $%.2f × 2^%d), streak: %d | session P&L: $%.4f%s",
+            "(start $%.2f × 2^%d), streak: %d | session P&L: $%.4f "
+            "| resolved in %.1fs%s",
             bet["direction"], loss, bet.get("fill_price", 0),
             self.current_bet, self.start_bet, self.consecutive_losses,
-            self.consecutive_losses, self.session_pnl, slip_info,
+            self.consecutive_losses, self.session_pnl,
+            resolution_seconds, slip_info,
+        )
+
+        self._log_event("loss",
+            direction=bet["direction"],
+            loss=round(loss, 6),
+            fill_price=bet.get("fill_price", 0),
+            next_bet=self.current_bet,
+            slug=bet.get("slug", ""),
+            resolution_seconds=resolution_seconds,
+            slippage=slip,
         )
 
         self._log_bet(bet, won=False, profit=-loss)
@@ -6529,6 +6701,11 @@ class MartingaleBot(threading.Thread):
                         "MARTINGALE: resolution timeout for %s, treating as loss",
                         bet["slug"],
                     )
+                    self._log_event("resolution_timeout",
+                        slug=bet["slug"],
+                        direction=bet["direction"],
+                        elapsed_seconds=now - bet["window_end"],
+                    )
                     self._handle_loss(bet)
                 return False  # FAST poll — keep checking every 2s
 
@@ -6573,16 +6750,26 @@ class MartingaleBot(threading.Thread):
         poll_slow = max(float(self._scfg("poll_seconds", "martingale_poll_seconds", 10)), 1)
         poll_fast = 1.0  # aggressive polling when looking for next bet
 
+        self._log_event("bot_started",
+            direction=self.direction,
+            start_bet=self.start_bet,
+            slug_base=self._scfg("slug_base", "martingale_slug_base", ""),
+            window=int(self._scfg("window", "martingale_window", 300)),
+        )
+
         while not self._stop_event.is_set():
             try:
                 in_position = self._cycle()
+                self._log_heartbeat()
             except Exception as exc:
                 self.logger.error("Martingale error: %s", exc, exc_info=True)
+                self._log_event("error", error=str(exc))
                 in_position = False
             self._stop_event.wait(
                 timeout=poll_slow if in_position else poll_fast,
             )
 
+        self._log_event("bot_stopped")
         self.logger.info("Martingale bot stopped")
 
     def stop(self):
