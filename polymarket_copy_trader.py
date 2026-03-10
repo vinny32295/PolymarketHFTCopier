@@ -517,6 +517,9 @@ DEFAULT_CONFIG = {
     "martingale_recovery_candles": 10,  # number of candles to evaluate for recovery
     "martingale_recovery_green": 5,     # how many of those candles must be green to resume
     "martingale_recovery_interval": 300, # candle interval in seconds for recovery sampling
+    "martingale_streak_confirm_at": 7,    # require trend confirmation before betting at this streak level (0 = disabled)
+    "martingale_streak_confirm_green": 2, # green candles needed out of confirm_total
+    "martingale_streak_confirm_total": 3, # total candles to sample for confirmation
     "martingale_slug_base": "btc-updown-5m",  # slug prefix for the market
     "martingale_window": 300,          # window size in seconds (300 = 5 min)
     "martingale_poll_seconds": 10,     # how often to check for resolution
@@ -4906,6 +4909,12 @@ class MartingaleBot(threading.Thread):
         self._recovery_candle_open = None   # price at start of current candle
         self._recovery_candle_ts = 0    # epoch when current candle opened
 
+        # Streak-level trend confirmation (e.g. 2/3 candles green before betting at streak 7)
+        self._streak_confirming = False        # True when waiting for trend confirmation
+        self._streak_confirm_candles = []      # list of {"open": px, "close": px, "green": bool}
+        self._streak_confirm_candle_open = None
+        self._streak_confirm_candle_ts = 0
+
         # Timing metrics
         self._bet_placed_at = None          # time.time() when bet was placed
         self._window_open_at = None         # time.time() when we first saw the new window
@@ -5184,6 +5193,8 @@ class MartingaleBot(threading.Thread):
             "streak_paused": self._streak_paused,
             "streak_paused_at": self._streak_paused_at.isoformat() if self._streak_paused_at else None,
             "recovery_candles": self._recovery_candles[-20:],
+            "streak_confirming": self._streak_confirming,
+            "streak_confirm_candles": self._streak_confirm_candles[-10:],
         }
         try:
             tmp = self.STATE_FILE + ".tmp"
@@ -5234,6 +5245,33 @@ class MartingaleBot(threading.Thread):
                 except (ValueError, TypeError):
                     self._streak_paused_at = None
             self._recovery_candles = state.get("recovery_candles", [])
+            self._streak_confirming = bool(state.get("streak_confirming", False))
+            self._streak_confirm_candles = state.get("streak_confirm_candles", [])
+
+            # On restart while confirming, reset candle sampling so we
+            # start fresh with current market prices.
+            if self._streak_confirming:
+                self._streak_confirm_candle_open = None
+                self._streak_confirm_candle_ts = 0
+                n_total = int(self._scfg(
+                    "streak_confirm_total", "martingale_streak_confirm_total", 3))
+                n_green = int(self._scfg(
+                    "streak_confirm_green", "martingale_streak_confirm_green", 2))
+                # Prune stale confirm candles
+                interval = int(self._scfg(
+                    "recovery_interval", "martingale_recovery_interval", 300))
+                cutoff = int(time.time()) - (n_total * interval)
+                self._streak_confirm_candles = [
+                    c for c in self._streak_confirm_candles
+                    if c.get("ts", 0) >= cutoff
+                ]
+                green = sum(1 for c in self._streak_confirm_candles if c["green"])
+                self.logger.info(
+                    "MARTINGALE [%s]: streak confirmation on restart: "
+                    "%d/%d candles (%d green, need %d/%d)",
+                    self.strategy_name, len(self._streak_confirm_candles),
+                    n_total, green, n_green, n_total,
+                )
 
             # On restart while paused, prune recovery candles that are
             # outside the lookback window so the bot evaluates recent
@@ -5279,7 +5317,9 @@ class MartingaleBot(threading.Thread):
                 self.current_bet, self.consecutive_losses,
                 self.session_pnl, self.direction, self._last_window_ts,
                 len(self._missed_windows),
-                " [PAUSED — waiting for recovery]" if self._streak_paused else "",
+                " [PAUSED — waiting for recovery]" if self._streak_paused
+                else " [CONFIRMING — waiting for trend]" if self._streak_confirming
+                else "",
             )
 
             # Discard stale active bets from a previous session.
@@ -5869,6 +5909,114 @@ class MartingaleBot(threading.Thread):
             except Exception:
                 pass
 
+    # -- streak-level trend confirmation ------------------------------------
+
+    def _check_streak_confirmation(self):
+        """Sample candles to confirm the trend before placing a high-streak bet.
+
+        Called each cycle while ``_streak_confirming`` is True.  Returns True
+        when the confirmation condition is met (e.g. 2 out of 3 candles green),
+        meaning the bot should proceed to place the bet.
+
+        Uses the same candle logic as recovery sampling but with its own
+        (typically shorter) window: confirm_total candles, confirm_green needed.
+        """
+        interval = int(self._scfg(
+            "recovery_interval", "martingale_recovery_interval", 300))
+        n_total = int(self._scfg(
+            "streak_confirm_total", "martingale_streak_confirm_total", 3))
+        n_green = int(self._scfg(
+            "streak_confirm_green", "martingale_streak_confirm_green", 2))
+
+        # Get a token_id to sample — use the current window's market
+        slug = self._generate_slug()
+        market = self._fetch_market(slug)
+        if not market:
+            return False
+
+        direction = self._scfg("direction", "martingale_direction", self.direction)
+        token_id = (
+            market["up_token"] if direction == "Up"
+            else market["down_token"]
+        )
+        price, _ = self._get_best_ask(token_id)
+        if not price or price <= 0:
+            return False
+
+        now = int(time.time())
+
+        if self._streak_confirm_candle_ts == 0 or (now - self._streak_confirm_candle_ts) >= interval:
+            # Close the previous candle if one was open
+            if self._streak_confirm_candle_open is not None and self._streak_confirm_candle_ts > 0:
+                candle = {
+                    "open": self._streak_confirm_candle_open,
+                    "close": price,
+                    "green": price >= self._streak_confirm_candle_open,
+                    "ts": self._streak_confirm_candle_ts,
+                }
+                self._streak_confirm_candles.append(candle)
+                # Keep only the last N candles
+                self._streak_confirm_candles = self._streak_confirm_candles[-n_total:]
+                self._save_state()
+
+                green_count = sum(1 for c in self._streak_confirm_candles if c["green"])
+                total = len(self._streak_confirm_candles)
+                color = "GREEN" if candle["green"] else "RED"
+                self.logger.info(
+                    "MARTINGALE [%s] streak confirmation candle: %s (%.4f → %.4f) "
+                    "— %d/%d green (%d needed from %d candles)",
+                    self.strategy_name, color, candle["open"], candle["close"],
+                    green_count, total, n_green, n_total,
+                )
+
+                if total >= n_total and green_count >= n_green:
+                    return True
+
+                # If we have enough candles but NOT enough green, reset and
+                # start sampling fresh — trend not confirmed yet.
+                if total >= n_total:
+                    self.logger.info(
+                        "MARTINGALE [%s] streak confirmation failed (%d/%d green) "
+                        "— resetting candles, will re-sample",
+                        self.strategy_name, green_count, n_total,
+                    )
+                    self._streak_confirm_candles = []
+                    self._save_state()
+
+            # Open a new candle
+            self._streak_confirm_candle_open = price
+            self._streak_confirm_candle_ts = now
+
+        return False
+
+    def _resume_from_streak_confirmation(self):
+        """Clear confirmation state after trend is confirmed — proceed to bet."""
+        green_count = sum(1 for c in self._streak_confirm_candles if c["green"])
+        total = len(self._streak_confirm_candles)
+
+        self._streak_confirming = False
+        self._streak_confirm_candles = []
+        self._streak_confirm_candle_open = None
+        self._streak_confirm_candle_ts = 0
+        self._save_state()
+
+        msg = (
+            f"MARTINGALE [{self.strategy_name}] TREND CONFIRMED at streak "
+            f"{self.consecutive_losses}: {green_count}/{total} candles green "
+            f"— proceeding with ${self.current_bet:.2f} bet"
+        )
+        self.logger.info(msg)
+        self._log_event("streak_confirm_passed",
+            streak=self.consecutive_losses,
+            green_candles=green_count,
+            total_candles=total,
+        )
+        if self.notify_callback:
+            try:
+                self.notify_callback(msg)
+            except Exception:
+                pass
+
     # -- bet placement & result handling ------------------------------------
 
     def _try_place_bet(self):
@@ -5909,6 +6057,44 @@ class MartingaleBot(threading.Thread):
 
         if self._streak_paused:
             return False  # recovery check happens in _cycle()
+
+        # Trend confirmation gate — at a configurable streak level (default 7),
+        # require N-of-M candles in our direction before placing the next bet.
+        confirm_at = int(self._scfg(
+            "streak_confirm_at", "martingale_streak_confirm_at", 7))
+        if (confirm_at > 0
+                and self.consecutive_losses >= confirm_at
+                and not self._streak_confirming):
+            self._streak_confirming = True
+            self._streak_confirm_candles = []
+            self._streak_confirm_candle_open = None
+            self._streak_confirm_candle_ts = 0
+            self._save_state()
+            n_total = int(self._scfg(
+                "streak_confirm_total", "martingale_streak_confirm_total", 3))
+            n_green = int(self._scfg(
+                "streak_confirm_green", "martingale_streak_confirm_green", 2))
+            msg = (
+                f"MARTINGALE [{self.strategy_name}] CONFIRMING: streak "
+                f"{self.consecutive_losses} hit — waiting for {n_green}/{n_total} "
+                f"candles in our direction before placing ${self.current_bet:.2f} bet"
+            )
+            self.logger.warning(msg)
+            self._log_event("streak_confirm_start",
+                streak=self.consecutive_losses,
+                confirm_green_needed=n_green,
+                confirm_total=n_total,
+                pending_bet=self.current_bet,
+            )
+            if self.notify_callback:
+                try:
+                    self.notify_callback(msg)
+                except Exception:
+                    pass
+            return False
+
+        if self._streak_confirming:
+            return False  # confirmation check happens in _cycle()
 
         # Safety: max bet
         max_bet = float(self._scfg("max_bet", "martingale_max_bet", 0))
@@ -6392,6 +6578,11 @@ class MartingaleBot(threading.Thread):
 
         self.current_bet = self.start_bet
         self.consecutive_losses = 0
+        # Clear any in-progress trend confirmation
+        self._streak_confirming = False
+        self._streak_confirm_candles = []
+        self._streak_confirm_candle_open = None
+        self._streak_confirm_candle_ts = 0
         # Keep the token in _martingale_token_ids until the position is
         # actually redeemed/removed from _positions.  Removing it here
         # created a window where auto-exit could try to sell the resolved
@@ -6720,6 +6911,13 @@ class MartingaleBot(threading.Thread):
                 if self._check_streak_recovery():
                     self._resume_from_streak_pause()
                 return False  # keep fast-polling to sample prices
+            # While confirming trend at high streak, sample candles
+            if self._streak_confirming:
+                if self._check_streak_confirmation():
+                    self._resume_from_streak_confirmation()
+                    # Confirmation passed — fall through to _try_place_bet
+                else:
+                    return False  # keep fast-polling to sample prices
             placed = self._try_place_bet()
             return placed  # fast poll until placed, then slow poll
 
