@@ -4900,6 +4900,8 @@ class MartingaleBot(threading.Thread):
         self._miss_recorded_for_ts = 0  # last window_ts we recorded a miss for (dedup)
         self._fok_retry_count = 0       # FOK rejection retries within current window
         self._fok_retry_window_ts = 0   # window_ts the retry counter belongs to
+        self._fok_net_err_count = 0     # FOK network errors within current window
+        self._fok_net_err_window_ts = 0 # window_ts the net-error counter belongs to
         self._windows_attempted = 0     # windows where we tried to bet
         self._windows_no_market = 0     # market slug not found on Gamma API
         self._missed_windows = []       # windows skipped due to price/book/balance
@@ -4930,6 +4932,9 @@ class MartingaleBot(threading.Thread):
         self._session_losses = 0            # loss count this session
         self._total_resolution_time = 0.0   # cumulative resolution wait seconds
         self._resolution_count = 0          # number of resolved bets (for avg calc)
+        self._fok_network_errors = 0        # FOK network errors this session
+        self._fok_rejections = 0            # FOK clean rejections this session
+        self._phantom_fills = 0             # phantom fills detected this session
 
         # Callbacks (wired by CopyTraderBot)
         self.notify_callback = None
@@ -5172,11 +5177,14 @@ class MartingaleBot(threading.Thread):
         self.logger.info(
             "MARTINGALE [%s] HEARTBEAT: status=%s | W/L=%d/%d (%.1f%%) | "
             "P&L=$%.4f | bet=$%.2f | streak=%d | avg_resolution=%.1fs | "
-            "windows_attempted=%d | missed=%d",
+            "windows_attempted=%d | missed=%d | "
+            "fok_errors=%d | fok_rejects=%d | phantom_fills=%d",
             self.strategy_name, status, self._session_wins,
             self._session_losses, win_rate, self.session_pnl,
             self.current_bet, self.consecutive_losses, avg_res,
             self._windows_attempted, len(self._missed_windows),
+            self._fok_network_errors, self._fok_rejections,
+            self._phantom_fills,
         )
 
         self._log_event("heartbeat",
@@ -5187,6 +5195,9 @@ class MartingaleBot(threading.Thread):
             avg_resolution_seconds=avg_res,
             windows_attempted=self._windows_attempted,
             windows_missed=len(self._missed_windows),
+            fok_network_errors=self._fok_network_errors,
+            fok_rejections=self._fok_rejections,
+            phantom_fills=self._phantom_fills,
         )
 
     # -- persistence --------------------------------------------------------
@@ -6409,10 +6420,32 @@ class MartingaleBot(threading.Thread):
         # order but the HTTP response was lost.  Check on-chain balance
         # before retrying to avoid placing a duplicate bet.
         if isinstance(result, dict) and result.get("status") == "network_error":
+            self._fok_network_errors += 1
+            # Track per-window network error count
+            if self._fok_net_err_window_ts != current_window_ts:
+                self._fok_net_err_count = 0
+                self._fok_net_err_window_ts = current_window_ts
+            self._fok_net_err_count += 1
+            max_net_retries = int(self._scfg(
+                "max_net_error_retries", "martingale_max_net_error_retries", 1,
+            ))
             self.logger.warning(
                 "MARTINGALE: FOK network error for %s @ $%.4f — "
-                "checking for phantom fill on-chain (pre-balance: %.1f raw)",
+                "checking for phantom fill on-chain (pre-balance: %.1f raw) "
+                "[window_net_err=%d/%d, session=%d]",
                 direction, ask_price, _pre_order_balance,
+                self._fok_net_err_count, max_net_retries,
+                self._fok_network_errors,
+            )
+            self._log_event("fok_network_error",
+                direction=direction,
+                ask_price=ask_price,
+                slug=slug,
+                pre_balance_raw=_pre_order_balance,
+                window_net_errors=self._fok_net_err_count,
+                max_net_retries=max_net_retries,
+                network_errors_session=self._fok_network_errors,
+                reason=result.get("reason", ""),
             )
             time.sleep(2)  # allow on-chain settlement
             raw_balance = self._check_phantom_fill(
@@ -6426,12 +6459,24 @@ class MartingaleBot(threading.Thread):
                     Decimal(raw_delta) / Decimal("1000000")
                 )
                 actual_cost = round(actual_shares * ask_price, 6)
+                self._phantom_fills += 1
                 self.logger.warning(
                     "MARTINGALE: PHANTOM FILL DETECTED — %.1f new shares "
                     "(delta) of token %s on-chain (expected ~%.1f, "
-                    "pre-balance: %.1f raw). Treating as successful fill.",
+                    "pre-balance: %.1f raw). Treating as successful fill. "
+                    "[phantom_fills=%d this session]",
                     actual_shares, token_id[:16] + "...", target_shares,
-                    _pre_order_balance,
+                    _pre_order_balance, self._phantom_fills,
+                )
+                self._log_event("phantom_fill_detected",
+                    direction=direction,
+                    ask_price=ask_price,
+                    slug=slug,
+                    actual_shares=round(actual_shares, 1),
+                    actual_cost=round(actual_cost, 6),
+                    pre_balance_raw=_pre_order_balance,
+                    post_balance_raw=raw_balance,
+                    phantom_fills_session=self._phantom_fills,
                 )
                 # Synthetic result so the success path below works
                 result = {
@@ -6442,10 +6487,40 @@ class MartingaleBot(threading.Thread):
                     "_phantom_fill": True,
                 }
             else:
+                # No phantom fill detected.  If we've already hit the
+                # per-window network-error cap, give up on this window
+                # to prevent duplicate bets (the orders may be settling
+                # slower than the 2 s check).
+                if self._fok_net_err_count >= max_net_retries:
+                    self.logger.warning(
+                        "MARTINGALE: no phantom fill (delta=0, post=%d, pre=%d) "
+                        "AND hit network-error cap (%d/%d) — SKIPPING window %d "
+                        "to avoid duplicate bets",
+                        raw_balance, _pre_order_balance,
+                        self._fok_net_err_count, max_net_retries,
+                        current_window_ts,
+                    )
+                    self._log_event("fok_network_error_cap",
+                        direction=direction,
+                        ask_price=ask_price,
+                        slug=slug,
+                        window_net_errors=self._fok_net_err_count,
+                        max_net_retries=max_net_retries,
+                        window_ts=current_window_ts,
+                    )
+                    self._skip_reason = (
+                        f"network error cap ({self._fok_net_err_count}x) "
+                        f"@ ${ask_price:.4f}"
+                    )
+                    self._skip_price = ask_price
+                    self._last_window_ts = current_window_ts
+                    self._save_state()
+                    return False
                 self.logger.info(
                     "MARTINGALE: no phantom fill (delta=0, post=%d, pre=%d) — "
-                    "will retry next poll",
+                    "will retry next poll (%d/%d net errors this window)",
                     raw_balance, _pre_order_balance,
+                    self._fok_net_err_count, max_net_retries,
                 )
                 self._skip_reason = (
                     f"network error (no phantom fill) @ ${ask_price:.4f}"
@@ -6456,6 +6531,7 @@ class MartingaleBot(threading.Thread):
         if isinstance(result, dict) and (
             result.get("status") == "fok_rejected" or result.get("error")
         ):
+            self._fok_rejections += 1
             # Track per-window FOK retries
             if self._fok_retry_window_ts != current_window_ts:
                 self._fok_retry_count = 0
@@ -6470,10 +6546,23 @@ class MartingaleBot(threading.Thread):
             if max_entry > 0 and seconds_into_retry > max_entry:
                 self.logger.warning(
                     "MARTINGALE: FOK rejected %d times for %s @ $%.4f "
-                    "— out of time (%ds > %ds) on window %d",
+                    "— out of time (%ds > %ds) on window %d "
+                    "[rejections=%d this session]",
                     self._fok_retry_count,
                     direction, ask_price,
                     seconds_into_retry, max_entry, current_window_ts,
+                    self._fok_rejections,
+                )
+                self._log_event("fok_rejected_timeout",
+                    direction=direction,
+                    ask_price=ask_price,
+                    slug=slug,
+                    retries=self._fok_retry_count,
+                    seconds_into_window=seconds_into_retry,
+                    max_entry_seconds=max_entry,
+                    window_ts=current_window_ts,
+                    rejections_session=self._fok_rejections,
+                    reason=result.get("reason", ""),
                 )
                 self._skip_reason = (
                     f"FOK rejected {self._fok_retry_count}x @ ${ask_price:.4f}"
@@ -6484,10 +6573,20 @@ class MartingaleBot(threading.Thread):
                 return False
             self.logger.warning(
                 "MARTINGALE: FOK rejected for %s @ $%.4f — retry %d "
-                "(%ds left in window)",
+                "(%ds left in window) [rejections=%d this session]",
                 direction, ask_price,
                 self._fok_retry_count,
                 max(0, max_entry - seconds_into_retry),
+                self._fok_rejections,
+            )
+            self._log_event("fok_rejected",
+                direction=direction,
+                ask_price=ask_price,
+                slug=slug,
+                retry_num=self._fok_retry_count,
+                seconds_left=max(0, max_entry - seconds_into_retry),
+                rejections_session=self._fok_rejections,
+                reason=result.get("reason", ""),
             )
             self._skip_reason = f"FOK rejected @ ${ask_price:.4f}"
             self._skip_price = ask_price
