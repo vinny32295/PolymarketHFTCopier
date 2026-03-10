@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-Polymarket Copy Trader Bot
-==========================
-Monitors specified trader wallet addresses on Polymarket (Polygon network)
-and automatically replicates their trades using the bot operator's wallet.
+Polymarket Martingale Bot
+=========================
+Automated martingale betting strategy on Polymarket binary markets.
 
 Features:
 - Tkinter GUI for configuration and monitoring
-- Real-time WebSocket-based transaction monitoring
-- Polymarket CLOB API integration as primary data source
-- On-chain fallback monitoring via Web3.py
-- Configurable copy percentage and trade scaling
+- Polymarket CLOB API integration for order placement
+- Multi-strategy martingale with independent parameters
+- Streak-pause and recovery logic
 - Persistent JSON configuration
 - Comprehensive logging (file, console, GUI)
+- Telegram command bot for remote control
 """
 
 import json
@@ -194,9 +193,6 @@ MIN_ORDER_NOTIONAL_USDC = 1.05  # slightly above $1 to stay above min after fees
 # balance recovers to at least the resume threshold.
 LOW_BALANCE_PAUSE_THRESHOLD = Decimal("1.05")   # can't even fill the smallest order
 
-# Auto-exit thresholds for open positions
-TAKE_PROFIT_PRICE = Decimal("0.99")   # sell near top instead of waiting for resolution
-STOP_LOSS_PCT = Decimal("0")          # disabled — follow whale's hold-to-resolution strategy
 
 # Polymarket CLOB API base URL
 CLOB_API_BASE = "https://clob.polymarket.com"
@@ -463,24 +459,13 @@ DEFAULT_CONFIG = {
     "rpc_url": "",
     "ws_rpc_url": "",
     "private_key_file": ".private_key",
-    "watched_addresses": [],
-    "copy_percentage": 50,
-    "max_trade_usdc": 100.0,
-    "slippage_tolerance_bps": 50,
     "gas_multiplier": 1.2,
-    "poll_interval_seconds": 5,
     "use_clob_api": True,
     "clob_api_key": "",
     "clob_api_secret": "",
     "clob_api_passphrase": "",
     "dry_run": False,
-    "order_ttl_seconds": 60,
     "resume_threshold_usdc": 5.0,
-    "take_profit_price": 0.99,
-    "take_profit_pct": 0,
-    "stop_loss_pct": 0,
-    "exit_check_seconds": 5,
-    "exit_mode": "whale",
     "auto_redeem_settled": True,
     "proxy_redeem": True,
     "proxy_withdraw": True,
@@ -488,23 +473,7 @@ DEFAULT_CONFIG = {
     "webhook_url": "",
     "telegram_bot_token": "",
     "telegram_chat_id": "",
-    "max_price_deviation_pct": 3,
     "max_loss_usdc": 0,
-    "trade_max_age_seconds": 20,
-    # --- Arbitrage mode (binary market spread capture) ---
-    "arb_enabled": False,
-    "arb_condition_ids": [],          # condition IDs of binary markets to monitor
-    "arb_dynamic_slug": "",           # DEPRECATED — single slug (kept for backward compat)
-    "arb_dynamic_window": 300,        # DEPRECATED — window for single slug (kept for compat)
-    "arb_dynamic_slugs": [],          # list of {"slug": str, "window": int, "format": str}
-                                      #   format: "timestamp" (default) or "hourly"
-                                      #   e.g. [{"slug": "btc-updown-15m", "window": 900},
-                                      #         {"slug": "ethereum-up-or-down", "window": 3600, "format": "hourly"}]
-    "arb_min_edge_pct": 1.0,         # minimum spread % to trigger (e.g. 1.0 = 1%)
-    "arb_size_usdc": 10.0,           # USDC to spend per side of each arb trade
-    "arb_max_positions": 5,           # max simultaneous arb positions
-    "arb_poll_seconds": 1,            # how often to scan orderbooks
-    "arb_log_interval": 5,            # seconds between INFO-level arb scan logs
     # --- Martingale mode (double-on-loss binary market betting) ---
     "martingale_enabled": False,
     "martingale_direction": "Up",      # "Up" or "Down"
@@ -536,15 +505,8 @@ DEFAULT_CONFIG = {
 # Sensitive secrets (private key, API keys) are excluded.
 _PERSISTENT_CONFIG_KEYS = [
     "rpc_url", "ws_rpc_url", "proxy_address",
-    "watched_addresses", "copy_percentage", "max_trade_usdc",
-    "slippage_tolerance_bps", "poll_interval_seconds", "order_ttl_seconds",
-    "resume_threshold_usdc", "take_profit_price", "take_profit_pct",
-    "stop_loss_pct", "max_loss_usdc", "exit_check_seconds", "exit_mode",
+    "resume_threshold_usdc", "max_loss_usdc",
     "dry_run", "auto_redeem_settled", "proxy_redeem", "proxy_withdraw",
-    "max_price_deviation_pct", "trade_max_age_seconds",
-    "arb_enabled", "arb_condition_ids", "arb_dynamic_slug",
-    "arb_dynamic_window", "arb_dynamic_slugs", "arb_min_edge_pct",
-    "arb_size_usdc", "arb_max_positions", "arb_poll_seconds",
     "webhook_url",
     "telegram_bot_token", "telegram_chat_id",
     "martingale_enabled", "martingale_direction", "martingale_start_bet",
@@ -591,7 +553,7 @@ def save_user_config(cfg):
 
 def setup_logging(gui_handler=None):
     """Configure logging to file, console, and optionally a GUI handler."""
-    logger = logging.getLogger("CopyTrader")
+    logger = logging.getLogger("MartingaleBot")
     logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
 
@@ -623,7 +585,6 @@ def setup_logging(gui_handler=None):
 # ---------------------------------------------------------------------------
 # Configuration helpers
 # ---------------------------------------------------------------------------
-
 
 
 def load_private_key(cfg):
@@ -801,7 +762,7 @@ class TelegramCommandBot:
     def __init__(self, token, chat_id, bot_ref, logger):
         self.token = token
         self.chat_id = str(chat_id)
-        self.bot = bot_ref          # CopyTraderBot instance
+        self.bot = bot_ref          # MartingaleEngine instance
         self.logger = logger
         self._stop_event = threading.Event()
         self._thread = None
@@ -889,61 +850,30 @@ class TelegramCommandBot:
             self.logger.warning("Telegram flush failed: %s", exc)
 
     def _register_commands(self):
-        """Register all commands with Telegram via setMyCommands so they
-        appear in the '/' command menu and are recognized by the client."""
-        commands = [
-            ("balance", "Current USDC & MATIC balances"),
-            ("positions", "Open positions with floating P&L"),
-            ("trades", "Recent trade history (last 10)"),
-            ("stats", "Stats by timeframe (1D 7D 30D ALL)"),
-            ("strategies", "Martingale strategy status"),
-            ("status", "Bot state, session P&L, uptime"),
-            ("chart", "Equity P&L chart (add 'session' for current)"),
-            ("missed", "Missed windows (1D 7D 30D ALL)"),
-            ("stop", "Stop the bot gracefully"),
-            ("pause", "Pause trading (keep monitoring)"),
-            ("resume", "Resume trading after pause"),
-            ("kill", "Emergency kill switch"),
-            ("toggle_arb", "Toggle arb mode on/off"),
-            ("toggle_martingale", "Toggle martingale on/off"),
-            ("toggle_copy", "Toggle copy trading on/off"),
-            ("dry_run", "Toggle dry run mode on/off"),
-            ("set_max_bet", "Set max bet size in USDC"),
-            ("set_copy_pct", "Set copy percentage (0-100)"),
-            ("set_max_trade", "Set max trade size in USDC"),
-            ("set_min_edge", "Set minimum arb edge %"),
-            ("set_max_loss", "Set max loss threshold in USDC"),
-            ("set_exit", "Set exit strategy (whale|auto)"),
-            ("sell", "Force sell position(s)"),
-            ("reset_martingale", "Reset streak & bet size"),
-            ("redeem", "Scan & redeem resolved positions"),
-            ("help", "List available commands"),
-        ]
+        """Register bot commands with Telegram for the command menu."""
         try:
             url = TELEGRAM_API.format(token=self.token) + "/setMyCommands"
-            payload = {
-                "commands": [
-                    {"command": cmd, "description": desc}
-                    for cmd, desc in commands
-                ]
-            }
-            resp = requests.post(url, json=payload, timeout=10)
-            if resp.status_code == 200 and resp.json().get("ok"):
-                self.logger.info("Telegram commands registered (%d commands)", len(commands))
-            else:
-                self.logger.warning("Failed to register Telegram commands: %s", resp.text)
+            commands = [
+                {"command": "balance", "description": "USDC & MATIC balances"},
+                {"command": "positions", "description": "Open positions"},
+                {"command": "trades", "description": "Recent trade history"},
+                {"command": "stats", "description": "W/L record, P&L, ROI"},
+                {"command": "strategies", "description": "Per-strategy diagnostic"},
+                {"command": "status", "description": "Bot running state"},
+                {"command": "missed", "description": "Missed windows"},
+                {"command": "chart", "description": "Equity curve"},
+                {"command": "help", "description": "Available commands"},
+                {"command": "stop", "description": "Graceful shutdown"},
+                {"command": "toggle_martingale", "description": "Toggle martingale on/off"},
+                {"command": "set_max_bet", "description": "Set max bet"},
+                {"command": "reset_martingale", "description": "Reset streak & bet"},
+                {"command": "redeem", "description": "Scan & redeem settled"},
+            ]
+            resp = requests.post(url, json={"commands": commands}, timeout=10)
+            if resp.status_code == 200:
+                self.logger.debug("Telegram commands registered")
         except Exception as exc:
-            self.logger.warning("Could not register Telegram commands: %s", exc)
-
-    def stop(self):
-        self._stop_event.set()
-        self.logger.info("Telegram command bot stopped")
-
-    def send(self, text, parse_mode=None):
-        """Send a message to the configured chat."""
-        send_telegram(self.token, self.chat_id, text, self.logger, parse_mode)
-
-    # -- polling loop -------------------------------------------------------
+            self.logger.debug("Failed to register commands: %s", exc)
 
     def _poll_loop(self):
         base = TELEGRAM_API.format(token=self.token)
@@ -1013,19 +943,12 @@ class TelegramCommandBot:
             "/resume": self._cmd_resume,
             "/kill": self._cmd_kill,
             # -- Toggles --
-            "/toggle_arb": self._cmd_toggle_arb,
             "/toggle_martingale": self._cmd_toggle_martingale,
-            "/toggle_copy": self._cmd_toggle_copy,
             "/dry_run": self._cmd_dry_run,
             # -- Parameter tuning --
             "/set_max_bet": self._cmd_set_max_bet,
-            "/set_copy_pct": self._cmd_set_copy_pct,
-            "/set_max_trade": self._cmd_set_max_trade,
-            "/set_min_edge": self._cmd_set_min_edge,
             "/set_max_loss": self._cmd_set_max_loss,
-            "/set_exit": self._cmd_set_exit,
-            # -- Position management --
-            "/sell": self._cmd_sell,
+            # -- Martingale management --
             "/reset_martingale": self._cmd_reset_martingale,
             "/redeem": self._cmd_redeem,
         }
@@ -1195,10 +1118,10 @@ class TelegramCommandBot:
         lines = [f"RECENT TRADES (last {len(recent)} of {len(trades)})"]
         for t in reversed(recent):
             # Three record types:
-            #  1) Copy trade result (in-memory): has side, amount_usdc, price
+            #  1) Trade result (in-memory): has side, amount_usdc, price
             #  2) Closed/resolved position (_log_closed_trade): has market,
             #     entry_price, cost_basis_usdc, outcome
-            #  3) Martingale (_log_bet): like #2 but reason="martingale"
+            #  3) Martingale bet: like #2 but reason="martingale"
             has_entry = "entry_price" in t or "cost_basis_usdc" in t
             if has_entry:
                 # Types 2 & 3: resolved positions and martingale
@@ -1208,7 +1131,7 @@ class TelegramCommandBot:
                 price = t.get("entry_price", 0)
                 ts = t.get("closed_at", "")
             else:
-                # Type 1: in-memory copy trade result
+                # Type 1: in-memory trade result
                 label = t.get("side", "?")
                 amount = t.get("amount_usdc", t.get("cost", 0))
                 price = t.get("price", 0)
@@ -1395,27 +1318,13 @@ class TelegramCommandBot:
                       if r.get("reason") != "martingale"
                       and not r.get("reason", "").startswith("arb")]
 
-        # Determine label: only say "COPY TRADING" if copy trading is on
-        copy_active = bool(
-            self.bot and self.bot.cfg.get("watched_addresses")
-        )
-        pos_label = "COPY TRADING" if copy_active else "POSITIONS"
-
-        # Always show per-source breakdown so users can see what drove P&L
         if pos_trades:
             c = self._bucket_stats(pos_trades)
             lines += [
                 "",
-                pos_label,
+                "OTHER TRADES",
                 f"  {c['n']} trades  |  W/L {c['wins']}/{c['losses']}"
                 f" ({c['win_pct']:.0f}%)  |  P&L ${c['pnl']:+,.2f}",
-            ]
-        if arb_trades:
-            a = self._bucket_stats(arb_trades)
-            lines += [
-                "",
-                "ARBITRAGE",
-                f"  {a['n']} trades  |  P&L ${a['pnl']:+,.2f}",
             ]
 
         # -- Per-strategy martingale breakdown --
@@ -1542,10 +1451,6 @@ class TelegramCommandBot:
 
             # Modes
             modes = []
-            if self.bot.cfg.get("watched_addresses"):
-                modes.append(f"Copy ({len(self.bot.cfg['watched_addresses'])} addr)")
-            if getattr(self.bot, "_arb_monitor", None):
-                modes.append("Arbitrage")
             mgr = getattr(self.bot, "_martingale_mgr", None)
             if mgr:
                 for mg in mgr.bots:
@@ -1909,49 +1814,37 @@ class TelegramCommandBot:
         send_telegram_photo(self.token, self.chat_id, png_bytes, caption=caption, logger=self.logger)
 
     def _cmd_help(self, args=None):
-        self.send(
-            "Polymarket Bot Commands:\n"
-            "\n"
-            "INFO\n"
-            "/balance — USDC & MATIC balances\n"
-            "/positions — open positions with P/L\n"
-            "/trades — recent trade history\n"
-            "/stats [1D|7D|30D|ALL] — W/L, win %, P&L, ROI\n"
-            "/strategies — per-strategy diagnostics\n"
-            "/status — bot state, uptime, session info\n"
-            "/chart — equity P&L chart (add 'session' for current session)\n"
-            "/missed [1D|7D|30D|ALL] — missed windows analysis\n"
-            "\n"
-            "CONTROL\n"
-            "/stop — graceful shutdown\n"
-            "/pause — pause new trades (keeps exits running)\n"
-            "/resume — resume after pause\n"
-            "/kill — emergency kill switch\n"
-            "\n"
-            "TOGGLES\n"
-            "/toggle_arb on|off\n"
-            "/toggle_martingale on|off\n"
-            "/toggle_copy on|off\n"
-            "/dry_run on|off\n"
-            "\n"
-            "PARAMETERS\n"
-            "/set_max_bet <usdc>\n"
-            "/set_copy_pct <0-100>\n"
-            "/set_max_trade <usdc>\n"
-            "/set_min_edge <pct>\n"
-            "/set_max_loss <usdc>\n"
-            "/set_exit whale|auto\n"
-            "\n"
-            "ACTIONS\n"
-            "/sell <token_id|all> — force sell position(s)\n"
-            "/reset_martingale [strategy] — reset streak & bet\n"
-            "/redeem — scan & redeem resolved positions\n"
-            "/help — this message"
-        )
-
-    # -------------------------------------------------------------------
-    # Control commands
-    # -------------------------------------------------------------------
+        """Show available commands."""
+        lines = [
+            "Available commands:",
+            "",
+            "📊 *Info*",
+            "/balance — USDC & MATIC balances",
+            "/positions — open positions with P&L",
+            "/trades \[N] — recent trade history",
+            "/stats \[1H|1D|ALL] — W/L, P&L, ROI",
+            "/strategies — per-strategy diagnostic",
+            "/status — bot running state",
+            "/missed \[24H|7D] — missed windows",
+            "/chart — equity curve (image)",
+            "",
+            "⚙️ *Control*",
+            "/stop — graceful shutdown",
+            "/pause — pause trading",
+            "/resume — resume trading",
+            "/kill — emergency stop",
+            "/toggle\_martingale on|off",
+            "/dry\_run on|off",
+            "",
+            "🔧 *Tuning*",
+            "/set\_max\_bet <usdc>",
+            "/set\_max\_loss <usdc>",
+            "",
+            "🎲 *Martingale*",
+            "/reset\_martingale \[strategy]",
+            "/redeem — scan & redeem settled",
+        ]
+        self.send("\n".join(lines), parse_mode="Markdown")
 
     def _cmd_stop(self, args=None):
         """Graceful shutdown — stops all subsystems, lets active bets settle."""
@@ -2014,24 +1907,6 @@ class TelegramCommandBot:
     # Toggle commands
     # -------------------------------------------------------------------
 
-    def _cmd_toggle_arb(self, args):
-        """Toggle arbitrage on/off.  Usage: /toggle_arb on|off"""
-        if not self.bot:
-            self.send("No bot instance.")
-            return
-        if not args:
-            cur = self.bot.cfg.get("arb_enabled", False)
-            self.send(f"Arbitrage is {'ON' if cur else 'OFF'}.\nUsage: /toggle_arb on|off")
-            return
-        val = args[0].lower()
-        if val not in ("on", "off"):
-            self.send("Usage: /toggle_arb on|off")
-            return
-        new_val = val == "on"
-        self.bot.cfg["arb_enabled"] = new_val
-        save_user_config(self.bot.cfg)
-        self.send(f"Arbitrage {'ENABLED' if new_val else 'DISABLED'}.")
-
     def _cmd_toggle_martingale(self, args):
         """Toggle martingale on/off.  Usage: /toggle_martingale on|off"""
         if not self.bot:
@@ -2052,57 +1927,6 @@ class TelegramCommandBot:
         self.bot.cfg["martingale_enabled"] = new_val
         save_user_config(self.bot.cfg)
         self.send(f"Martingale {'ENABLED' if new_val else 'DISABLED'}.")
-
-    def _cmd_toggle_copy(self, args):
-        """Toggle copy trading on/off.  Usage: /toggle_copy on|off
-
-        Stores watched_addresses in _watched_addresses_backup when
-        toggling off so they can be restored with /toggle_copy on.
-        """
-        if not self.bot:
-            self.send("No bot instance.")
-            return
-        if not args:
-            cur = bool(self.bot.cfg.get("watched_addresses"))
-            self.send(
-                f"Copy trading is {'ON' if cur else 'OFF'}.\n"
-                "Usage: /toggle_copy on|off"
-            )
-            return
-        val = args[0].lower()
-        if val not in ("on", "off"):
-            self.send("Usage: /toggle_copy on|off")
-            return
-        if val == "off":
-            addrs = self.bot.cfg.get("watched_addresses", [])
-            if addrs:
-                self.bot._watched_addresses_backup = list(addrs)
-                self.bot.cfg["watched_addresses"] = []
-                save_user_config(self.bot.cfg)
-                self.send(
-                    f"Copy trading DISABLED ({len(addrs)} address(es) backed up).\n"
-                    "Use /toggle_copy on to restore."
-                )
-            else:
-                self.send("Copy trading is already off.")
-        else:
-            backup = getattr(self.bot, "_watched_addresses_backup", None)
-            current = self.bot.cfg.get("watched_addresses", [])
-            if current:
-                self.send(
-                    f"Copy trading already on ({len(current)} address(es))."
-                )
-            elif backup:
-                self.bot.cfg["watched_addresses"] = backup
-                save_user_config(self.bot.cfg)
-                self.send(
-                    f"Copy trading ENABLED — restored {len(backup)} address(es)."
-                )
-            else:
-                self.send(
-                    "No addresses to restore. Add watched_addresses "
-                    "to config.json manually."
-                )
 
     def _cmd_dry_run(self, args):
         """Toggle dry-run mode.  Usage: /dry_run on|off"""
@@ -2156,75 +1980,6 @@ class TelegramCommandBot:
         label = f"${val:.2f}" if val > 0 else "unlimited"
         self.send(f"Martingale max bet set to {label}.")
 
-    def _cmd_set_copy_pct(self, args):
-        """Set copy trade percentage.  Usage: /set_copy_pct <0-100>"""
-        if not self.bot:
-            self.send("No bot instance.")
-            return
-        if not args:
-            cur = self.bot.cfg.get("copy_percentage", 50)
-            self.send(f"Current copy %: {cur}%\nUsage: /set_copy_pct <0-100>")
-            return
-        try:
-            val = float(args[0])
-        except ValueError:
-            self.send("Invalid number. Usage: /set_copy_pct <0-100>")
-            return
-        if val < 0 or val > 100:
-            self.send("Value must be between 0 and 100.")
-            return
-        self.bot.cfg["copy_percentage"] = val
-        save_user_config(self.bot.cfg)
-        executor = self._get_executor()
-        if executor:
-            executor.copy_pct = Decimal(str(val)) / Decimal("100")
-        self.send(f"Copy percentage set to {val:.0f}%.")
-
-    def _cmd_set_max_trade(self, args):
-        """Set max trade size in USDC.  Usage: /set_max_trade <usdc>"""
-        if not self.bot:
-            self.send("No bot instance.")
-            return
-        if not args:
-            cur = self.bot.cfg.get("max_trade_usdc", 100)
-            self.send(f"Current max trade: ${cur:.2f}\nUsage: /set_max_trade <usdc>")
-            return
-        try:
-            val = float(args[0])
-        except ValueError:
-            self.send("Invalid number. Usage: /set_max_trade <usdc>")
-            return
-        if val <= 0:
-            self.send("Max trade must be positive.")
-            return
-        self.bot.cfg["max_trade_usdc"] = val
-        save_user_config(self.bot.cfg)
-        executor = self._get_executor()
-        if executor:
-            executor.max_trade = Decimal(str(val))
-        self.send(f"Max trade size set to ${val:.2f}.")
-
-    def _cmd_set_min_edge(self, args):
-        """Set arb minimum edge %.  Usage: /set_min_edge <pct>"""
-        if not self.bot:
-            self.send("No bot instance.")
-            return
-        if not args:
-            cur = self.bot.cfg.get("arb_min_edge_pct", 1.0)
-            self.send(f"Current min edge: {cur}%\nUsage: /set_min_edge <pct>")
-            return
-        try:
-            val = float(args[0])
-        except ValueError:
-            self.send("Invalid number. Usage: /set_min_edge <pct>")
-            return
-        if val < 0:
-            self.send("Min edge cannot be negative.")
-            return
-        self.bot.cfg["arb_min_edge_pct"] = val
-        save_user_config(self.bot.cfg)
-        self.send(f"Arb min edge set to {val:.2f}%.")
-
     def _cmd_set_max_loss(self, args):
         """Set session max loss for kill switch.  Usage: /set_max_loss <usdc>"""
         if not self.bot:
@@ -2250,113 +2005,9 @@ class TelegramCommandBot:
         label = f"${val:.2f}" if val > 0 else "disabled"
         self.send(f"Kill switch max loss set to {label}.")
 
-    def _cmd_set_exit(self, args):
-        """Set exit mode.  Usage: /set_exit whale|auto"""
-        if not self.bot:
-            self.send("No bot instance.")
-            return
-        if not args:
-            cur = self.bot.cfg.get("exit_mode", "whale")
-            self.send(f"Current exit mode: {cur}\nUsage: /set_exit whale|auto")
-            return
-        val = args[0].lower()
-        if val not in ("whale", "auto"):
-            self.send("Usage: /set_exit whale|auto")
-            return
-        self.bot.cfg["exit_mode"] = val
-        save_user_config(self.bot.cfg)
-        desc = (
-            "whale (hold until resolution/whale sell)"
-            if val == "whale" else
-            "auto (take-profit & stop-loss active)"
-        )
-        self.send(f"Exit mode set to {desc}.")
-
     # -------------------------------------------------------------------
     # Position management commands
     # -------------------------------------------------------------------
-
-    def _cmd_sell(self, args):
-        """Force sell a position.  Usage: /sell <token_id|all>"""
-        executor = self._get_executor()
-        if not executor:
-            self.send("Bot not running — cannot sell.")
-            return
-        if not args:
-            self.send("Usage: /sell <token_id|all>\nUse /positions to see token IDs.")
-            return
-        if self.bot.cfg.get("dry_run", False):
-            self.send("Cannot sell in dry-run mode.")
-            return
-        target = args[0].lower()
-        positions = dict(executor._positions)
-        if not positions:
-            self.send("No open positions.")
-            return
-
-        if target == "all":
-            self.send(f"Force selling {len(positions)} position(s)...")
-            sold = 0
-            for token_id, pos in list(positions.items()):
-                ok = self._force_sell_position(executor, token_id, pos)
-                if ok:
-                    sold += 1
-            self.send(f"Sold {sold}/{len(positions)} positions.")
-        else:
-            # Match by full token_id or prefix
-            match = None
-            for tid in positions:
-                if tid == target or tid.startswith(target):
-                    match = tid
-                    break
-            if not match:
-                self.send(f"No position found matching '{target}'.")
-                return
-            pos = positions[match]
-            market = pos.get("market_name") or match[:16] + "..."
-            self.send(f"Force selling {market}...")
-            ok = self._force_sell_position(executor, match, pos)
-            if ok:
-                self.send(f"Sell submitted for {market}.")
-            else:
-                self.send(f"Failed to sell {market}. Check logs.")
-
-    def _force_sell_position(self, executor, token_id, pos):
-        """Place a market sell for a single position. Returns True on success."""
-        tokens = pos.get("tokens", Decimal("0"))
-        if tokens <= 0:
-            return False
-        try:
-            price = executor.clob_client.get_last_trade_price(token_id)
-            if price is None:
-                price = float(pos.get("entry_price", 0.5))
-            price_d = Decimal(str(price))
-            sell_usdc = float(tokens * price_d)
-            slippage_mult = Decimal(str(executor.slippage_bps)) / Decimal("10000")
-            adjusted = float(price_d * (Decimal("1") - slippage_mult))
-            adjusted = max(adjusted, 0.01)
-            neg_risk = pos.get("neg_risk", False)
-            executor.ensure_ct_approval(neg_risk=neg_risk)
-            result = executor.clob_client.place_order(
-                token_id=token_id,
-                side="SELL",
-                size_usdc=sell_usdc,
-                price=adjusted,
-            )
-            if result:
-                executor._log_closed_trade(
-                    token_id, pos.get("entry_price", 0), price_d,
-                    tokens, "manual_sell",
-                    market=pos.get("market_name"),
-                )
-                if token_id in executor._positions:
-                    del executor._positions[token_id]
-                executor._save_positions()
-                executor.invalidate_balance_cache()
-                return True
-        except Exception as exc:
-            self.logger.error("Force sell failed for %s: %s", token_id[:16], exc)
-        return False
 
     def _cmd_reset_martingale(self, args):
         """Reset martingale streak & bet.  Usage: /reset_martingale [strategy]"""
@@ -2454,7 +2105,7 @@ class PolymarketCLOBClient:
         self.gamma_url = GAMMA_API_BASE.rstrip("/")
         self.data_url = DATA_API_BASE.rstrip("/")
         self.session = requests.Session() if requests else None
-        self.logger = logger or logging.getLogger("CopyTrader")
+        self.logger = logger or logging.getLogger("MartingaleBot")
         self._last_trade_ids = {}  # address -> set of seen trade IDs
         self._token_to_condition = {}  # token_id -> condition_id from activity
         self._token_to_neg_risk = {}  # token_id -> neg_risk flag from activity/API
@@ -3158,1431 +2809,6 @@ class PolymarketCLOBClient:
 
 
 # ---------------------------------------------------------------------------
-# On-chain monitor (Web3-based fallback)
-# ---------------------------------------------------------------------------
-
-class OnChainMonitor:
-    """Monitors Polygon blocks for Polymarket trades by watched addresses.
-
-    This class provides a fallback when the CLOB API is unavailable or as
-    a complementary data source. It listens for OrderFilled / OrdersMatched
-    events on the CTF Exchange contracts.
-    """
-
-    EXCHANGE_ADDRESSES = {
-        CTF_EXCHANGE_ADDRESS.lower(),
-        NEG_RISK_CTF_EXCHANGE_ADDRESS.lower(),
-        NEG_RISK_ADAPTER_ADDRESS.lower(),
-    }
-
-    def __init__(self, w3, watched_addresses, logger=None):
-        self.w3 = w3
-        self.watched = {a.lower() for a in watched_addresses}
-        self.logger = logger or logging.getLogger("CopyTrader")
-        self._last_block = None
-
-        # Build contract objects for event parsing
-        self.ctf_exchange = self.w3.eth.contract(
-            address=Web3.to_checksum_address(CTF_EXCHANGE_ADDRESS),
-            abi=CTF_EXCHANGE_ABI,
-        )
-
-    def update_watched(self, addresses):
-        self.watched = {a.lower() for a in addresses}
-
-    def _rpc_with_retry(self, fn, description="RPC call", retries=3):
-        """Execute *fn()* with exponential-backoff retries on connection errors."""
-        for attempt in range(retries + 1):
-            try:
-                return fn()
-            except (ConnectionError, OSError) as exc:
-                if attempt < retries:
-                    delay = 2 ** attempt
-                    self.logger.warning(
-                        "%s failed (attempt %d/%d): %s — retrying in %ds",
-                        description, attempt + 1, retries + 1, exc, delay,
-                    )
-                    time.sleep(delay)
-                else:
-                    raise
-
-    def _scan_block(self, block_number):
-        """Scan a single block for relevant Polymarket trades."""
-        trades = []
-        try:
-            block = self._rpc_with_retry(
-                lambda: self.w3.eth.get_block(block_number, full_transactions=True),
-                description="get_block(%d)" % block_number,
-            )
-        except Exception as exc:
-            self.logger.error("Failed to fetch block %d: %s", block_number, exc)
-            return trades
-
-        for tx in block.get("transactions", []):
-            sender = (tx.get("from") or "").lower()
-            to_addr = (tx.get("to") or "").lower()
-
-            # Check if the transaction involves a watched address
-            # interacting with a Polymarket contract
-            if sender not in self.watched:
-                continue
-            if to_addr not in self.EXCHANGE_ADDRESSES:
-                continue
-
-            self.logger.info(
-                "On-chain: detected tx %s from watched address %s",
-                tx["hash"].hex() if isinstance(tx["hash"], bytes) else tx["hash"],
-                sender,
-            )
-            trades.append(self._parse_tx(tx))
-
-        return [t for t in trades if t is not None]
-
-    def _parse_tx(self, tx):
-        """Attempt to decode a transaction's input data."""
-        try:
-            tx_hash = tx["hash"].hex() if isinstance(tx["hash"], bytes) else tx["hash"]
-            input_data = tx.get("input", "0x")
-            if isinstance(input_data, bytes):
-                input_data = input_data.hex()
-                if not input_data.startswith("0x"):
-                    input_data = "0x" + input_data
-
-            # Try to decode via the CTF Exchange ABI
-            try:
-                func, params = self.ctf_exchange.decode_function_input(input_data)
-                return {
-                    "source": "on-chain",
-                    "tx_hash": tx_hash,
-                    "from": tx["from"],
-                    "function": func.fn_name,
-                    "params": dict(params),
-                    "block": tx.get("blockNumber"),
-                }
-            except Exception:
-                # Could not decode – return raw info
-                return {
-                    "source": "on-chain",
-                    "tx_hash": tx_hash,
-                    "from": tx["from"],
-                    "function": "unknown",
-                    "raw_input": input_data[:200],
-                    "block": tx.get("blockNumber"),
-                }
-        except Exception as exc:
-            self.logger.debug("Failed to parse tx: %s", exc)
-            return None
-
-    def poll_new_blocks(self):
-        """Check for new blocks since last poll and scan them."""
-        try:
-            current = self._rpc_with_retry(
-                lambda: self.w3.eth.block_number,
-                description="get_block_number",
-            )
-        except Exception as exc:
-            self.logger.error("Failed to get block number: %s", exc)
-            return []
-
-        if self._last_block is None:
-            self._last_block = current
-            self.logger.info("On-chain monitor starting at block %d", current)
-            return []
-
-        trades = []
-        # Process at most 10 blocks per poll to avoid excessive RPC calls
-        start = self._last_block + 1
-        end = min(current, self._last_block + 10)
-        for blk in range(start, end + 1):
-            trades.extend(self._scan_block(blk))
-        self._last_block = end
-        return trades
-
-    def get_event_logs(self, from_block, to_block):
-        """Fetch OrderFilled event logs for watched maker addresses."""
-        trades = []
-        for addr in self.watched:
-            try:
-                logs = self.ctf_exchange.events.OrderFilled().get_logs(
-                    fromBlock=from_block,
-                    toBlock=to_block,
-                    argument_filters={"maker": Web3.to_checksum_address(addr)},
-                )
-                for log in logs:
-                    trades.append({
-                        "source": "event-log",
-                        "tx_hash": log.transactionHash.hex(),
-                        "maker": log.args.get("maker", ""),
-                        "taker": log.args.get("taker", ""),
-                        "makerAssetId": str(log.args.get("makerAssetId", "")),
-                        "takerAssetId": str(log.args.get("takerAssetId", "")),
-                        "makerAmountFilled": str(log.args.get("makerAmountFilled", "")),
-                        "takerAmountFilled": str(log.args.get("takerAmountFilled", "")),
-                        "block": log.blockNumber,
-                    })
-            except Exception as exc:
-                self.logger.debug("Event log query failed for %s: %s", addr, exc)
-        return trades
-
-
-# ---------------------------------------------------------------------------
-# WebSocket Monitor – real-time whale trade detection via eth_subscribe
-# ---------------------------------------------------------------------------
-
-class WebSocketMonitor(threading.Thread):
-    """Real-time whale trade detection via Polygon WebSocket eth_subscribe.
-
-    Subscribes to OrderFilled and OrdersMatched events on the CTF Exchange
-    contracts, filtered by watched whale addresses (as both maker and taker).
-    When a matching event arrives, signals the main loop to immediately poll
-    the CLOB API for structured trade details instead of waiting for the next
-    poll interval.
-
-    Requires:
-      - A Polygon WebSocket RPC URL (e.g. Alchemy, Infura, QuickNode)
-      - The ``websocket-client`` package (``pip install websocket-client``)
-
-    Falls back gracefully if websocket-client is not installed.
-    """
-
-    RECONNECT_DELAYS = [1, 2, 4, 8, 16, 30]  # seconds, capped at 30
-    PING_INTERVAL = 30  # seconds between keepalive pings
-    DATA_TIMEOUT = 300  # seconds without any message before reconnecting
-
-    def __init__(self, ws_url, watched_addresses, wake_event, logger=None):
-        super().__init__(daemon=True, name="WebSocketMonitor")
-        self.ws_url = ws_url
-        self.watched = {a.lower().replace("0x", "") for a in watched_addresses}
-        self.wake_event = wake_event  # threading.Event to wake main loop
-        self.logger = logger or logging.getLogger("CopyTrader")
-        self.running = True
-        self._ws = None
-        self._reconnect_count = 0
-        self.last_event_time = 0.0
-        self.connected = False
-
-        # Compute event topic hashes (keccak256 of canonical signatures)
-        if Web3 is not None:
-            self._order_filled_topic = Web3.keccak(
-                text="OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)"
-            ).hex()
-            self._orders_matched_topic = Web3.keccak(
-                text="OrdersMatched(bytes32,address,address,uint256,uint256,uint256,uint256)"
-            ).hex()
-        else:
-            # Precomputed fallbacks (Polygon mainnet)
-            self._order_filled_topic = (
-                "0x4b9f2d36e1b4c93de62cc077b00b1a91d84b6c31b4a14e012718571f"
-                "3100b2257"
-            )
-            self._orders_matched_topic = (
-                "0x1234567890abcdef"  # placeholder, Web3 should always be available
-            )
-
-    def update_watched(self, addresses):
-        """Update the set of whale addresses to monitor (thread-safe)."""
-        self.watched = {a.lower().replace("0x", "") for a in addresses}
-
-    def stop(self):
-        """Signal the monitor to shut down."""
-        self.running = False
-        ws = self._ws
-        if ws:
-            try:
-                ws.close()
-            except Exception:
-                pass
-
-    def run(self):
-        """Main thread loop — connect, subscribe, listen, reconnect."""
-        if not HAS_WS_CLIENT:
-            self.logger.warning(
-                "websocket-client not installed — WebSocket monitoring disabled. "
-                "Install with: pip install websocket-client"
-            )
-            return
-
-        if Web3 is None:
-            self.logger.warning(
-                "web3 not installed — WebSocket monitoring disabled."
-            )
-            return
-
-        self.logger.info(
-            "WebSocket monitor starting — %s (watching %d address(es))",
-            self.ws_url[:50] + "...", len(self.watched),
-        )
-
-        while self.running:
-            try:
-                self._connect_and_listen()
-            except Exception as exc:
-                self.connected = False
-                if not self.running:
-                    break
-                idx = min(self._reconnect_count, len(self.RECONNECT_DELAYS) - 1)
-                delay = self.RECONNECT_DELAYS[idx]
-                self.logger.warning(
-                    "WebSocket disconnected: %s — reconnecting in %ds (attempt %d)",
-                    exc, delay, self._reconnect_count + 1,
-                )
-                self._reconnect_count += 1
-                # Sleep in small steps so we can exit quickly on stop()
-                elapsed = 0.0
-                while elapsed < delay and self.running:
-                    time.sleep(min(0.5, delay - elapsed))
-                    elapsed += 0.5
-
-        self.connected = False
-        self.logger.info("WebSocket monitor stopped")
-
-    def _connect_and_listen(self):
-        """Connect to the Polygon WebSocket RPC, subscribe, and listen."""
-        ws = _ws_lib.WebSocket()
-        ws.settimeout(self.PING_INTERVAL + 10)
-        ws.connect(self.ws_url)
-        self._ws = ws
-        self.connected = True
-        self._reconnect_count = 0
-        self.logger.info("WebSocket connected to %s", self.ws_url[:50] + "...")
-
-        # Subscribe to CTF Exchange events for whale addresses
-        self._subscribe(ws)
-
-        # Listen for incoming events
-        last_ping = time.monotonic()
-        last_data = time.monotonic()
-
-        while self.running:
-            try:
-                raw = ws.recv()
-                if not raw:
-                    continue
-                last_data = time.monotonic()
-
-                msg = json.loads(raw)
-
-                # Subscription confirmation
-                if "result" in msg and "id" in msg:
-                    self.logger.debug(
-                        "WebSocket subscription confirmed: id=%s sub=%s",
-                        msg["id"], msg["result"],
-                    )
-                    continue
-
-                # Subscription event
-                if msg.get("method") == "eth_subscription":
-                    self._handle_event(msg["params"]["result"])
-
-            except _ws_lib.WebSocketTimeoutException:
-                pass  # normal timeout, send ping below
-            except _ws_lib.WebSocketConnectionClosedException:
-                raise ConnectionError("WebSocket connection closed by server")
-
-            # Keepalive ping
-            now = time.monotonic()
-            if now - last_ping >= self.PING_INTERVAL:
-                try:
-                    ws.ping()
-                except Exception:
-                    raise ConnectionError("WebSocket ping failed")
-                last_ping = now
-
-            # Reconnect if no data for too long (server went silent)
-            if now - last_data > self.DATA_TIMEOUT:
-                raise ConnectionError(
-                    "No data received for %ds — reconnecting" % self.DATA_TIMEOUT
-                )
-
-    def _subscribe(self, ws):
-        """Send eth_subscribe requests for OrderFilled/OrdersMatched events."""
-        whale_topics = ["0x" + addr.zfill(64) for addr in self.watched]
-
-        if not whale_topics:
-            self.logger.warning("No whale addresses configured for WebSocket monitoring")
-            return
-
-        exchanges = [
-            CTF_EXCHANGE_ADDRESS,
-            NEG_RISK_CTF_EXCHANGE_ADDRESS,
-        ]
-        event_topics = [
-            self._order_filled_topic,
-            self._orders_matched_topic,
-        ]
-
-        # Subscription 1: whale as MAKER (topic index 2)
-        ws.send(json.dumps({
-            "jsonrpc": "2.0",
-            "method": "eth_subscribe",
-            "params": ["logs", {
-                "address": exchanges,
-                "topics": [
-                    event_topics,   # topic0: either event type
-                    None,           # topic1: any orderHash
-                    whale_topics,   # topic2: maker is a watched whale
-                ],
-            }],
-            "id": 1,
-        }))
-
-        # Subscription 2: whale as TAKER (topic index 3)
-        ws.send(json.dumps({
-            "jsonrpc": "2.0",
-            "method": "eth_subscribe",
-            "params": ["logs", {
-                "address": exchanges,
-                "topics": [
-                    event_topics,   # topic0: either event type
-                    None,           # topic1: any orderHash
-                    None,           # topic2: any maker
-                    whale_topics,   # topic3: taker is a watched whale
-                ],
-            }],
-            "id": 2,
-        }))
-
-        self.logger.info(
-            "WebSocket subscribed: %d event type(s) × %d exchange(s) × %d whale(s) "
-            "(maker + taker)",
-            len(event_topics), len(exchanges), len(whale_topics),
-        )
-
-    def _handle_event(self, log_entry):
-        """Process an incoming OrderFilled/OrdersMatched log event."""
-        topics = log_entry.get("topics", [])
-        tx_hash = log_entry.get("transactionHash", "")
-        block_hex = log_entry.get("blockNumber", "0x0")
-        block_num = int(block_hex, 16) if isinstance(block_hex, str) else block_hex
-
-        # Identify which whale address matched (topic2=maker, topic3=taker)
-        whale_addr = None
-        whale_role = None
-        for idx, label in [(2, "maker"), (3, "taker")]:
-            if idx < len(topics) and topics[idx]:
-                addr_hex = topics[idx][-40:].lower()
-                if addr_hex in self.watched:
-                    whale_addr = "0x" + addr_hex
-                    whale_role = label
-                    break
-
-        event_name = "OrderFilled"
-        if len(topics) > 0 and topics[0] == self._orders_matched_topic:
-            event_name = "OrdersMatched"
-
-        self.logger.info(
-            "WS EVENT: %s — whale %s (%s) — block %d — tx %s",
-            event_name,
-            whale_addr[:12] + "..." if whale_addr else "unknown",
-            whale_role or "?",
-            block_num,
-            tx_hash[:18] + "..." if tx_hash else "?",
-        )
-
-        self.last_event_time = time.time()
-
-        # Wake the main loop to immediately poll CLOB API for full trade details
-        self.wake_event.set()
-
-
-# ---------------------------------------------------------------------------
-# Arbitrage Monitor – binary market spread capture
-# ---------------------------------------------------------------------------
-
-class ArbitrageMonitor(threading.Thread):
-    """Scans binary Polymarket markets for risk-free spread opportunities.
-
-    A binary market has exactly two outcome tokens whose payouts sum to $1.
-    When the combined best-ask price of both outcomes drops below $1, buying
-    both sides locks in a guaranteed profit equal to ($1 - total_cost) per
-    share once the market resolves.
-
-    Example:  Up = $0.48, Down = $0.50  ->  cost = $0.98, profit = $0.02/share (2%).
-
-    The monitor:
-      1. Resolves each configured ``condition_id`` to its pair of token IDs
-         via the Gamma API.
-      2. Polls orderbooks for both tokens on a fast interval.
-      3. When the combined best-ask drops below the configured edge threshold,
-         places simultaneous FOK BUY orders for both sides.
-      4. Tracks active arb positions to avoid exceeding ``arb_max_positions``.
-    """
-
-    ARB_POSITIONS_FILE = "arb_positions.json"
-
-    def __init__(self, clob_client, cfg, logger=None):
-        super().__init__(daemon=True, name="ArbitrageMonitor")
-        self.clob_client = clob_client
-        self.cfg = cfg
-        self.logger = logger or logging.getLogger("CopyTrader")
-        self._stop_event = threading.Event()
-
-        # Lock protects _markets from concurrent access between
-        # _resolve_dynamic_slugs() and _scan_cycle().
-        self._market_lock = threading.Lock()
-
-        # condition_id -> {"yes_token": str, "no_token": str, "question": str, ...}
-        self._markets = {}
-        # condition_id -> {"yes_fill": {...}, "no_fill": {...}, "cost": float, "ts": str}
-        self._active_positions = {}
-        self._load_positions()
-
-        # Per-slug state: slug_base -> {"window_key": str, "failed_key": str}
-        # Tracks the last resolved window and last failed window for each
-        # configured dynamic slug so they rotate independently.
-        self._slug_states = {}
-
-        # Per-market log-throttle timestamps so multi-market scanning
-        # doesn't spam logs.
-        self._edge_log_ts = {}   # cid -> last log time
-        self._noask_log_ts = {}  # cid -> last log time
-
-        # Callbacks wired up by CopyTraderBot after construction.
-        # notify_callback(message) — sends webhook notification.
-        # log_trade_callback(record) — appends to trade_history.json.
-        self.notify_callback = None
-        self.log_trade_callback = None
-
-    # -- persistence --------------------------------------------------------
-
-    def _load_positions(self):
-        try:
-            with open(self.ARB_POSITIONS_FILE, "r") as fh:
-                self._active_positions = json.load(fh)
-        except (FileNotFoundError, json.JSONDecodeError):
-            self._active_positions = {}
-
-    def _save_positions(self):
-        try:
-            tmp = self.ARB_POSITIONS_FILE + ".tmp"
-            with open(tmp, "w") as fh:
-                json.dump(self._active_positions, fh, indent=2, default=str)
-            os.replace(tmp, self.ARB_POSITIONS_FILE)
-        except Exception as exc:
-            self.logger.debug("Could not save arb positions: %s", exc)
-
-    def _log_arb_trade(self, position, is_partial=False):
-        """Log a completed arb trade to trade_history.json.
-
-        Creates a single record per arb with both legs' data and the
-        correct locked P&L based on actual fill amounts.
-        """
-        if not self.log_trade_callback:
-            return
-
-        question = position.get("question", "Unknown")
-        yes_shares = position.get("yes_shares", 0)
-        no_shares = position.get("no_shares", 0)
-        total_cost = position.get("total_cost", 0)
-        locked_profit = position.get("locked_profit", 0)
-        edge_pct = position.get("edge_pct", 0)
-        matched_shares = min(yes_shares, no_shares)
-
-        # For a complete arb, the proceeds are guaranteed at resolution:
-        # each matched pair of shares pays out $1.00.
-        if is_partial:
-            outcome = "partial"
-            reason = "arb_partial"
-            # Partial arbs have unknown proceeds
-            proceeds = 0
-            pnl = -total_cost  # worst-case until resolution
-        else:
-            outcome = "arb"
-            reason = "arb_executed"
-            proceeds = matched_shares  # $1 per matched pair at resolution
-            pnl = locked_profit
-
-        # Extract per-leg details for the record
-        yes_fill = position.get("yes_fill") or {}
-        no_fill = position.get("no_fill") or {}
-
-        record = {
-            "closed_at": position.get("ts", datetime.now().isoformat()),
-            "token_id": "arb",
-            "market": question,
-            "shares": matched_shares,
-            "entry_price": round(total_cost / matched_shares, 6) if matched_shares > 0 else 0,
-            "exit_price": 1.0 if not is_partial else 0,
-            "cost_basis_usdc": round(total_cost, 6),
-            "proceeds_usdc": round(proceeds, 6),
-            "pnl_usdc": round(pnl, 6),
-            "outcome": outcome,
-            "reason": reason,
-            "arb_details": {
-                "yes_shares": yes_shares,
-                "no_shares": no_shares,
-                "yes_cost": round(
-                    float(yes_fill.get("makingAmount", 0))
-                    if isinstance(yes_fill, dict) else 0, 4,
-                ),
-                "no_cost": round(
-                    float(no_fill.get("makingAmount", 0))
-                    if isinstance(no_fill, dict) else 0, 4,
-                ),
-                "edge_pct": edge_pct,
-                "locked_profit": locked_profit,
-            },
-        }
-
-        try:
-            self.log_trade_callback(record)
-        except Exception as exc:
-            self.logger.debug("Could not log arb trade to history: %s", exc)
-
-    def _notify_arb(self, message):
-        """Send webhook notification for arb events."""
-        if self.notify_callback:
-            try:
-                self.notify_callback(message)
-            except Exception:
-                pass
-
-    # -- market resolution --------------------------------------------------
-
-    def _resolve_markets(self):
-        """Resolve each condition_id to its pair of outcome token IDs."""
-        condition_ids = self.cfg.get("arb_condition_ids", [])
-        if not condition_ids:
-            self.logger.warning("Arbitrage enabled but no condition IDs configured")
-            return
-
-        for cid in condition_ids:
-            if cid in self._markets:
-                continue  # already resolved
-            try:
-                market = self.clob_client.get_market_info(condition_id=cid)
-                if not market:
-                    self.logger.warning("Arb: could not fetch market for condition %s", cid[:20])
-                    continue
-
-                tokens = market.get("tokens") or []
-                if len(tokens) < 2:
-                    self.logger.warning(
-                        "Arb: market %s has %d tokens (need 2) — skipping",
-                        cid[:20], len(tokens),
-                    )
-                    continue
-
-                # Map outcomes.  Polymarket uses "Yes"/"No" or custom labels.
-                # We just need the two token IDs — call them "yes" and "no"
-                # regardless of the actual outcome name.
-                t0 = tokens[0]
-                t1 = tokens[1]
-                tid0 = t0.get("token_id") or t0.get("tokenId") or ""
-                tid1 = t1.get("token_id") or t1.get("tokenId") or ""
-                label0 = t0.get("outcome", "A")
-                label1 = t1.get("outcome", "B")
-                question = market.get("question", cid[:30])
-
-                self._markets[cid] = {
-                    "yes_token": tid0,
-                    "no_token": tid1,
-                    "yes_label": label0,
-                    "no_label": label1,
-                    "question": question,
-                }
-                self.logger.info(
-                    "Arb: resolved market '%s' — %s=%s... / %s=%s...",
-                    question[:50], label0, tid0[:12], label1, tid1[:12],
-                )
-            except Exception as exc:
-                self.logger.warning("Arb: failed to resolve condition %s: %s", cid[:20], exc)
-
-    # -- dynamic slug discovery ---------------------------------------------
-
-    @staticmethod
-    def _get_window_ts(window):
-        """Return the current window-start unix timestamp for a given window size."""
-        window = max(int(window), 30)
-        now = int(time.time())
-        return now - (now % window)
-
-    def _get_effective_slugs(self):
-        """Return the list of dynamic slug entries from config.
-
-        Supports both the new ``arb_dynamic_slugs`` list format and the
-        legacy single ``arb_dynamic_slug`` string.  The legacy format is
-        automatically converted so callers always get a uniform list of
-        ``{"slug": str, "window": int, "format": str}`` dicts.
-        """
-        slugs = self.cfg.get("arb_dynamic_slugs") or []
-        if slugs:
-            # Normalise entries: ensure each has "format" defaulting to "timestamp"
-            normalised = []
-            for entry in slugs:
-                if isinstance(entry, str):
-                    entry = {"slug": entry}
-                if isinstance(entry, dict) and entry.get("slug", "").strip():
-                    normalised.append({
-                        "slug": entry["slug"].strip(),
-                        "window": int(entry.get("window", 300)),
-                        "format": entry.get("format", "timestamp"),
-                    })
-            return normalised
-
-        # Backward compat: single slug string -> list of one
-        single = self.cfg.get("arb_dynamic_slug", "").strip()
-        if single:
-            return [{
-                "slug": single,
-                "window": int(self.cfg.get("arb_dynamic_window", 300)),
-                "format": "timestamp",
-            }]
-        return []
-
-    def _generate_slug(self, slug_entry):
-        """Generate the full event slug for the current window.
-
-        For ``"timestamp"`` format (default):
-            ``{base_slug}-{unix_window_start}``
-
-        For ``"hourly"`` format:
-            ``{base_slug}-{month}-{day}-{hour}{am/pm}-et``
-            Uses US Eastern time with proper DST handling.
-        """
-        base = slug_entry["slug"]
-        window = slug_entry["window"]
-        fmt = slug_entry.get("format", "timestamp")
-
-        if fmt == "hourly":
-            return self._generate_hourly_slug(base, window)
-
-        # Default: timestamp format
-        window_ts = self._get_window_ts(window)
-        return f"{base}-{window_ts}"
-
-    @staticmethod
-    def _generate_hourly_slug(base, window):
-        """Generate a human-readable hourly slug in US Eastern time.
-
-        Pattern: ``{base}-{month}-{day}-{hour}{am/pm}-et``
-        Example: ``ethereum-up-or-down-february-16-9pm-et``
-        """
-        try:
-            from zoneinfo import ZoneInfo
-            et = ZoneInfo("America/New_York")
-        except (ImportError, KeyError):
-            from datetime import timedelta as _td
-            et = timezone(_td(hours=-5))
-
-        now_et = datetime.now(et)
-        # Truncate to the current window boundary.  For hourly markets
-        # the window is typically 3600 but we honour whatever is configured.
-        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-        ts = int((now_et.astimezone(timezone.utc) - epoch).total_seconds())
-        window_start_ts = ts - (ts % max(window, 60))
-        window_start_utc = datetime.fromtimestamp(window_start_ts, tz=timezone.utc)
-        window_start_et = window_start_utc.astimezone(et)
-
-        month_name = window_start_et.strftime("%B").lower()
-        day = window_start_et.day
-        hour_12 = int(window_start_et.strftime("%I"))
-        ampm = window_start_et.strftime("%p").lower()
-        return f"{base}-{month_name}-{day}-{hour_12}{ampm}-et"
-
-    def _window_key_for(self, slug_entry):
-        """Return a comparable key representing the current window for a slug.
-
-        For timestamp slugs this is the unix timestamp (int).
-        For hourly slugs this is the generated slug suffix (str).
-        Either way, when the key changes the window has rotated.
-        """
-        return self._generate_slug(slug_entry)
-
-    def _resolve_dynamic_slugs(self):
-        """Discover current rotating markets for all configured dynamic slugs.
-
-        Unlike the legacy single-slug method, this **merges** newly discovered
-        markets into ``self._markets`` (keyed by condition_id) and removes
-        stale markets whose window has rotated.
-
-        Each market entry is tagged with ``_slug_key`` (the base slug) and
-        ``_resolved_slug`` (the full generated slug at discovery time) so
-        that ``_scan_cycle()`` can perform per-market staleness checks.
-        """
-        slug_entries = self._get_effective_slugs()
-        if not slug_entries:
-            return
-
-        any_resolved = False
-        new_markets = {}
-
-        for entry in slug_entries:
-            slug_base = entry["slug"]
-            current_key = self._window_key_for(entry)
-
-            state = self._slug_states.get(slug_base, {})
-            prev_key = state.get("window_key")
-
-            # Same window, already resolved — carry forward existing markets
-            if current_key == prev_key:
-                with self._market_lock:
-                    for cid, mkt in self._markets.items():
-                        if mkt.get("_slug_key") == slug_base:
-                            new_markets[cid] = mkt
-                continue
-
-            # Already failed for this exact window — skip
-            if current_key == state.get("failed_key"):
-                # Still carry forward any existing markets from this slug
-                # (they may be from a previous successful resolution)
-                with self._market_lock:
-                    for cid, mkt in self._markets.items():
-                        if mkt.get("_slug_key") == slug_base:
-                            new_markets[cid] = mkt
-                continue
-
-            full_slug = current_key  # _window_key_for returns the full slug
-            self.logger.info(
-                "Arb dynamic: discovering market for slug '%s'", full_slug,
-            )
-
-            resolved = self._fetch_and_parse_slug(
-                full_slug, slug_base, entry,
-            )
-            if resolved:
-                cid, mkt_data = resolved
-                new_markets[cid] = mkt_data
-                self._slug_states[slug_base] = {
-                    "window_key": current_key, "failed_key": "",
-                }
-                any_resolved = True
-            else:
-                self._slug_states[slug_base] = {
-                    "window_key": state.get("window_key", ""),
-                    "failed_key": current_key,
-                }
-                # Carry forward existing markets from this slug
-                with self._market_lock:
-                    for cid, mkt in self._markets.items():
-                        if mkt.get("_slug_key") == slug_base:
-                            new_markets[cid] = mkt
-
-        # Also carry forward any static (non-dynamic) markets.
-        with self._market_lock:
-            for cid, mkt in self._markets.items():
-                if not mkt.get("_slug_key"):
-                    new_markets[cid] = mkt
-
-        # Atomically swap the entire markets dict.
-        with self._market_lock:
-            self._markets = new_markets
-
-    def _fetch_and_parse_slug(self, full_slug, slug_base, slug_entry):
-        """Fetch a single event slug from the Gamma API and parse it.
-
-        Returns ``(condition_id, market_dict)`` on success, or ``None``.
-        """
-        try:
-            url = f"{GAMMA_API_BASE}/events"
-            data = self.clob_client._get_public(url, params={"slug": full_slug})
-
-            event = None
-            if isinstance(data, list) and data:
-                event = data[0]
-            elif isinstance(data, dict):
-                event = data
-
-            if not event:
-                self.logger.warning(
-                    "Arb dynamic: no event found for slug '%s' — "
-                    "market may not be open yet", full_slug,
-                )
-                return None
-
-            markets = event.get("markets") or []
-            if not markets:
-                self.logger.warning(
-                    "Arb dynamic: event '%s' has no markets", full_slug,
-                )
-                return None
-
-            market = markets[0]
-            cid = market.get("condition_id") or market.get("conditionId") or ""
-            if not cid:
-                self.logger.warning(
-                    "Arb dynamic: market in event '%s' has no condition_id",
-                    full_slug,
-                )
-                return None
-
-            # --- Parse token IDs ---
-            token_ids = []
-            outcome_labels = []
-
-            raw_clob = market.get("clobTokenIds") or ""
-            if isinstance(raw_clob, str) and raw_clob.strip():
-                try:
-                    parsed = json.loads(raw_clob)
-                    if isinstance(parsed, list):
-                        token_ids = [str(t) for t in parsed]
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            elif isinstance(raw_clob, list):
-                token_ids = [str(t) for t in raw_clob]
-
-            raw_outcomes = market.get("outcomes") or ""
-            if isinstance(raw_outcomes, str) and raw_outcomes.strip():
-                try:
-                    parsed = json.loads(raw_outcomes)
-                    if isinstance(parsed, list):
-                        outcome_labels = [str(o) for o in parsed]
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            elif isinstance(raw_outcomes, list):
-                outcome_labels = [str(o) for o in raw_outcomes]
-
-            # Fallback: try native "tokens" array (CLOB API format)
-            if len(token_ids) < 2:
-                tokens = market.get("tokens") or []
-                if len(tokens) >= 2:
-                    token_ids = [
-                        tokens[0].get("token_id") or tokens[0].get("tokenId") or "",
-                        tokens[1].get("token_id") or tokens[1].get("tokenId") or "",
-                    ]
-                    outcome_labels = [
-                        tokens[0].get("outcome", "A"),
-                        tokens[1].get("outcome", "B"),
-                    ]
-
-            if len(token_ids) < 2 or not token_ids[0] or not token_ids[1]:
-                self.logger.warning(
-                    "Arb dynamic: market %s has insufficient token data "
-                    "(clobTokenIds=%r, tokens=%r) — skipping",
-                    cid[:20],
-                    market.get("clobTokenIds", ""),
-                    len(market.get("tokens") or []),
-                )
-                return None
-
-            if len(outcome_labels) < 2:
-                outcome_labels = ["A", "B"]
-
-            tid0, tid1 = token_ids[0], token_ids[1]
-            label0, label1 = outcome_labels[0], outcome_labels[1]
-            question = market.get("question") or event.get("title") or full_slug
-
-            self.logger.info(
-                "Arb dynamic: resolved '%s' — %s=%s... / %s=%s... (slug %s)",
-                question[:50], label0, tid0[:12], label1, tid1[:12], full_slug,
-            )
-
-            return cid, {
-                "yes_token": tid0,
-                "no_token": tid1,
-                "yes_label": label0,
-                "no_label": label1,
-                "question": question,
-                # Multi-slug metadata for per-market staleness checks
-                "_slug_key": slug_base,
-                "_slug_entry": slug_entry,
-                "_resolved_slug": full_slug,
-            }
-
-        except Exception as exc:
-            self.logger.warning(
-                "Arb dynamic: failed to resolve slug '%s': %s", full_slug, exc,
-            )
-            return None
-
-    # -- core loop ----------------------------------------------------------
-
-    def run(self):
-        slug_entries = self._get_effective_slugs()
-        static_cids = self.cfg.get("arb_condition_ids", [])
-
-        if slug_entries:
-            for entry in slug_entries:
-                self.logger.info(
-                    "Arbitrage monitor: dynamic slug '%s' "
-                    "(window %ds, format %s)",
-                    entry["slug"], entry["window"], entry.get("format", "timestamp"),
-                )
-            self._resolve_dynamic_slugs()
-        else:
-            self.logger.info(
-                "Arbitrage monitor starting — %d market(s) configured",
-                len(static_cids),
-            )
-            self._resolve_markets()
-
-        if not self._markets and not slug_entries:
-            self.logger.error("Arb: no markets could be resolved — monitor stopping")
-            return
-
-        poll_interval = max(self.cfg.get("arb_poll_seconds", 2), 0.5)
-
-        while not self._stop_event.is_set():
-            # Runtime toggle: if arb_enabled is turned off, stop gracefully
-            if not self.cfg.get("arb_enabled", True):
-                self.logger.info(
-                    "Arbitrage monitor: arb_enabled toggled off — stopping"
-                )
-                break
-
-            try:
-                # For dynamic slugs, re-resolve when any window rotates
-                if slug_entries:
-                    self._resolve_dynamic_slugs()
-
-                if self._markets:
-                    self._scan_cycle()
-            except Exception as exc:
-                self.logger.error("Arb scan error: %s", exc, exc_info=True)
-            self._stop_event.wait(timeout=poll_interval)
-
-        self.logger.info("Arbitrage monitor stopped")
-
-    def stop(self):
-        self._stop_event.set()
-
-    # -- scan & execute -----------------------------------------------------
-
-    def _scan_cycle(self):
-        """One pass: check every tracked market for an arb opportunity."""
-        min_edge_pct = self.cfg.get("arb_min_edge_pct", 1.0)
-        arb_size = self.cfg.get("arb_size_usdc", 10.0)
-        max_positions = self.cfg.get("arb_max_positions", 5)
-        dry_run = self.cfg.get("dry_run", False)
-
-        # Snapshot markets under lock so we iterate a stable copy.
-        with self._market_lock:
-            markets_snapshot = dict(self._markets)
-
-        # Capture per-market window keys at scan start for staleness checks.
-        window_keys_at_start = {}
-        for cid, mkt in markets_snapshot.items():
-            entry = mkt.get("_slug_entry")
-            if entry:
-                window_keys_at_start[cid] = self._window_key_for(entry)
-
-        for cid, mkt in markets_snapshot.items():
-            # Respect max positions
-            if len(self._active_positions) >= max_positions:
-                break
-
-            # Skip if we already have an active arb on this market
-            if cid in self._active_positions:
-                continue
-
-            yes_token = mkt["yes_token"]
-            no_token = mkt["no_token"]
-
-            # Fetch orderbooks for both sides in parallel to cut latency
-            try:
-                with ThreadPoolExecutor(max_workers=2) as pool:
-                    fut_yes = pool.submit(self.clob_client.get_order_book, yes_token)
-                    fut_no = pool.submit(self.clob_client.get_order_book, no_token)
-                    book_yes = fut_yes.result(timeout=5)
-                    book_no = fut_no.result(timeout=5)
-            except Exception as exc:
-                self.logger.debug("Arb: orderbook fetch failed for %s: %s", cid[:16], exc)
-                continue
-
-            if not book_yes or not book_no:
-                continue
-
-            asks_yes = book_yes.get("asks") or []
-            asks_no = book_no.get("asks") or []
-
-            if not asks_yes or not asks_no:
-                now = time.time()
-                last_t = self._noask_log_ts.get(cid, 0)
-                if now - last_t >= 60:
-                    self._noask_log_ts[cid] = now
-                    self.logger.info(
-                        "Arb scan: %s — no asks on %s side (Yes asks: %d, No asks: %d)",
-                        mkt["question"][:40],
-                        "Yes" if not asks_yes else "No",
-                        len(asks_yes), len(asks_no),
-                    )
-                continue
-
-            # Sort asks by price ascending so asks[0] is the *cheapest*
-            # offer.  The CLOB API does not guarantee sort order, so
-            # without this we may pick a stale $0.99 resting order
-            # instead of the tightest available ask.
-            asks_yes = sorted(asks_yes, key=lambda e: float(e.get("price", "0")))
-            asks_no = sorted(asks_no, key=lambda e: float(e.get("price", "0")))
-
-            best_ask_yes = float(asks_yes[0].get("price", 0))
-            best_ask_no = float(asks_no[0].get("price", 0))
-            avail_yes = float(asks_yes[0].get("size", 0))
-            avail_no = float(asks_no[0].get("size", 0))
-
-            self.logger.debug(
-                "Arb orderbook: %s — Yes top3 asks: %s / No top3 asks: %s",
-                mkt["question"][:30],
-                [(float(a.get("price", 0)), float(a.get("size", 0))) for a in asks_yes[:3]],
-                [(float(a.get("price", 0)), float(a.get("size", 0))) for a in asks_no[:3]],
-            )
-
-            if best_ask_yes <= 0 or best_ask_no <= 0:
-                continue
-
-            combined = best_ask_yes + best_ask_no
-            edge = 1.0 - combined  # positive = profitable
-            edge_pct = edge * 100.0
-
-            if edge_pct < min_edge_pct:
-                # Log at INFO periodically so user can see the monitor is
-                # actively scanning and what the current spread looks like.
-                log_interval = self.cfg.get("arb_log_interval", 5)
-                now = time.time()
-                last_t = self._edge_log_ts.get(cid, 0)
-                if now - last_t >= log_interval:
-                    self._edge_log_ts[cid] = now
-                    self.logger.info(
-                        "Arb scan: %s — %s=$%.3f + %s=$%.3f = $%.4f "
-                        "(edge %.2f%% < min %.2f%%, no trade)",
-                        mkt["question"][:40],
-                        mkt["yes_label"], best_ask_yes,
-                        mkt["no_label"], best_ask_no,
-                        combined, edge_pct, min_edge_pct,
-                    )
-                continue
-
-            # --- OPPORTUNITY FOUND ---
-            # Calculate how many shares we can buy (limited by available
-            # liquidity on both sides and our configured size).
-            max_shares_by_budget = arb_size / max(best_ask_yes, best_ask_no)
-            target_shares = min(max_shares_by_budget, avail_yes, avail_no)
-            est_cost = round(target_shares * (best_ask_yes + best_ask_no), 2)
-            est_profit = round(target_shares - est_cost, 4)
-
-            self.logger.info(
-                "ARB OPPORTUNITY: %s — %s=$%.3f + %s=$%.3f = $%.4f "
-                "(edge %.2f%%, ~%.0f shares, est cost $%.2f, est profit $%.4f)",
-                mkt["question"][:50],
-                mkt["yes_label"], best_ask_yes,
-                mkt["no_label"], best_ask_no,
-                combined, edge_pct, target_shares, est_cost, est_profit,
-            )
-
-            if dry_run:
-                self.logger.info("ARB DRY RUN — would buy both sides (skipping)")
-                continue
-
-            # Guard: abort if this market's window boundary has passed since
-            # we started this scan cycle.  The condition_id and token IDs
-            # from our snapshot belong to the *previous* window and
-            # Polymarket may have already created the next market.
-            slug_entry = mkt.get("_slug_entry")
-            if slug_entry and cid in window_keys_at_start:
-                current_wk = self._window_key_for(slug_entry)
-                if current_wk != window_keys_at_start[cid]:
-                    self.logger.warning(
-                        "ARB SKIPPED: window rotated during scan — "
-                        "aborting stale order for %s",
-                        mkt["question"][:40],
-                    )
-                    continue
-
-            # --- Execute first leg ---
-            # Cap the FOK retry price to preserve the arb edge.
-            # Max acceptable price for this leg = $1 - other_side_ask - min_margin.
-            # This prevents the retry from accepting a fill that destroys the arb.
-            max_retry_yes = round(1.0 - best_ask_no - 0.005, 2)
-            yes_result, yes_shares, yes_cost = self._place_arb_leg(
-                yes_token, best_ask_yes, target_shares, mkt["yes_label"],
-                max_retry_price=max(max_retry_yes, 0.01),
-            )
-
-            if not yes_result:
-                self.logger.warning(
-                    "ARB ABORTED: first leg (%s) failed for %s",
-                    mkt["yes_label"], mkt["question"][:40],
-                )
-                continue
-
-            # Guard between legs: if window rotated after first leg, do NOT
-            # place the second leg (it would target a different market).
-            if slug_entry and cid in window_keys_at_start:
-                current_wk = self._window_key_for(slug_entry)
-                if current_wk != window_keys_at_start[cid]:
-                    self.logger.warning(
-                        "ARB ABORTED BETWEEN LEGS: window rotated after %s leg "
-                        "filled (%.2f shares @ $%.2f) — skipping %s leg",
-                        mkt["yes_label"], yes_shares, yes_cost,
-                        mkt["no_label"],
-                    )
-                    self._active_positions[cid] = {
-                        "question": mkt["question"],
-                        "yes_fill": yes_result,
-                        "no_fill": None,
-                        "total_cost": yes_cost,
-                        "locked_profit": 0,
-                        "edge_pct": 0,
-                        "partial": True,
-                        "ts": datetime.now().isoformat(),
-                    }
-                    self._save_positions()
-                    continue
-
-            # --- Verify arb viability after first leg ---
-            # The first leg may have filled at a different price than
-            # expected.  Check that the actual cost per share + current
-            # best ask for the other side still yields a profit.
-            yes_eff_price = yes_cost / yes_shares if yes_shares > 0 else best_ask_yes
-            try:
-                fresh_book_no = self.clob_client.get_order_book(no_token)
-                fresh_asks_no = sorted(
-                    (fresh_book_no or {}).get("asks") or [],
-                    key=lambda e: float(e.get("price", "0")),
-                )
-                fresh_ask_no = float(fresh_asks_no[0].get("price", 0)) if fresh_asks_no else 0
-                fresh_avail_no = float(fresh_asks_no[0].get("size", 0)) if fresh_asks_no else 0
-            except Exception:
-                fresh_ask_no = best_ask_no
-                fresh_avail_no = avail_no
-
-            if fresh_ask_no <= 0:
-                self.logger.warning(
-                    "ARB ABORTED: no asks on %s side after first leg fill",
-                    mkt["no_label"],
-                )
-                self._active_positions[cid] = {
-                    "question": mkt["question"],
-                    "yes_fill": yes_result, "no_fill": None,
-                    "total_cost": yes_cost, "locked_profit": 0,
-                    "edge_pct": 0, "partial": True,
-                    "ts": datetime.now().isoformat(),
-                }
-                self._save_positions()
-                continue
-
-            real_combined = yes_eff_price + fresh_ask_no
-            if real_combined >= 1.0:
-                self.logger.warning(
-                    "ARB ABORTED: after first leg, combined cost $%.4f >= $1 "
-                    "(%s eff=$%.4f + %s ask=$%.4f) — no longer profitable",
-                    real_combined,
-                    mkt["yes_label"], yes_eff_price,
-                    mkt["no_label"], fresh_ask_no,
-                )
-                self._active_positions[cid] = {
-                    "question": mkt["question"],
-                    "yes_fill": yes_result, "no_fill": None,
-                    "total_cost": yes_cost, "locked_profit": 0,
-                    "edge_pct": 0, "partial": True,
-                    "ts": datetime.now().isoformat(),
-                }
-                self._save_positions()
-                continue
-
-            # --- Execute second leg ---
-            # CRITICAL: use the ACTUAL share count from the first leg
-            # so both sides have equal shares.  Also cap to available
-            # liquidity on the second side.
-            no_target_shares = min(yes_shares, fresh_avail_no)
-            if no_target_shares < yes_shares * 0.95:
-                self.logger.warning(
-                    "ARB ABORTED: insufficient %s liquidity "
-                    "(need %.2f shares, avail %.2f) for equal-share arb",
-                    mkt["no_label"], yes_shares, fresh_avail_no,
-                )
-                self._active_positions[cid] = {
-                    "question": mkt["question"],
-                    "yes_fill": yes_result, "no_fill": None,
-                    "total_cost": yes_cost, "locked_profit": 0,
-                    "edge_pct": 0, "partial": True,
-                    "ts": datetime.now().isoformat(),
-                }
-                self._save_positions()
-                continue
-
-            max_retry_no = round(1.0 - yes_eff_price - 0.005, 2)
-            no_result, no_shares, no_cost = self._place_arb_leg(
-                no_token, fresh_ask_no, no_target_shares, mkt["no_label"],
-                max_retry_price=max(max_retry_no, 0.01),
-            )
-
-            if yes_result and no_result:
-                actual_total_cost = yes_cost + no_cost
-                actual_min_shares = min(yes_shares, no_shares)
-                actual_profit = round(actual_min_shares - actual_total_cost, 4)
-                actual_edge = round(
-                    (1.0 - actual_total_cost / actual_min_shares) * 100
-                    if actual_min_shares > 0 else 0, 2,
-                )
-                self._active_positions[cid] = {
-                    "question": mkt["question"],
-                    "yes_fill": yes_result,
-                    "no_fill": no_result,
-                    "yes_shares": yes_shares,
-                    "no_shares": no_shares,
-                    "total_cost": actual_total_cost,
-                    "locked_profit": actual_profit,
-                    "edge_pct": actual_edge,
-                    "ts": datetime.now().isoformat(),
-                }
-                self._save_positions()
-                self.logger.info(
-                    "ARB EXECUTED: %s — %s=%.2f shares, %s=%.2f shares, "
-                    "cost $%.2f, locked profit $%.4f (%.2f%%)",
-                    mkt["question"][:50],
-                    mkt["yes_label"], yes_shares,
-                    mkt["no_label"], no_shares,
-                    actual_total_cost, actual_profit, actual_edge,
-                )
-                if abs(yes_shares - no_shares) > 0.01:
-                    self.logger.warning(
-                        "ARB WARNING: share mismatch — %s=%.4f vs %s=%.4f "
-                        "(diff=%.4f, %.2f unhedged shares)",
-                        mkt["yes_label"], yes_shares,
-                        mkt["no_label"], no_shares,
-                        abs(yes_shares - no_shares),
-                        abs(yes_shares - no_shares),
-                    )
-                # Log to trade history and send webhook
-                self._log_arb_trade(self._active_positions[cid])
-                self._notify_arb(
-                    "ARB EXECUTED: %s — %s=%.2f, %s=%.2f shares, "
-                    "cost $%.2f, locked profit $%.4f (%.2f%%)"
-                    % (
-                        mkt["question"][:50],
-                        mkt["yes_label"], yes_shares,
-                        mkt["no_label"], no_shares,
-                        actual_total_cost, actual_profit, actual_edge,
-                    )
-                )
-            else:
-                self.logger.warning(
-                    "ARB PARTIAL FILL: %s — %s=%s, %s=%s",
-                    mkt["question"][:40],
-                    mkt["yes_label"],
-                    "%.2f shares" % yes_shares if yes_result else "FAILED",
-                    mkt["no_label"],
-                    "%.2f shares" % no_shares if no_result else "FAILED",
-                )
-                partial_pos = {
-                    "question": mkt["question"],
-                    "yes_fill": yes_result,
-                    "no_fill": no_result,
-                    "yes_shares": yes_shares if yes_result else 0,
-                    "no_shares": no_shares if no_result else 0,
-                    "total_cost": (yes_cost if yes_result else 0) + (no_cost if no_result else 0),
-                    "locked_profit": 0,
-                    "edge_pct": round(edge_pct, 4),
-                    "partial": True,
-                    "ts": datetime.now().isoformat(),
-                }
-                self._active_positions[cid] = partial_pos
-                self._save_positions()
-                self._log_arb_trade(partial_pos, is_partial=True)
-                self._notify_arb(
-                    "ARB PARTIAL FILL: %s — %s=%s, %s=%s (NEEDS ATTENTION)"
-                    % (
-                        mkt["question"][:40],
-                        mkt["yes_label"],
-                        "%.2f shares" % yes_shares if yes_result else "FAILED",
-                        mkt["no_label"],
-                        "%.2f shares" % no_shares if no_result else "FAILED",
-                    )
-                )
-
-    def _place_arb_leg(self, token_id, price, target_shares, label,
-                       max_retry_price=None):
-        """Place a single FOK buy order for one side of the arb.
-
-        Args:
-            token_id: Token to buy.
-            price: Expected price per share (best ask at scan time).
-            target_shares: Number of shares to acquire.
-            label: Human-readable label for logging (e.g. "Up").
-            max_retry_price: If set, caps the FOK retry price to this
-                value.  For arb orders this prevents the retry from
-                accepting a fill price that destroys the arb edge.
-
-        Returns:
-            ``(result_dict, actual_shares, actual_cost)`` on success,
-            ``(None, 0, 0)`` on failure.
-        """
-        size_usdc = round(target_shares * price, 2)
-        # Send the initial FOK at the max arb-viable price instead of
-        # the exact best ask.  The CLOB fills at the best available
-        # price up to this limit, so small price movements between the
-        # orderbook fetch and the order submission won't cause a
-        # rejection.  Using the exact best ask (old behaviour) meant
-        # *any* movement resulted in a FOK rejection.
-        fok_price = price
-        if max_retry_price and max_retry_price > price:
-            fok_price = max_retry_price
-        try:
-            result = self.clob_client.place_order(
-                token_id=token_id,
-                side="BUY",
-                size_usdc=size_usdc,
-                price=fok_price,
-                use_fok=True,
-                max_retry_price=max_retry_price,
-            )
-            # Guard against FOK rejections that return a truthy dict like
-            # {"status": "fok_rejected", ...} or {"error": ...} — these
-            # are *not* successful fills and must not be treated as such.
-            if isinstance(result, dict) and (
-                result.get("status") == "fok_rejected"
-                or result.get("error")
-            ):
-                self.logger.warning(
-                    "Arb leg NOT filled (%s): %s", label, result,
-                )
-                return None, 0.0, 0.0
-
-            # Extract actual fill amounts from the CLOB response.
-            # For BUY: takingAmount = shares received, makingAmount = USDC spent.
-            actual_shares = 0.0
-            actual_cost = 0.0
-            if isinstance(result, dict):
-                try:
-                    actual_shares = float(result.get("takingAmount", 0))
-                except (ValueError, TypeError):
-                    pass
-                try:
-                    actual_cost = float(result.get("makingAmount", 0))
-                except (ValueError, TypeError):
-                    pass
-            # Fallback: if response doesn't have these fields, use our
-            # planned values as a best-effort estimate.
-            if actual_shares <= 0:
-                actual_shares = target_shares
-            if actual_cost <= 0:
-                actual_cost = size_usdc
-
-            if result:
-                eff_price = actual_cost / actual_shares if actual_shares > 0 else price
-                self.logger.info(
-                    "Arb leg filled: %s — %.2f shares @ $%.4f eff "
-                    "(planned %.2f @ $%.3f, cost $%.2f) — %s",
-                    label, actual_shares, eff_price,
-                    target_shares, price, actual_cost,
-                    str(result)[:100],
-                )
-            return result, actual_shares, actual_cost
-        except Exception as exc:
-            self.logger.error("Arb leg FAILED (%s): %s", label, exc)
-            return None, 0.0, 0.0
-
-    # -- public helpers (used by GUI / dashboard) ---------------------------
-
-    @property
-    def active_position_count(self):
-        return len(self._active_positions)
-
-    def get_status_summary(self):
-        """Return a one-line status string for the dashboard."""
-        n_markets = len(self._markets)
-        n_pos = len(self._active_positions)
-        total_locked = sum(
-            p.get("locked_profit", 0) for p in self._active_positions.values()
-        )
-        return (
-            f"Markets: {n_markets} | Active arbs: {n_pos} | "
-            f"Locked profit: ${total_locked:,.4f}"
-        )
-
-
-# ---------------------------------------------------------------------------
 # Martingale Bot – double-on-loss betting on 5-min BTC binary markets
 # ---------------------------------------------------------------------------
 
@@ -4654,7 +2880,7 @@ class MartingaleBot(threading.Thread):
         self._recovery_candle_open = None   # price at start of current candle
         self._recovery_candle_ts = 0    # epoch when current candle opened
 
-        # Callbacks (wired by CopyTraderBot)
+        # Callbacks (wired by MartingaleEngine)
         self.notify_callback = None
         self.log_trade_callback = None
 
@@ -6134,7 +4360,7 @@ class MartingaleManager:
             )
             self._bots.append(bot)
 
-    # -- Callbacks (wired once by CopyTraderBot) ----------------------------
+    # -- Callbacks (wired once by MartingaleEngine) ----------------------------
 
     def set_notify_callback(self, cb):
         for bot in self._bots:
@@ -6184,13 +4410,10 @@ class MartingaleManager:
 # ---------------------------------------------------------------------------
 
 class TradeExecutor:
-    """Handles the execution of copy trades via the Polymarket CLOB API
-    or directly on-chain.
+    """Handles trade execution via the Polymarket CLOB API and on-chain.
 
-    For the CLOB-based flow Polymarket requires signed orders submitted
-    via their API. For simplicity this implementation focuses on the
-    on-chain interaction path using the CTF Exchange contract, while also
-    supporting CLOB order placement when possible.
+    Manages balance checking, position tracking, redemption of settled
+    positions, and USDC approval management.
     """
 
     def __init__(self, w3, private_key, cfg, clob_client=None, logger=None):
@@ -6200,9 +4423,7 @@ class TradeExecutor:
         self.address = self.account.address
         self.cfg = cfg
         self.clob_client = clob_client  # PolymarketCLOBClient for order placement
-        self.logger = logger or logging.getLogger("CopyTrader")
-        self.copy_pct = Decimal(str(cfg.get("copy_percentage", 50))) / Decimal("100")
-        self.max_trade = Decimal(str(cfg.get("max_trade_usdc", 100)))
+        self.logger = logger or logging.getLogger("MartingaleBot")
         self.gas_multiplier = cfg.get("gas_multiplier", 1.2)
         self.slippage_bps = cfg.get("slippage_tolerance_bps", 50)
         self._nonce_lock = threading.Lock()
@@ -6216,7 +4437,7 @@ class TradeExecutor:
         self._open_orders = {}
         self._order_ttl = cfg.get("order_ttl_seconds", 300)
 
-        # Optional webhook callback (set by CopyTraderBot after init)
+        # Optional webhook callback (set by MartingaleEngine after init)
         self.notify_callback = None
 
         # Kill switch: stop the bot when session losses exceed threshold
@@ -8712,25 +6933,6 @@ class TradeExecutor:
             self.logger.warning("Proxy USDC withdrawal error: %s", exc)
         return results
 
-    def compute_copy_amount(self, original_usdc_amount):
-        """Return the copy amount in USDC.
-
-        Scales the original trade by copy_percentage, capped to max_trade.
-        When the balance is available, also capped to 95% of it.
-        """
-        base = Decimal(str(original_usdc_amount)) * self.copy_pct
-        amount = min(base, self.max_trade)
-        try:
-            balance = self.get_usdc_balance()
-            amount = min(amount, balance * Decimal("0.95"))
-        except Exception as exc:
-            self.logger.warning(
-                "Could not fetch USDC balance for cap check (%s); "
-                "proceeding with max_trade cap only",
-                exc,
-            )
-        return max(amount, Decimal("0"))
-
     def ensure_usdc_approval(self, spender, amount_raw):
         """Approve the spender for at least *amount_raw* USDC if needed."""
         spender = Web3.to_checksum_address(spender)
@@ -8829,451 +7031,11 @@ class TradeExecutor:
                 time.sleep(2 ** attempt)
         return None
 
-    def execute_copy_trade(self, trade_info):
-        """Attempt to replicate a detected trade.
-
-        *trade_info* is a dict with at least:
-          - asset_id or tokenId: the conditional token ID
-          - side: 'BUY' or 'SELL'
-          - size or amount: the USDC notional
-          - price: the price per share (0-1 range)
-        """
-        try:
-            self.logger.debug("Raw trade_info: %s", json.dumps(trade_info, default=str)[:500])
-            side = str(trade_info.get("side", "BUY")).upper()
-            # CLOB API: prefer usdcSize (actual USDC spent), fall back to size/amount
-            clob_size = (
-                trade_info.get("usdcSize")
-                or trade_info.get("size")
-                or trade_info.get("amount")
-            )
-            if clob_size:
-                original_usdc = Decimal(str(clob_size))
-            else:
-                raw = Decimal(str(trade_info.get("makerAmountFilled", "0")))
-                original_usdc = raw / Decimal("1000000")
-            self.logger.debug("Trade size parsing: raw=%s -> original_usdc=%s", clob_size or trade_info.get("makerAmountFilled"), original_usdc)
-            if original_usdc <= 0:
-                self.logger.warning("Skipping trade with zero/negative size")
-                return None
-
-            copy_amount = self.compute_copy_amount(original_usdc)
-            if copy_amount <= Decimal("0.01"):
-                self.logger.info("Computed copy amount too small (%.4f USDC), skipping", copy_amount)
-                return None
-
-            token_id = str(
-                trade_info.get("asset")
-                or trade_info.get("asset_id")
-                or trade_info.get("tokenId")
-                or trade_info.get("makerAssetId", "")
-            )
-            price = trade_info.get("price", 0.5)
-
-            # Detect whether this is a Neg Risk market and capture the
-            # condition_id — both are needed for correct exchange approval
-            # and later redemption.
-            neg_risk = False
-            condition_id = None
-            market = None
-            if self.clob_client:
-                try:
-                    market = self.clob_client.get_market_by_token(token_id)
-                    if market:
-                        neg_risk = self._is_neg_risk_market(market)
-                        condition_id = market.get("condition_id")
-                        # Cache neg_risk for future fallback lookups
-                        self.clob_client._token_to_neg_risk[token_id] = neg_risk
-                except Exception as exc:
-                    self.logger.debug(
-                        "Market lookup failed for token %s: %s",
-                        token_id[:16] + "...", exc,
-                    )
-                # Fallback 1: use cached condition_id from activity data
-                if not condition_id:
-                    condition_id = self.clob_client._token_to_condition.get(token_id)
-                    neg_risk = self.clob_client._token_to_neg_risk.get(
-                        token_id, neg_risk
-                    )
-                # Fallback 2: extract condition_id from the trade_info itself
-                if not condition_id:
-                    condition_id = (
-                        trade_info.get("conditionId")
-                        or trade_info.get("condition_id")
-                    )
-                    if condition_id:
-                        # Cache it for future trades on the same token
-                        self.clob_client._token_to_condition[token_id] = str(condition_id)
-            if not condition_id:
-                self.logger.warning(
-                    "No condition_id found for token %s — positions will "
-                    "lack redemption params until resolved",
-                    token_id[:16] + "...",
-                )
-
-            # --- Enforce Polymarket order minimums early ---
-            # The CLOB API requires both ≥5 tokens AND ≥$1 USDC notional.
-            # Compute the minimum viable USDC now so the balance cap and
-            # allowance approval use the real order size (not the pre-bump
-            # amount that place_order would silently inflate).
-            #
-            # Use the whale's price directly — no adverse slippage applied.
-            price_f = float(price) if not isinstance(price, float) else price
-            if price_f > 0:
-                effective_price = round(price_f, 2)
-                effective_price = max(min(effective_price, 0.99), 0.01)
-                min_viable_usdc = max(
-                    MIN_ORDER_SIZE_TOKENS * effective_price,
-                    MIN_ORDER_NOTIONAL_USDC,
-                )
-                if float(copy_amount) < min_viable_usdc:
-                    # Check balance before committing to the bumped amount
-                    try:
-                        balance = float(self.get_usdc_balance())
-                        if min_viable_usdc > balance * 0.95:
-                            self.logger.info(
-                                "Min viable order $%.2f exceeds 95%% of balance $%.2f, "
-                                "skipping trade",
-                                min_viable_usdc, balance,
-                            )
-                            return None
-                    except Exception:
-                        pass  # let it proceed; place_order will fail gracefully
-                    self.logger.info(
-                        "Bumping copy amount from $%.2f to min viable $%.2f "
-                        "(price=%.4f, min_tokens=%d, min_notional=$%.0f)",
-                        copy_amount, min_viable_usdc,
-                        price_f, MIN_ORDER_SIZE_TOKENS, MIN_ORDER_NOTIONAL_USDC,
-                    )
-                    copy_amount = Decimal(str(round(min_viable_usdc, 6)))
-
-            # --- SELL guard: only sell tokens we actually hold ---
-            if side == "SELL":
-                pos = self._positions.get(token_id)
-                held = pos["tokens"] if pos else Decimal("0")
-                if held <= 0:
-                    self.logger.info(
-                        "SELL skipped – no position in token %s",
-                        token_id[:16] + "...",
-                    )
-                    return None
-                # Cap sell to what we own (in USDC terms at current price)
-                if price_f > 0:
-                    held_usdc = held * Decimal(str(price_f))
-                    if copy_amount > held_usdc:
-                        self.logger.info(
-                            "SELL capped from $%.2f to $%.2f (held %.2f tokens)",
-                            copy_amount, held_usdc, held,
-                        )
-                        copy_amount = held_usdc
-
-            # Log latency info if the trade was annotated by get_new_trades()
-            detection_latency = trade_info.get("_detection_latency_s")
-            latency_str = " [latency=%.1fs]" % detection_latency if detection_latency else ""
-            self.logger.info(
-                "COPY TRADE: %s %.2f USDC of token %s (original: %.2f USDC, price: %s)%s",
-                side, copy_amount, token_id[:16] + "..." if len(token_id) > 16 else token_id,
-                original_usdc, price, latency_str,
-            )
-
-            # --- DRY RUN: log but do not execute ---
-            if self.cfg.get("dry_run", False):
-                self.logger.info(
-                    "[DRY RUN] Would %s %.2f USDC of token %s @ price %s",
-                    side, copy_amount, token_id[:20], price,
-                )
-                return {
-                    "status": "dry_run",
-                    "side": side,
-                    "amount_usdc": float(copy_amount),
-                    "token_id": token_id,
-                    "price": price,
-                }
-
-            # Ensure approvals on the correct exchange.
-            if side == "BUY":
-                raw_amount = int(copy_amount * Decimal("1000000"))
-                self.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
-                if neg_risk:
-                    self.ensure_usdc_approval(
-                        NEG_RISK_CTF_EXCHANGE_ADDRESS, raw_amount,
-                    )
-            else:
-                # SELL: exchange needs ERC1155 approval to transfer our tokens
-                self.ensure_ct_approval(neg_risk=neg_risk)
-
-            # Place order via the CLOB API (requires py-clob-client + API creds)
-            if self.clob_client and self.clob_client.clob_sdk:
-                # --- Smart price selection ---
-                # The whale's trade price is STALE by the time we detect it
-                # (5-30s later).  Using whale_price + slippage guarantees we
-                # overpay on buys and undersell on sells.
-                #
-                # Instead, fetch the CURRENT orderbook and use the live
-                # best_ask (for buys) or best_bid (for sells) as our limit.
-                # This ensures we fill at the actual market price, not a
-                # worse price derived from stale data.
-                #
-                # We still apply max_price_deviation_pct as a safety cap to
-                # avoid filling when the market has moved too far from the
-                # whale's entry (suggesting the opportunity is gone).
-                slippage_mult = Decimal(str(self.slippage_bps)) / Decimal("10000")
-                whale_price = float(price)
-
-                # --- FOK at whale price (buys) / whale price - slippage (sells) ---
-                # For BUYS: use the whale's exact price as our FOK limit.
-                # If the market has moved above whale price, our FOK won't fill
-                # and we skip the trade.  Better to miss than overpay — paying
-                # more than the whale guarantees we underperform them.
-                #
-                # For SELLS (copied_sell): apply slippage tolerance since we
-                # need to exit and a small concession is acceptable.
-                if side == "BUY":
-                    adjusted_price = float(price)
-                    adjusted_price = min(adjusted_price, 0.99)
-                else:
-                    adjusted_price = float(
-                        Decimal(str(price)) * (Decimal("1") - slippage_mult)
-                    )
-                    adjusted_price = max(adjusted_price, 0.01)
-
-                # --- Fetch live orderbook for stale-price safety check ---
-                max_dev_pct = self.cfg.get("max_price_deviation_pct", 5)
-                best_bid = 0
-                best_ask = 0
-                try:
-                    book = self.clob_client.get_order_book(token_id)
-                    if book:
-                        bids = book.get("bids") or []
-                        asks = book.get("asks") or []
-                        best_bid = float(bids[0].get("price", 0)) if bids else 0
-                        best_ask = float(asks[0].get("price", 0)) if asks else 0
-                except Exception as book_exc:
-                    self.logger.debug(
-                        "Orderbook fetch failed (using whale price): %s",
-                        book_exc,
-                    )
-
-                if best_bid > 0 and best_ask > 0:
-                    mid_price = (best_bid + best_ask) / 2.0
-
-                    # --- Stale price protection ---
-                    if whale_price > 0 and max_dev_pct > 0:
-                        deviation = abs(mid_price - whale_price) / whale_price * 100
-                        if deviation > max_dev_pct:
-                            self.logger.warning(
-                                "STALE PRICE: whale traded at %.4f but "
-                                "current mid=%.4f (%.1f%% deviation > %d%% "
-                                "max) — skipping %s",
-                                whale_price, mid_price, deviation,
-                                max_dev_pct, token_id[:16] + "...",
-                            )
-                            return {
-                                "status": "skipped_stale_price",
-                                "side": side,
-                                "amount_usdc": float(copy_amount),
-                                "token_id": token_id,
-                                "price": float(price),
-                                "mid_price": mid_price,
-                                "deviation_pct": round(deviation, 2),
-                            }
-
-                    # For SELLS only: use best_bid for better fill if available
-                    if side == "SELL":
-                        market_price = float(
-                            Decimal(str(best_bid)) * (Decimal("1") - slippage_mult)
-                        )
-                        market_price = max(market_price, 0.01)
-                        adjusted_price = max(market_price, adjusted_price)
-
-                self.logger.info(
-                    "WHALE PRICE FOK: whale=%.4f, bid=%.4f, ask=%.4f, "
-                    "limit=%.4f (%s)",
-                    whale_price, best_bid, best_ask, adjusted_price, side,
-                )
-
-                result = self.clob_client.place_order(
-                    token_id=token_id,
-                    side=side,
-                    size_usdc=float(copy_amount),
-                    price=adjusted_price,
-                    use_fok=True,
-                )
-                if result:
-                    self.logger.info("Order submitted to CLOB: %s", result)
-
-                    # If the order was rejected, do NOT update positions
-                    order_status = result.get("status", "") if isinstance(result, dict) else ""
-                    if order_status in ("fok_rejected", "error"):
-                        return result
-
-                    self.invalidate_balance_cache()
-
-                    # Update position tracker — use actual fill amounts from
-                    # CLOB response when available (FOK fills may execute at a
-                    # better price, giving more tokens than limit_price implies).
-                    actual_tokens = None
-                    actual_price = None
-                    if isinstance(result, dict):
-                        taking = result.get("takingAmount")
-                        making = result.get("makingAmount")
-                        if side == "BUY" and taking:
-                            try:
-                                actual_tokens = Decimal(str(taking))
-                                if making:
-                                    actual_price = Decimal(str(making)) / actual_tokens
-                            except Exception:
-                                pass
-                        elif side == "SELL" and making:
-                            try:
-                                actual_tokens = Decimal(str(making))
-                                if taking:
-                                    actual_price = Decimal(str(taking)) / actual_tokens
-                            except Exception:
-                                pass
-                    tokens = actual_tokens if actual_tokens else (
-                        copy_amount / Decimal(str(adjusted_price))
-                        if adjusted_price > 0
-                        else Decimal("0")
-                    )
-                    fill_price = float(actual_price) if actual_price else adjusted_price
-                    market_name = (
-                        market.get("question") or market.get("slug")
-                        if market else None
-                    )
-                    # Determine outcome side (Yes/No) from market tokens
-                    outcome_side = None
-                    if market:
-                        for tok in (market.get("tokens") or []):
-                            tid = tok.get("token_id") or tok.get("tokenId") or ""
-                            if tid == token_id:
-                                outcome_side = tok.get("outcome", "").capitalize()
-                                break
-                    redeem_params = {
-                        "neg_risk": neg_risk,
-                        "condition_id": condition_id,
-                        "collateral_token": USDC_ADDRESS,
-                        "parent_collection_id": "0x" + "00" * 32,
-                        "index_sets": [1, 2],
-                        "market_name": market_name,
-                        "outcome_side": outcome_side,
-                    }
-                    if side == "BUY":
-                        pos = self._positions.get(token_id)
-                        if pos:
-                            # Weighted-average entry price (both bot and whale)
-                            old_tokens = pos["tokens"]
-                            old_cost = old_tokens * pos["entry_price"]
-                            new_cost = tokens * Decimal(str(fill_price))
-                            total_tokens = old_tokens + tokens
-                            avg_price = (
-                                (old_cost + new_cost) / total_tokens
-                                if total_tokens > 0
-                                else Decimal(str(fill_price))
-                            )
-                            pos["tokens"] = total_tokens
-                            pos["entry_price"] = avg_price
-                            pos.update(redeem_params)
-                        else:
-                            self._positions[token_id] = {
-                                "tokens": tokens,
-                                "entry_price": Decimal(str(fill_price)),
-                                "opened_at": datetime.now().isoformat(),
-                                **redeem_params,
-                            }
-                    elif side == "SELL":
-                        pos = self._positions.get(token_id)
-                        if pos:
-                            sold_tokens = min(tokens, pos["tokens"])
-                            pos["tokens"] = max(pos["tokens"] - tokens, Decimal("0"))
-                            # Remove position entirely if fully closed
-                            if pos["tokens"] <= 0:
-                                self._log_closed_trade(
-                                    token_id, pos.get("entry_price", 0),
-                                    fill_price, sold_tokens,
-                                    "copied_sell",
-                                    market=pos.get("market_name"),
-                
-                                )
-                                del self._positions[token_id]
-
-                    # Log redemption parameters for every trade
-                    self.logger.info(
-                        "Redemption params for token %s: "
-                        "conditionId=%s, collateralToken=%s, "
-                        "parentCollectionId=0x00..00, indexSets=[1,2], "
-                        "neg_risk=%s",
-                        token_id[:16] + "...",
-                        condition_id[:16] + "..." if condition_id else "UNKNOWN",
-                        USDC_ADDRESS,
-                        neg_risk,
-                    )
-
-                    cur_tokens = (
-                        self._positions[token_id]["tokens"]
-                        if token_id in self._positions
-                        else Decimal("0")
-                    )
-                    self.logger.info(
-                        "Position updated: token %s now %.2f tokens",
-                        token_id[:16] + "...",
-                        cur_tokens,
-                    )
-
-                    # Persist to disk so redemption params survive restarts
-                    self._save_positions()
-
-                    # Track the order for fill monitoring
-                    order_id = None
-                    if isinstance(result, dict):
-                        order_id = (
-                            result.get("orderID")
-                            or result.get("id")
-                            or result.get("order_id")
-                        )
-                    if order_id:
-                        self.track_order(
-                            order_id, side, token_id,
-                            fill_price, float(copy_amount),
-                        )
-
-                    return {
-                        "status": "submitted",
-                        "side": side,
-                        "amount_usdc": float(copy_amount),
-                        "token_id": token_id,
-                        "price": fill_price,
-                        "fill_tokens": float(tokens),
-                        "whale_price": float(price),
-                        "original_usdc": float(original_usdc),
-                        "clob_response": result,
-                    }
-                else:
-                    self.logger.warning("CLOB order placement returned no result")
-            else:
-                self.logger.warning(
-                    "CLOB SDK not available – trade detected but not executed. "
-                    "Install py-clob-client and configure API credentials to enable."
-                )
-
-            return {
-                "status": "detected_only",
-                "side": side,
-                "amount_usdc": float(copy_amount),
-                "token_id": token_id,
-                "price": price,
-            }
-
-        except Exception as exc:
-            self.logger.error("Failed to execute copy trade: %s", exc, exc_info=True)
-            return None
-
-
 # ---------------------------------------------------------------------------
 # Core bot engine (runs in a background thread)
 # ---------------------------------------------------------------------------
 
-class CopyTraderBot:
+class MartingaleEngine:
     """Orchestrates the monitoring loop and trade execution."""
 
     def __init__(self, cfg, logger):
@@ -9294,10 +7056,6 @@ class CopyTraderBot:
 
         # Web3 connection (lazy init)
         self.w3 = None
-        self.on_chain_monitor = None
-        self._ws_monitor = None
-        self._ws_wake = threading.Event()
-        self._arb_monitor = None
         self._martingale_mgr = None
         self._telegram_bot = None
         self.executor = None
@@ -9315,8 +7073,8 @@ class CopyTraderBot:
     def _append_trade_history(self, record):
         """Append a trade record to the persistent trade_history.json.
 
-        Used by ArbitrageMonitor and MartingaleBot to log trades into the
-        same history file that the TradeExecutor uses for copy trades, so
+        Used by MartingaleBot to log trades into the
+        same history file that the TradeExecutor uses, so
         all trades appear in the History tab and dashboard stats.
 
         Thread-safe: uses the module-level ``_TRADE_HISTORY_LOCK`` to
@@ -9473,12 +7231,6 @@ class CopyTraderBot:
         except Exception as exc:
             self.logger.warning("Startup: cancel-all failed (non-fatal): %s", exc)
 
-        # Seed existing trades so we don't copy old history
-        watched = self.cfg.get("watched_addresses", [])
-        for i, addr in enumerate(watched):
-            self.clob_client.seed_seen_trades(addr)
-            if i < len(watched) - 1:
-                time.sleep(0.5)  # throttle API calls between addresses
 
     def start(self):
         if self.running:
@@ -9489,74 +7241,32 @@ class CopyTraderBot:
         self._trade_history = []
 
         # --- Display active configuration at startup ---
-        watched = self.cfg.get("watched_addresses", [])
         self.logger.info("=" * 60)
-        self.logger.info("COPY TRADER CONFIGURATION")
+        self.logger.info("MARTINGALE BOT CONFIGURATION")
         self.logger.info("=" * 60)
-        self.logger.info("  Watched addresses:      %d", len(watched))
-        for i, addr in enumerate(watched):
-            self.logger.info("    [%d] %s", i + 1, addr)
-        self.logger.info("  Copy percentage:        %s%%",
-                         self.cfg.get("copy_percentage", 50))
-        self.logger.info("  Max trade size:         $%s",
-                         self.cfg.get("max_trade_usdc", 100))
-        self.logger.info("  Slippage tolerance:     %s bps",
-                         self.cfg.get("slippage_tolerance_bps", 0))
-        self.logger.info("  Poll interval:          %ss",
-                         self.cfg.get("poll_interval_seconds", 2))
-        self.logger.info("  Order TTL:              %ss",
-                         self.cfg.get("order_ttl_seconds", 10))
-        self.logger.info("  Max price deviation:    %s%%",
-                         self.cfg.get("max_price_deviation_pct", 2))
-        self.logger.info("  Trade max age:          %ss",
-                         self.cfg.get("trade_max_age_seconds", 30))
+        self.logger.info("  Martingale enabled:     %s",
+                         self.cfg.get("martingale_enabled", False))
         self.logger.info("  Resume threshold:       $%s",
                          self.cfg.get("resume_threshold_usdc", 5))
         self.logger.info("  Dry run:                %s",
                          self.cfg.get("dry_run", False))
         self.logger.info("  Auto redeem settled:    %s",
                          self.cfg.get("auto_redeem_settled", True))
-        ws_status = "disabled"
-        if self.cfg.get("ws_rpc_url"):
-            ws_status = "enabled" if HAS_WS_CLIENT else "no websocket-client"
-        self.logger.info("  WebSocket detection:    %s", ws_status)
-        arb_status = "disabled"
-        if self.cfg.get("arb_enabled"):
-            dynamic_slug = self.cfg.get("arb_dynamic_slug", "").strip()
-            if dynamic_slug:
-                arb_status = (
-                    f"enabled (dynamic '{dynamic_slug}' every "
-                    f"{self.cfg.get('arb_dynamic_window', 300)}s, "
-                    f"min edge {self.cfg.get('arb_min_edge_pct', 1.0)}%)"
-                )
-            else:
-                n_arb = len(self.cfg.get("arb_condition_ids", []))
-                arb_status = f"enabled ({n_arb} market(s), min edge {self.cfg.get('arb_min_edge_pct', 1.0)}%)"
-        self.logger.info("  Arbitrage mode:         %s", arb_status)
         self.logger.info("=" * 60)
 
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         self.logger.info("Bot started")
-        self._notify("Bot started — monitoring %d address(es)" % len(watched))
+        self._notify("Martingale bot started")
 
     def stop(self):
         self.running = False
-        # Stop WebSocket monitor if running
-        if self._ws_monitor:
-            self._ws_monitor.stop()
-        # Stop Arbitrage monitor if running
-        if self._arb_monitor:
-            self._arb_monitor.stop()
         # Stop Martingale bots if running
         if self._martingale_mgr:
             self._martingale_mgr.stop()
         # Stop Telegram command bot if running
         if self._telegram_bot:
             self._telegram_bot.stop()
-        # Wake the main loop so it exits the Event.wait() immediately
-        if hasattr(self, '_ws_wake'):
-            self._ws_wake.set()
         self.logger.info("Bot stop requested")
         self._notify("Bot stopped")
         # Report is generated at the end of _run_loop after the while
@@ -9567,84 +7277,11 @@ class CopyTraderBot:
         # Initialise connections – CLOB first so executor can use it
         self._init_clob()
 
-        # Event used by WebSocketMonitor to wake the main loop instantly
-        # when a whale trade is detected on-chain.
-        self._ws_wake = threading.Event()
-        self._ws_monitor = None
-
         web3_ok = self._init_web3()
         if web3_ok:
             self._init_executor()
-            watched = self.cfg.get("watched_addresses", [])
-            self.on_chain_monitor = OnChainMonitor(self.w3, watched, self.logger)
 
-            # Start WebSocket monitor for real-time detection if ws_rpc_url
-            # is configured and websocket-client is installed.
-            ws_url = self.cfg.get("ws_rpc_url", "")
-            if ws_url and HAS_WS_CLIENT and watched:
-                self._ws_monitor = WebSocketMonitor(
-                    ws_url, watched, self._ws_wake, self.logger,
-                )
-                self._ws_monitor.start()
-                self.logger.info(
-                    "Real-time WebSocket detection enabled — "
-                    "poll interval serves as fallback only"
-                )
-            elif ws_url and not HAS_WS_CLIENT:
-                self.logger.warning(
-                    "ws_rpc_url configured but websocket-client not installed. "
-                    "Install with: pip install websocket-client"
-                )
-
-        # ---- Start Arbitrage Monitor (independent of copy trading) ----
-        if self.cfg.get("arb_enabled") and self.clob_client:
-            arb_cids = self.cfg.get("arb_condition_ids", [])
-            dynamic_slugs = self.cfg.get("arb_dynamic_slugs", [])
-            dynamic_slug = self.cfg.get("arb_dynamic_slug", "").strip()
-            has_dynamic = bool(dynamic_slugs or dynamic_slug)
-            if arb_cids or has_dynamic:
-                self._arb_monitor = ArbitrageMonitor(
-                    self.clob_client, self.cfg, self.logger,
-                )
-                self._arb_monitor.notify_callback = self._notify
-                self._arb_monitor.log_trade_callback = self._append_trade_history
-                self._arb_monitor.start()
-                self.logger.info(
-                    "Copy trading from watched wallets DISABLED while "
-                    "arb mode is active (wallet polling skipped)"
-                )
-                if has_dynamic:
-                    # Use the monitor's helper to get the effective slug list
-                    eff_slugs = self._arb_monitor._get_effective_slugs()
-                    self.logger.info(
-                        "Arbitrage monitor enabled — %d dynamic slug(s), "
-                        "min edge %.1f%%, $%.0f/side, poll every %ds",
-                        len(eff_slugs),
-                        self.cfg.get("arb_min_edge_pct", 1.0),
-                        self.cfg.get("arb_size_usdc", 10.0),
-                        self.cfg.get("arb_poll_seconds", 2),
-                    )
-                    for s in eff_slugs:
-                        self.logger.info(
-                            "  slug: '%s' (window %ds, format %s)",
-                            s["slug"], s["window"], s.get("format", "timestamp"),
-                        )
-                else:
-                    self.logger.info(
-                        "Arbitrage monitor enabled — scanning %d market(s), "
-                        "min edge %.1f%%, $%.0f/side, poll every %ds",
-                        len(arb_cids),
-                        self.cfg.get("arb_min_edge_pct", 1.0),
-                        self.cfg.get("arb_size_usdc", 10.0),
-                        self.cfg.get("arb_poll_seconds", 2),
-                    )
-            else:
-                self.logger.warning(
-                    "arb_enabled=True but no arb_condition_ids or "
-                    "arb_dynamic_slugs configured"
-                )
-
-        # ---- Start Martingale Bot(s) (independent of copy trading) ----
+        # ---- Start Martingale Bot(s) ----
         if self.cfg.get("martingale_enabled") and self.clob_client:
             self._martingale_mgr = MartingaleManager(
                 self.clob_client, self.cfg, self.logger,
@@ -9653,7 +7290,7 @@ class CopyTraderBot:
             self._martingale_mgr.set_log_trade_callback(self._append_trade_history)
             self._martingale_mgr.start()
 
-        # ---- Start Telegram command bot (independent of trading mode) ----
+        # ---- Start Telegram command bot ----
         tg_token = self.cfg.get("telegram_bot_token", "").strip()
         tg_chat = self.cfg.get("telegram_chat_id", "").strip()
         if tg_token and tg_chat and requests:
@@ -9671,8 +7308,8 @@ class CopyTraderBot:
                 except Exception as bf_exc:
                     self.logger.debug("Market name backfill failed (non-fatal): %s", bf_exc)
 
-            # ---- Startup redemption (runs BEFORE copy-trading begins) ----
-            self.logger.info("Startup: redeeming settled positions before monitoring...")
+            # ---- Startup redemption ----
+            self.logger.info("Startup: redeeming settled positions...")
 
             if self.executor and self.cfg.get("auto_redeem_settled", True):
                 try:
@@ -9692,7 +7329,7 @@ class CopyTraderBot:
                         proxy_exc,
                     )
 
-            # Report balance after redemptions so user knows what's available
+            # Report balance after redemptions
             if self.executor:
                 try:
                     balance = self.executor.get_usdc_balance(max_age_seconds=0)
@@ -9703,28 +7340,19 @@ class CopyTraderBot:
                 except Exception:
                     pass
 
-        poll_interval = self.cfg.get("poll_interval_seconds", 5)
-        self.logger.info(
-            "Monitoring %d address(es), poll interval %ds",
-            len(self.cfg.get("watched_addresses", [])),
-            poll_interval,
-        )
+        poll_interval = self.cfg.get("poll_interval_seconds", 10)
 
         resume_threshold = Decimal(
             str(self.cfg.get("resume_threshold_usdc", 5))
         )
-        _last_pause_log = 0  # timestamp of last "still paused" INFO log
-        # Initialise to now so the main loop doesn't immediately re-run
-        # the same scans that the startup sequence just completed.
+        _last_pause_log = 0
         _now = time.time()
         _last_redeem_check = _now
         _last_proxy_check = _now
         _last_portfolio_scan = _now
-        _last_exit_check = 0  # exit checks should start immediately
-        exit_check_interval = self.cfg.get("exit_check_seconds", 5)
 
         # Runtime-togglable config keys — re-read from config.json
-        _RUNTIME_TOGGLE_KEYS = {"arb_enabled", "martingale_enabled"}
+        _RUNTIME_TOGGLE_KEYS = {"martingale_enabled"}
         _last_config_reload = 0
 
         while self.running:
@@ -9744,7 +7372,7 @@ class CopyTraderBot:
                                     k, old, disk_cfg[k],
                                 )
                     except Exception:
-                        pass  # config.json may not exist or be corrupt
+                        pass
 
                 # --- Low-balance pause / resume check ---
                 if self.executor:
@@ -9763,8 +7391,6 @@ class CopyTraderBot:
                                     "trading" % balance
                                 )
                             else:
-                                # Log at INFO only every 5 minutes to
-                                # avoid flooding the logs while idle.
                                 now = time.time()
                                 if now - _last_pause_log >= 300:
                                     self.logger.info(
@@ -9794,39 +7420,7 @@ class CopyTraderBot:
                             "Balance check failed: %s", bal_exc,
                         )
 
-                # --- Monitor open orders regardless of pause state ---
-                # Orders must still be tracked so they can settle and
-                # free up balance for the resume check.
-                if self.executor:
-                    try:
-                        self.executor.monitor_open_orders()
-                    except Exception as mon_exc:
-                        self.logger.debug(
-                            "Order monitor error: %s", mon_exc,
-                        )
-
-                # --- Auto-exit positions at take-profit / stop-loss ---
-                # Runs even while paused so we protect existing positions.
-                # Uses its own faster timer (default 5s) independent of
-                # the poll interval to catch price moves quickly.
-                now_exit = time.time()
-                if (
-                    self.executor
-                    and now_exit - _last_exit_check >= exit_check_interval
-                ):
-                    _last_exit_check = now_exit
-                    try:
-                        self.executor.check_exit_conditions()
-                    except Exception as exit_exc:
-                        self.logger.warning(
-                            "Exit condition check error: %s", exit_exc,
-                            exc_info=True,
-                        )
-
                 # --- Auto-redeem settled positions back to USDC ---
-                # When paused (low balance) we check every 30 s so we
-                # can redeem as trades resolve and resume quickly.
-                # Otherwise checks every 5 min.
                 now = time.time()
                 redeem_interval = (
                     PAUSED_REDEEM_INTERVAL_SECONDS
@@ -9855,13 +7449,6 @@ class CopyTraderBot:
                         )
 
                 # --- Full portfolio scan (periodic) ---
-                # Re-scans the wallet's complete trade history to catch
-                # positions that resolved since the last check.  More
-                # expensive than check_and_redeem_settled (which only
-                # checks _positions dict) but catches positions that
-                # were missed or not tracked.
-                # When paused, uses the same accelerated cadence as the
-                # proxy scan so we can redeem quickly and resume trading.
                 portfolio_scan_interval = (
                     PAUSED_REDEEM_INTERVAL_SECONDS
                     if self._paused_low_balance
@@ -9888,7 +7475,6 @@ class CopyTraderBot:
                         )
 
                 # --- Proxy wallet redemption & withdrawal ---
-                # Uses the same accelerated cadence while paused.
                 proxy_interval = (
                     PAUSED_REDEEM_INTERVAL_SECONDS
                     if self._paused_low_balance
@@ -9914,8 +7500,7 @@ class CopyTraderBot:
                             exc_info=True,
                         )
 
-                # If we just redeemed while paused, immediately re-check
-                # balance so we can resume without waiting another cycle.
+                # If we just redeemed while paused, immediately re-check balance
                 if _did_redeem and self._paused_low_balance and self.executor:
                     try:
                         self.executor.invalidate_balance_cache()
@@ -9928,91 +7513,7 @@ class CopyTraderBot:
                                 balance, resume_threshold,
                             )
                     except Exception:
-                        pass  # will be rechecked next cycle
-
-                # --- Skip copy trading when arb mode is active ---
-                # Arb and copy trading share the same CLOB client and
-                # balance; running both simultaneously slows the arb bot
-                # down with unnecessary wallet polling & API calls.
-                _arb_mon = getattr(self, "_arb_monitor", None)
-                _arb_active = (
-                    self.cfg.get("arb_enabled")
-                    and _arb_mon is not None
-                    and _arb_mon.is_alive()
-                )
-                # Clean up dead monitor (e.g. after runtime toggle-off)
-                if _arb_mon is not None and not _arb_mon.is_alive():
-                    self._arb_monitor = None
-
-                # --- Skip trade detection & execution while paused ---
-                if self._paused_low_balance:
-                    pass  # just wait for balance to recover
-                elif _arb_active:
-                    pass  # arb mode owns the trading loop
-                else:
-                    new_trades = []
-
-                    # --- CLOB API polling (primary) ---
-                    if self.clob_client:
-                        for addr in self.cfg.get("watched_addresses", []):
-                            api_trades = self.clob_client.get_new_trades(addr)
-                            if api_trades:
-                                latencies = [
-                                    t.get("_detection_latency_s")
-                                    for t in api_trades
-                                    if t.get("_detection_latency_s") is not None
-                                ]
-                                latency_info = ""
-                                if latencies:
-                                    latency_info = (
-                                        " (avg latency=%.1fs, max=%.1fs)"
-                                        % (sum(latencies) / len(latencies),
-                                           max(latencies))
-                                    )
-                                self.logger.info(
-                                    "CLOB API: %d new trade(s) from %s%s",
-                                    len(api_trades), addr[:10] + "...",
-                                    latency_info,
-                                )
-                                new_trades.extend(api_trades)
-
-                    # --- On-chain polling (fallback) ---
-                    if self.on_chain_monitor and web3_ok:
-                        current_watched = self.cfg.get("watched_addresses", [])
-                        self.on_chain_monitor.update_watched(current_watched)
-                        if self._ws_monitor:
-                            self._ws_monitor.update_watched(current_watched)
-                        chain_trades = self.on_chain_monitor.poll_new_blocks()
-                        if chain_trades:
-                            self.logger.info(
-                                "On-chain: %d trade(s) detected",
-                                len(chain_trades),
-                            )
-                            new_trades.extend(chain_trades)
-
-                    # --- Execute copies ---
-                    for trade in new_trades:
-                        if self.executor:
-                            result = self.executor.execute_copy_trade(trade)
-                            if result and isinstance(result, dict):
-                                result["timestamp"] = datetime.now().isoformat()
-                                self._trade_history.append(result)
-                                # Crash-safe: persist session trades immediately
-                                self._save_session_trades()
-                                if result.get("status") == "submitted":
-                                    self._notify(
-                                        "TRADE %s $%.2f @ $%.4f — %s" % (
-                                            result.get("side", "?"),
-                                            result.get("amount_usdc", 0),
-                                            result.get("price", 0),
-                                            result.get("token_id", "")[:16] + "...",
-                                        )
-                                    )
-                        else:
-                            self.logger.warning(
-                                "Trade detected but executor not ready: %s",
-                                json.dumps(trade, default=str)[:200],
-                            )
+                        pass
 
             except Exception as exc:
                 self.logger.error("Error in monitoring loop: %s", exc, exc_info=True)
@@ -10024,14 +7525,8 @@ class CopyTraderBot:
                 self.running = False
                 break
 
-            # Wait for next cycle.  If the WebSocket monitor detects a whale
-            # trade it sets _ws_wake, waking us instantly instead of waiting
-            # the full poll_interval.  Without WebSocket this behaves like a
-            # normal sleep with early-exit support.
-            woke_by_ws = self._ws_wake.wait(timeout=float(poll_interval))
-            self._ws_wake.clear()
-            if woke_by_ws:
-                self.logger.debug("Main loop woken by WebSocket event")
+            # Wait for next cycle
+            time.sleep(float(poll_interval))
 
         try:
             self._generate_stop_report()
@@ -10120,17 +7615,7 @@ class CopyTraderBot:
         except (FileNotFoundError, json.JSONDecodeError):
             pass
 
-        # Also split closed_trades into copy vs martingale for the report
-        copy_trades = [r for r in closed_trades if r.get("reason") != "martingale"]
         mart_trades = [r for r in closed_trades if r.get("reason") == "martingale"]
-        copy_cost = sum(r.get("cost_basis_usdc", 0) for r in copy_trades)
-        copy_proceeds = sum(r.get("proceeds_usdc", 0) for r in copy_trades)
-        copy_pnl = round(copy_proceeds - copy_cost, 6)
-        copy_wins = sum(1 for r in copy_trades if r.get("outcome") in ("won", "win"))
-        copy_losses = sum(1 for r in copy_trades if r.get("outcome") in ("lost", "loss"))
-        copy_decided = copy_wins + copy_losses
-        copy_wr = (copy_wins / copy_decided * 100) if copy_decided > 0 else 0
-
         mart_cost = sum(r.get("cost_basis_usdc", 0) for r in mart_trades)
         mart_proceeds = sum(r.get("proceeds_usdc", 0) for r in mart_trades)
         mart_pnl = round(mart_proceeds - mart_cost, 6)
@@ -10159,15 +7644,6 @@ class CopyTraderBot:
             "closed_trade_count": len(closed_trades),
             "trade_history": self._trade_history,
             "open_positions": positions,
-            "copy_trading": {
-                "trades": len(copy_trades),
-                "wins": copy_wins,
-                "losses": copy_losses,
-                "win_rate_pct": round(copy_wr, 1),
-                "pnl_usdc": copy_pnl,
-                "capital_deployed_usdc": round(copy_cost, 6),
-                "capital_returned_usdc": round(copy_proceeds, 6),
-            },
             "martingale": {
                 "trades": len(mart_trades),
                 "wins": mart_wins,
@@ -10221,12 +7697,6 @@ class CopyTraderBot:
                 "P&L $%+.2f (deployed $%.2f, returned $%.2f)",
                 len(mart_trades), mart_wins, mart_losses, mart_wr,
                 mart_pnl, mart_cost, mart_proceeds,
-            )
-        if copy_trades:
-            self.logger.info(
-                "Copy trading stats: %d trades | W/L %d/%d (%.0f%%) | "
-                "P&L $%+.2f",
-                len(copy_trades), copy_wins, copy_losses, copy_wr, copy_pnl,
             )
         if positions:
             self.logger.info(
@@ -10287,7 +7757,7 @@ class TextHandler(logging.Handler):
 # Tkinter GUI Application
 # ---------------------------------------------------------------------------
 
-class CopyTraderGUI:
+class MartingaleGUI:
     """Main application window."""
 
     def __init__(self):
@@ -10302,7 +7772,7 @@ class CopyTraderGUI:
         self.logger = None
 
         self.root = tk.Tk()
-        self.root.title(f"Polymarket Copy Trader Bot  v{VERSION}")
+        self.root.title(f"Polymarket Martingale Bot  v{VERSION}")
         self.root.geometry("900x720")
         self.root.minsize(700, 550)
 
@@ -10311,7 +7781,7 @@ class CopyTraderGUI:
         # Set up logging with GUI handler
         self._gui_handler = TextHandler(self.log_area)
         self.logger = setup_logging(self._gui_handler)
-        self.logger.info("Polymarket Copy Trader v%s started", VERSION)
+        self.logger.info("Polymarket Martingale Bot v%s started", VERSION)
         self._load_fields_from_config()
 
     # ---- UI construction ----
@@ -10347,17 +7817,7 @@ class CopyTraderGUI:
         self._config_mousewheel_handler = _on_config_mousewheel
         self._build_config_tab(config_frame)
 
-        # Tab 3: Watched Addresses
-        addr_frame = ttk.Frame(notebook, padding=10)
-        notebook.add(addr_frame, text="Watched Addresses")
-        self._build_address_tab(addr_frame)
-
-        # Tab 4: Arbitrage
-        arb_frame = ttk.Frame(notebook, padding=10)
-        notebook.add(arb_frame, text="Arbitrage")
-        self._build_arb_tab(arb_frame)
-
-        # Tab 5: Martingale
+        # Tab 3: Martingale
         mart_frame = ttk.Frame(notebook, padding=10)
         notebook.add(mart_frame, text="Martingale")
         self._build_martingale_tab(mart_frame)
@@ -10847,34 +8307,6 @@ class CopyTraderGUI:
             wraplength=600,
         ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=3)
 
-        # Copy percentage
-        row += 1
-        ttk.Label(parent, text="Copy Percentage (%):").grid(row=row, column=0, sticky=tk.W, pady=3)
-        self.copy_pct_var = tk.IntVar(value=50)
-        pct_frame = ttk.Frame(parent)
-        pct_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
-        self.copy_pct_scale = ttk.Scale(
-            pct_frame, from_=1, to=100, variable=self.copy_pct_var, orient=tk.HORIZONTAL, length=250,
-        )
-        self.copy_pct_scale.pack(side=tk.LEFT)
-        self.copy_pct_label = ttk.Label(pct_frame, textvariable=self.copy_pct_var, width=4)
-        self.copy_pct_label.pack(side=tk.LEFT, padx=5)
-
-        # Max trade size
-        row += 1
-        ttk.Label(parent, text="Max Trade (USDC):").grid(row=row, column=0, sticky=tk.W, pady=3)
-        max_frame = ttk.Frame(parent)
-        max_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
-        self.max_trade_entry = ttk.Entry(max_frame, width=10)
-        self.max_trade_entry.pack(side=tk.LEFT)
-        ttk.Label(max_frame, text="(caps each copy trade)").pack(side=tk.LEFT, padx=5)
-
-        # Slippage
-        row += 1
-        ttk.Label(parent, text="Slippage Tolerance (bps):").grid(row=row, column=0, sticky=tk.W, pady=3)
-        self.slippage_entry = ttk.Entry(parent, width=20)
-        self.slippage_entry.grid(row=row, column=1, sticky=tk.W, pady=3)
-
         # Resume threshold
         row += 1
         ttk.Label(parent, text="Resume Threshold (USDC):").grid(row=row, column=0, sticky=tk.W, pady=3)
@@ -10884,33 +8316,6 @@ class CopyTraderGUI:
         self.resume_threshold_entry.pack(side=tk.LEFT)
         ttk.Label(resume_frame, text="(min balance to resume after pause)").pack(side=tk.LEFT, padx=5)
 
-        # Take-profit price
-        row += 1
-        ttk.Label(parent, text="Take-Profit Price:").grid(row=row, column=0, sticky=tk.W, pady=3)
-        tp_frame = ttk.Frame(parent)
-        tp_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
-        self.take_profit_entry = ttk.Entry(tp_frame, width=10)
-        self.take_profit_entry.pack(side=tk.LEFT)
-        ttk.Label(tp_frame, text="(sell when price >= this, e.g. 0.90)").pack(side=tk.LEFT, padx=5)
-
-        # Take-profit percentage gain
-        row += 1
-        ttk.Label(parent, text="Take-Profit Gain (%):").grid(row=row, column=0, sticky=tk.W, pady=3)
-        tp_pct_frame = ttk.Frame(parent)
-        tp_pct_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
-        self.take_profit_pct_entry = ttk.Entry(tp_pct_frame, width=10)
-        self.take_profit_pct_entry.pack(side=tk.LEFT)
-        ttk.Label(tp_pct_frame, text="(sell at +N% gain from entry, 0=off)").pack(side=tk.LEFT, padx=5)
-
-        # Stop-loss percentage
-        row += 1
-        ttk.Label(parent, text="Stop-Loss (%):").grid(row=row, column=0, sticky=tk.W, pady=3)
-        sl_frame = ttk.Frame(parent)
-        sl_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
-        self.stop_loss_entry = ttk.Entry(sl_frame, width=10)
-        self.stop_loss_entry.pack(side=tk.LEFT)
-        ttk.Label(sl_frame, text="(sell when price drops to this % of entry)").pack(side=tk.LEFT, padx=5)
-
         # Kill switch — max loss
         row += 1
         ttk.Label(parent, text="Max Loss Kill Switch (USDC):").grid(row=row, column=0, sticky=tk.W, pady=3)
@@ -10919,21 +8324,6 @@ class CopyTraderGUI:
         self.max_loss_entry = ttk.Entry(kill_frame, width=10)
         self.max_loss_entry.pack(side=tk.LEFT)
         ttk.Label(kill_frame, text="(stop bot after losing this much, 0=off)").pack(side=tk.LEFT, padx=5)
-
-        # Poll interval
-        row += 1
-        ttk.Label(parent, text="Poll Interval (seconds):").grid(row=row, column=0, sticky=tk.W, pady=3)
-        self.poll_entry = ttk.Entry(parent, width=20)
-        self.poll_entry.grid(row=row, column=1, sticky=tk.W, pady=3)
-
-        # Exit check interval
-        row += 1
-        ttk.Label(parent, text="Exit Check Interval (seconds):").grid(row=row, column=0, sticky=tk.W, pady=3)
-        exit_frame = ttk.Frame(parent)
-        exit_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
-        self.exit_check_entry = ttk.Entry(exit_frame, width=10)
-        self.exit_check_entry.pack(side=tk.LEFT)
-        ttk.Label(exit_frame, text="(how often TP/SL prices are checked)").pack(side=tk.LEFT, padx=5)
 
         # Use CLOB API checkbox
         row += 1
@@ -11040,271 +8430,6 @@ class CopyTraderGUI:
         ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
 
         parent.columnconfigure(1, weight=1)
-
-    def _build_address_tab(self, parent):
-        ttk.Label(parent, text="Watched Trader Addresses:").pack(anchor=tk.W)
-
-        list_frame = ttk.Frame(parent)
-        list_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-
-        self.addr_listbox = tk.Listbox(list_frame, height=10, font=("Courier", 10))
-        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.addr_listbox.yview)
-        self.addr_listbox.configure(yscrollcommand=scrollbar.set)
-        self.addr_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        entry_frame = ttk.Frame(parent)
-        entry_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(entry_frame, text="Address:").pack(side=tk.LEFT)
-        self.new_addr_entry = ttk.Entry(entry_frame, width=50, font=("Courier", 10))
-        self.new_addr_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-
-        btn_frame = ttk.Frame(parent)
-        btn_frame.pack(fill=tk.X)
-        ttk.Button(btn_frame, text="Add", command=self._add_address).pack(side=tk.LEFT, padx=3)
-        ttk.Button(btn_frame, text="Remove Selected", command=self._remove_address).pack(
-            side=tk.LEFT, padx=3
-        )
-        ttk.Button(btn_frame, text="Clear All", command=self._clear_addresses).pack(
-            side=tk.LEFT, padx=3
-        )
-
-    # ---- Arbitrage tab ----
-
-    def _build_arb_tab(self, parent):
-        # Enable checkbox
-        self.arb_enabled_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            parent, text="Enable Arbitrage Mode", variable=self.arb_enabled_var,
-        ).pack(anchor=tk.W, pady=(0, 5))
-
-        ttk.Label(
-            parent,
-            text="Buy both sides of a binary market when the combined ask "
-                 "price drops below $1, locking in guaranteed profit.",
-            wraplength=600,
-        ).pack(anchor=tk.W, pady=(0, 8))
-
-        # Dynamic slugs section (multiple rotating markets)
-        dyn_frame = ttk.LabelFrame(
-            parent, text="Dynamic Markets (Rotating Slugs)", padding=8,
-        )
-        dyn_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
-        ttk.Label(
-            dyn_frame,
-            text="Add rotating market slugs below. Each slug auto-discovers "
-                 "the current market every window.\n"
-                 "Timestamp format (e.g. btc-updown-15m, window 900) for "
-                 "markets like btc-updown-15m-1771293600.\n"
-                 "Hourly format (e.g. ethereum-up-or-down, window 3600) for "
-                 "markets like ethereum-up-or-down-february-16-9pm-et.",
-            wraplength=600,
-        ).pack(anchor=tk.W, pady=(0, 5))
-
-        slug_list_frame = ttk.Frame(dyn_frame)
-        slug_list_frame.pack(fill=tk.BOTH, expand=True, pady=3)
-        self.arb_slugs_listbox = tk.Listbox(
-            slug_list_frame, height=5, font=("Courier", 9),
-        )
-        slug_scroll = ttk.Scrollbar(
-            slug_list_frame, orient=tk.VERTICAL,
-            command=self.arb_slugs_listbox.yview,
-        )
-        self.arb_slugs_listbox.configure(yscrollcommand=slug_scroll.set)
-        self.arb_slugs_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        slug_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # Entry row for adding new slug
-        slug_entry_frame = ttk.Frame(dyn_frame)
-        slug_entry_frame.pack(fill=tk.X, pady=3)
-        ttk.Label(slug_entry_frame, text="Slug:").pack(side=tk.LEFT)
-        self.arb_new_slug_entry = ttk.Entry(slug_entry_frame, width=25)
-        self.arb_new_slug_entry.pack(side=tk.LEFT, padx=3)
-        ttk.Label(slug_entry_frame, text="Window:").pack(side=tk.LEFT)
-        self.arb_new_window_entry = ttk.Entry(slug_entry_frame, width=6)
-        self.arb_new_window_entry.insert(0, "900")
-        self.arb_new_window_entry.pack(side=tk.LEFT, padx=3)
-        ttk.Label(slug_entry_frame, text="Format:").pack(side=tk.LEFT)
-        self.arb_new_format_var = tk.StringVar(value="timestamp")
-        fmt_combo = ttk.Combobox(
-            slug_entry_frame, textvariable=self.arb_new_format_var,
-            values=["timestamp", "hourly"], width=10, state="readonly",
-        )
-        fmt_combo.pack(side=tk.LEFT, padx=3)
-
-        slug_btn_frame = ttk.Frame(dyn_frame)
-        slug_btn_frame.pack(fill=tk.X)
-        ttk.Button(
-            slug_btn_frame, text="Add Slug", command=self._arb_add_slug,
-        ).pack(side=tk.LEFT, padx=3)
-        ttk.Button(
-            slug_btn_frame, text="Remove Selected",
-            command=self._arb_remove_slug,
-        ).pack(side=tk.LEFT, padx=3)
-        ttk.Button(
-            slug_btn_frame, text="Clear All", command=self._arb_clear_slugs,
-        ).pack(side=tk.LEFT, padx=3)
-
-        # Settings row
-        settings_frame = ttk.LabelFrame(parent, text="Arbitrage Settings", padding=8)
-        settings_frame.pack(fill=tk.X, pady=(0, 8))
-
-        row = 0
-        ttk.Label(settings_frame, text="Min Edge (%):").grid(
-            row=row, column=0, sticky=tk.W, pady=3,
-        )
-        edge_frame = ttk.Frame(settings_frame)
-        edge_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
-        self.arb_min_edge_entry = ttk.Entry(edge_frame, width=8)
-        self.arb_min_edge_entry.pack(side=tk.LEFT)
-        ttk.Label(
-            edge_frame,
-            text="(e.g. 1.0 = only trade when spread >= 1%)",
-        ).pack(side=tk.LEFT, padx=5)
-
-        row += 1
-        ttk.Label(settings_frame, text="Size per Side (USDC):").grid(
-            row=row, column=0, sticky=tk.W, pady=3,
-        )
-        size_frame = ttk.Frame(settings_frame)
-        size_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
-        self.arb_size_entry = ttk.Entry(size_frame, width=8)
-        self.arb_size_entry.pack(side=tk.LEFT)
-        ttk.Label(
-            size_frame, text="(USDC to spend on each side)",
-        ).pack(side=tk.LEFT, padx=5)
-
-        row += 1
-        ttk.Label(settings_frame, text="Max Positions:").grid(
-            row=row, column=0, sticky=tk.W, pady=3,
-        )
-        self.arb_max_pos_entry = ttk.Entry(settings_frame, width=8)
-        self.arb_max_pos_entry.grid(row=row, column=1, sticky=tk.W, pady=3)
-
-        row += 1
-        ttk.Label(settings_frame, text="Poll Interval (seconds):").grid(
-            row=row, column=0, sticky=tk.W, pady=3,
-        )
-        self.arb_poll_entry = ttk.Entry(settings_frame, width=8)
-        self.arb_poll_entry.grid(row=row, column=1, sticky=tk.W, pady=3)
-
-        # Market condition IDs list
-        markets_frame = ttk.LabelFrame(parent, text="Markets to Monitor (Condition IDs)", padding=8)
-        markets_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
-
-        ttk.Label(
-            markets_frame,
-            text="Add the condition_id of each binary market to scan. "
-                 "Find this on the Polymarket market page URL or API.",
-            wraplength=600,
-        ).pack(anchor=tk.W, pady=(0, 5))
-
-        list_frame = ttk.Frame(markets_frame)
-        list_frame.pack(fill=tk.BOTH, expand=True, pady=3)
-
-        self.arb_market_listbox = tk.Listbox(
-            list_frame, height=6, font=("Courier", 9),
-        )
-        arb_scroll = ttk.Scrollbar(
-            list_frame, orient=tk.VERTICAL, command=self.arb_market_listbox.yview,
-        )
-        self.arb_market_listbox.configure(yscrollcommand=arb_scroll.set)
-        self.arb_market_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        arb_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
-        entry_frame = ttk.Frame(markets_frame)
-        entry_frame.pack(fill=tk.X, pady=3)
-        ttk.Label(entry_frame, text="Condition ID:").pack(side=tk.LEFT)
-        self.arb_new_cid_entry = ttk.Entry(
-            entry_frame, width=50, font=("Courier", 9),
-        )
-        self.arb_new_cid_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-
-        btn_frame = ttk.Frame(markets_frame)
-        btn_frame.pack(fill=tk.X)
-        ttk.Button(
-            btn_frame, text="Add", command=self._arb_add_market,
-        ).pack(side=tk.LEFT, padx=3)
-        ttk.Button(
-            btn_frame, text="Remove Selected", command=self._arb_remove_market,
-        ).pack(side=tk.LEFT, padx=3)
-        ttk.Button(
-            btn_frame, text="Clear All", command=self._arb_clear_markets,
-        ).pack(side=tk.LEFT, padx=3)
-
-        # Status label (updated while running)
-        self.arb_status_var = tk.StringVar(value="Arbitrage: idle")
-        ttk.Label(
-            parent, textvariable=self.arb_status_var,
-            font=("Courier", 10, "bold"),
-        ).pack(anchor=tk.W, pady=(5, 0))
-
-    def _arb_add_market(self):
-        cid = self.arb_new_cid_entry.get().strip()
-        if cid and cid not in list(self.arb_market_listbox.get(0, tk.END)):
-            self.arb_market_listbox.insert(tk.END, cid)
-            self.arb_new_cid_entry.delete(0, tk.END)
-
-    def _arb_remove_market(self):
-        sel = self.arb_market_listbox.curselection()
-        if sel:
-            self.arb_market_listbox.delete(sel[0])
-
-    def _arb_clear_markets(self):
-        self.arb_market_listbox.delete(0, tk.END)
-
-    def _arb_add_slug(self):
-        slug = self.arb_new_slug_entry.get().strip()
-        if not slug:
-            return
-        try:
-            window = int(self.arb_new_window_entry.get().strip())
-        except ValueError:
-            window = 900
-        fmt = self.arb_new_format_var.get() or "timestamp"
-        display = f"{slug}  |  window={window}s  |  {fmt}"
-        # Avoid duplicates by slug name
-        existing = list(self.arb_slugs_listbox.get(0, tk.END))
-        for e in existing:
-            if e.split("|")[0].strip() == slug:
-                return
-        self.arb_slugs_listbox.insert(tk.END, display)
-        self.arb_new_slug_entry.delete(0, tk.END)
-
-    def _arb_remove_slug(self):
-        sel = self.arb_slugs_listbox.curselection()
-        if sel:
-            self.arb_slugs_listbox.delete(sel[0])
-
-    def _arb_clear_slugs(self):
-        self.arb_slugs_listbox.delete(0, tk.END)
-
-    @staticmethod
-    def _parse_slug_display(display_str):
-        """Parse a listbox display string back into a slug dict."""
-        parts = [p.strip() for p in display_str.split("|")]
-        slug = parts[0].strip() if parts else ""
-        window = 900
-        fmt = "timestamp"
-        for p in parts[1:]:
-            if p.startswith("window="):
-                try:
-                    window = int(p.replace("window=", "").replace("s", ""))
-                except ValueError:
-                    pass
-            elif p in ("timestamp", "hourly"):
-                fmt = p
-        return {"slug": slug, "window": window, "format": fmt}
-
-    @staticmethod
-    def _format_slug_display(entry):
-        """Format a slug dict for display in the listbox."""
-        return (
-            f"{entry['slug']}  |  window={entry.get('window', 900)}s  "
-            f"|  {entry.get('format', 'timestamp')}"
-        )
-
-    # ---- Martingale tab ----
 
     def _build_martingale_tab(self, parent):
         # Enable checkbox
@@ -12111,16 +9236,8 @@ class CopyTraderGUI:
     def _load_fields_from_config(self):
         self.rpc_entry.insert(0, self.cfg.get("rpc_url", ""))
         self.ws_rpc_entry.insert(0, self.cfg.get("ws_rpc_url", ""))
-        self.copy_pct_var.set(self.cfg.get("copy_percentage", 50))
-        self.max_trade_entry.insert(0, str(self.cfg.get("max_trade_usdc", 100)))
-        self.slippage_entry.insert(0, str(self.cfg.get("slippage_tolerance_bps", 50)))
         self.resume_threshold_entry.insert(0, str(self.cfg.get("resume_threshold_usdc", 5)))
-        self.take_profit_entry.insert(0, str(self.cfg.get("take_profit_price", 0.99)))
-        self.take_profit_pct_entry.insert(0, str(self.cfg.get("take_profit_pct", 0)))
-        self.stop_loss_entry.insert(0, str(self.cfg.get("stop_loss_pct", 50)))
         self.max_loss_entry.insert(0, str(self.cfg.get("max_loss_usdc", 0)))
-        self.poll_entry.insert(0, str(self.cfg.get("poll_interval_seconds", 5)))
-        self.exit_check_entry.insert(0, str(self.cfg.get("exit_check_seconds", 5)))
         self.use_clob_var.set(self.cfg.get("use_clob_api", True))
         self.dry_run_var.set(self.cfg.get("dry_run", False))
         self.auto_redeem_var.set(self.cfg.get("auto_redeem_settled", True))
@@ -12134,31 +9251,6 @@ class CopyTraderGUI:
         pk = load_private_key(self.cfg)
         if pk:
             self.pk_entry.insert(0, pk)
-        for addr in self.cfg.get("watched_addresses", []):
-            self.addr_listbox.insert(tk.END, addr)
-        # Arbitrage fields
-        self.arb_enabled_var.set(self.cfg.get("arb_enabled", False))
-        self.arb_min_edge_entry.insert(0, str(self.cfg.get("arb_min_edge_pct", 1.0)))
-        self.arb_size_entry.insert(0, str(self.cfg.get("arb_size_usdc", 10.0)))
-        self.arb_max_pos_entry.insert(0, str(self.cfg.get("arb_max_positions", 5)))
-        self.arb_poll_entry.insert(0, str(self.cfg.get("arb_poll_seconds", 2)))
-        for cid in self.cfg.get("arb_condition_ids", []):
-            self.arb_market_listbox.insert(tk.END, cid)
-        # Load dynamic slugs list (new format) or migrate from legacy single slug
-        slugs = self.cfg.get("arb_dynamic_slugs", [])
-        if not slugs:
-            legacy = self.cfg.get("arb_dynamic_slug", "").strip()
-            if legacy:
-                slugs = [{
-                    "slug": legacy,
-                    "window": int(self.cfg.get("arb_dynamic_window", 300)),
-                    "format": "timestamp",
-                }]
-        for entry in slugs:
-            if isinstance(entry, dict) and entry.get("slug"):
-                self.arb_slugs_listbox.insert(
-                    tk.END, self._format_slug_display(entry),
-                )
         # Martingale fields
         self.mart_enabled_var.set(self.cfg.get("martingale_enabled", False))
         strategies = self.cfg.get("martingale_strategies") or []
@@ -12188,7 +9280,6 @@ class CopyTraderGUI:
     def _read_fields_to_config(self):
         self.cfg["rpc_url"] = self.rpc_entry.get().strip()
         self.cfg["ws_rpc_url"] = self.ws_rpc_entry.get().strip()
-        self.cfg["copy_percentage"] = self.copy_pct_var.get()
         self.cfg["use_clob_api"] = self.use_clob_var.get()
         self.cfg["dry_run"] = self.dry_run_var.get()
         self.cfg["auto_redeem_settled"] = self.auto_redeem_var.get()
@@ -12200,85 +9291,13 @@ class CopyTraderGUI:
         self.cfg["telegram_bot_token"] = self.tg_token_entry.get().strip()
         self.cfg["telegram_chat_id"] = self.tg_chat_entry.get().strip()
         try:
-            self.cfg["max_trade_usdc"] = float(self.max_trade_entry.get().strip())
-        except ValueError:
-            pass
-        try:
-            self.cfg["slippage_tolerance_bps"] = int(self.slippage_entry.get().strip())
-        except ValueError:
-            pass
-        try:
             self.cfg["resume_threshold_usdc"] = float(self.resume_threshold_entry.get().strip())
-        except ValueError:
-            pass
-        try:
-            val = float(self.take_profit_entry.get().strip())
-            if 0 < val <= 1:
-                self.cfg["take_profit_price"] = val
-        except ValueError:
-            pass
-        try:
-            val = float(self.take_profit_pct_entry.get().strip())
-            if val >= 0:
-                self.cfg["take_profit_pct"] = val
-        except ValueError:
-            pass
-        try:
-            val = float(self.stop_loss_entry.get().strip())
-            if 0 < val <= 100:
-                self.cfg["stop_loss_pct"] = val
         except ValueError:
             pass
         try:
             val = float(self.max_loss_entry.get().strip())
             if val >= 0:
                 self.cfg["max_loss_usdc"] = val
-        except ValueError:
-            pass
-        try:
-            self.cfg["poll_interval_seconds"] = int(self.poll_entry.get().strip())
-        except ValueError:
-            pass
-        try:
-            val = int(self.exit_check_entry.get().strip())
-            if val >= 1:
-                self.cfg["exit_check_seconds"] = val
-        except ValueError:
-            pass
-        self.cfg["watched_addresses"] = list(self.addr_listbox.get(0, tk.END))
-        # Arbitrage fields
-        self.cfg["arb_enabled"] = self.arb_enabled_var.get()
-        self.cfg["arb_condition_ids"] = list(self.arb_market_listbox.get(0, tk.END))
-        # Read dynamic slugs from listbox
-        slug_displays = list(self.arb_slugs_listbox.get(0, tk.END))
-        self.cfg["arb_dynamic_slugs"] = [
-            self._parse_slug_display(d) for d in slug_displays
-        ]
-        # Clear legacy single-slug field when using the new list
-        self.cfg["arb_dynamic_slug"] = ""
-        self.cfg["arb_dynamic_window"] = 300
-        try:
-            val = float(self.arb_min_edge_entry.get().strip())
-            if val > 0:
-                self.cfg["arb_min_edge_pct"] = val
-        except ValueError:
-            pass
-        try:
-            val = float(self.arb_size_entry.get().strip())
-            if val > 0:
-                self.cfg["arb_size_usdc"] = val
-        except ValueError:
-            pass
-        try:
-            val = int(self.arb_max_pos_entry.get().strip())
-            if val >= 1:
-                self.cfg["arb_max_positions"] = val
-        except ValueError:
-            pass
-        try:
-            val = int(self.arb_poll_entry.get().strip())
-            if val >= 1:
-                self.cfg["arb_poll_seconds"] = val
         except ValueError:
             pass
         # Martingale fields — save the strategies list
@@ -12384,28 +9403,6 @@ class CopyTraderGUI:
         except Exception as exc:
             messagebox.showerror("Error", f"Could not send message:\n{exc}")
 
-    def _add_address(self):
-        addr = self.new_addr_entry.get().strip()
-        if not addr:
-            return
-        # Basic validation
-        if not addr.startswith("0x") or len(addr) != 42:
-            messagebox.showwarning("Invalid Address", "Please enter a valid Ethereum/Polygon address (0x... 42 chars).")
-            return
-        if addr.lower() in [a.lower() for a in self.addr_listbox.get(0, tk.END)]:
-            messagebox.showinfo("Duplicate", "This address is already in the list.")
-            return
-        self.addr_listbox.insert(tk.END, addr)
-        self.new_addr_entry.delete(0, tk.END)
-
-    def _remove_address(self):
-        sel = self.addr_listbox.curselection()
-        if sel:
-            self.addr_listbox.delete(sel[0])
-
-    def _clear_addresses(self):
-        self.addr_listbox.delete(0, tk.END)
-
     def _clear_log(self):
         self.log_area.configure(state="normal")
         self.log_area.delete("1.0", tk.END)
@@ -12425,20 +9422,10 @@ class CopyTraderGUI:
         if pk:
             save_private_key(pk, self.cfg)
 
-        arb_mode = self.cfg.get("arb_enabled") and (
-            self.cfg.get("arb_condition_ids")
-            or self.cfg.get("arb_dynamic_slug")
-            or self.cfg.get("arb_dynamic_slugs")
-        )
-        martingale_mode = self.cfg.get("martingale_enabled")
-        if (not self.cfg.get("watched_addresses")
-                and not arb_mode and not martingale_mode):
+        if not self.cfg.get("martingale_enabled"):
             messagebox.showwarning(
-                "No Mode Selected",
-                "Enable at least one trading mode:\n"
-                "• Add a watched address for copy trading\n"
-                "• Enable arbitrage mode with market IDs or slugs\n"
-                "• Enable martingale mode",
+                "Martingale Not Enabled",
+                "Enable martingale mode in the Martingale tab before starting.",
             )
             return
         if not self.cfg.get("rpc_url") and not self.cfg.get("ws_rpc_url"):
@@ -12448,7 +9435,7 @@ class CopyTraderGUI:
                 )
                 return
 
-        self.bot = CopyTraderBot(self.cfg, self.logger)
+        self.bot = MartingaleEngine(self.cfg, self.logger)
         self.bot.start()
         self.start_btn.configure(state=tk.DISABLED)
         self.stop_btn.configure(state=tk.NORMAL)
@@ -12558,34 +9545,12 @@ def run_headless():
         cfg["ws_rpc_url"] = os.environ["WS_RPC_URL"]
     if os.environ.get("PRIVATE_KEY"):
         save_private_key(os.environ["PRIVATE_KEY"], cfg)
-    if os.environ.get("WATCHED_ADDRESSES"):
-        cfg["watched_addresses"] = [
-            a.strip() for a in os.environ["WATCHED_ADDRESSES"].split(",") if a.strip()
-        ]
-    if os.environ.get("COPY_PERCENTAGE"):
-        cfg["copy_percentage"] = int(os.environ["COPY_PERCENTAGE"])
-    if os.environ.get("MAX_TRADE_USDC"):
-        cfg["max_trade_usdc"] = float(os.environ["MAX_TRADE_USDC"])
     if os.environ.get("RESUME_THRESHOLD_USDC"):
         cfg["resume_threshold_usdc"] = float(os.environ["RESUME_THRESHOLD_USDC"])
     if os.environ.get("DRY_RUN"):
         cfg["dry_run"] = os.environ["DRY_RUN"].lower() in ("1", "true", "yes")
-    if os.environ.get("CLOB_API_KEY"):
-        cfg["clob_api_key"] = os.environ["CLOB_API_KEY"]
-    if os.environ.get("CLOB_API_SECRET"):
-        cfg["clob_api_secret"] = os.environ["CLOB_API_SECRET"]
-    if os.environ.get("CLOB_API_PASSPHRASE"):
-        cfg["clob_api_passphrase"] = os.environ["CLOB_API_PASSPHRASE"]
-    if os.environ.get("TAKE_PROFIT_PRICE"):
-        cfg["take_profit_price"] = float(os.environ["TAKE_PROFIT_PRICE"])
-    if os.environ.get("TAKE_PROFIT_PCT"):
-        cfg["take_profit_pct"] = float(os.environ["TAKE_PROFIT_PCT"])
-    if os.environ.get("STOP_LOSS_PCT"):
-        cfg["stop_loss_pct"] = float(os.environ["STOP_LOSS_PCT"])
     if os.environ.get("MAX_LOSS_USDC"):
         cfg["max_loss_usdc"] = float(os.environ["MAX_LOSS_USDC"])
-    if os.environ.get("EXIT_CHECK_SECONDS"):
-        cfg["exit_check_seconds"] = int(os.environ["EXIT_CHECK_SECONDS"])
     if os.environ.get("AUTO_REDEEM_SETTLED"):
         cfg["auto_redeem_settled"] = os.environ["AUTO_REDEEM_SETTLED"].lower() in ("1", "true", "yes")
     if os.environ.get("PROXY_REDEEM"):
@@ -12594,32 +9559,6 @@ def run_headless():
         cfg["proxy_withdraw"] = os.environ["PROXY_WITHDRAW"].lower() in ("1", "true", "yes")
     if os.environ.get("PROXY_ADDRESS"):
         cfg["proxy_address"] = os.environ["PROXY_ADDRESS"].strip()
-    # Arbitrage env vars
-    if os.environ.get("ARB_ENABLED"):
-        cfg["arb_enabled"] = os.environ["ARB_ENABLED"].lower() in ("1", "true", "yes")
-    if os.environ.get("ARB_CONDITION_IDS"):
-        cfg["arb_condition_ids"] = [
-            c.strip() for c in os.environ["ARB_CONDITION_IDS"].split(",") if c.strip()
-        ]
-    if os.environ.get("ARB_DYNAMIC_SLUGS"):
-        # JSON list: [{"slug":"btc-updown-15m","window":900},...]
-        try:
-            cfg["arb_dynamic_slugs"] = json.loads(os.environ["ARB_DYNAMIC_SLUGS"])
-        except (json.JSONDecodeError, TypeError):
-            logger.warning("ARB_DYNAMIC_SLUGS env var is not valid JSON — ignoring")
-    if os.environ.get("ARB_DYNAMIC_SLUG"):
-        # Legacy single slug — only used if arb_dynamic_slugs is empty
-        cfg["arb_dynamic_slug"] = os.environ["ARB_DYNAMIC_SLUG"].strip()
-    if os.environ.get("ARB_DYNAMIC_WINDOW"):
-        cfg["arb_dynamic_window"] = int(os.environ["ARB_DYNAMIC_WINDOW"])
-    if os.environ.get("ARB_MIN_EDGE_PCT"):
-        cfg["arb_min_edge_pct"] = float(os.environ["ARB_MIN_EDGE_PCT"])
-    if os.environ.get("ARB_SIZE_USDC"):
-        cfg["arb_size_usdc"] = float(os.environ["ARB_SIZE_USDC"])
-    if os.environ.get("ARB_MAX_POSITIONS"):
-        cfg["arb_max_positions"] = int(os.environ["ARB_MAX_POSITIONS"])
-    if os.environ.get("ARB_POLL_SECONDS"):
-        cfg["arb_poll_seconds"] = int(os.environ["ARB_POLL_SECONDS"])
     # Martingale env vars
     if os.environ.get("MARTINGALE_ENABLED"):
         cfg["martingale_enabled"] = os.environ["MARTINGALE_ENABLED"].lower() in ("1", "true", "yes")
@@ -12687,55 +9626,17 @@ def run_headless():
         except OSError:
             pass
 
-    arb_mode = cfg.get("arb_enabled") and (
-        cfg.get("arb_condition_ids")
-        or cfg.get("arb_dynamic_slugs")
-        or cfg.get("arb_dynamic_slug")
-    )
-    martingale_mode = cfg.get("martingale_enabled")
-    if not cfg.get("watched_addresses") and not arb_mode and not martingale_mode:
+    if not cfg.get("martingale_enabled"):
         logger.error(
-            "No watched addresses, arb markets, or martingale configured. "
-            "Set WATCHED_ADDRESSES, ARB_ENABLED=1, or MARTINGALE_ENABLED=1."
+            "Martingale not enabled. Set MARTINGALE_ENABLED=1."
         )
         sys.exit(1)
 
-    logger.info("=== Polymarket Copy Trader — Headless Mode ===")
-    logger.info("Watched addresses: %s", cfg["watched_addresses"])
-    logger.info("Copy %%: %s | Max trade: %s USDC | Resume threshold: $%s | Dry run: %s | Auto-redeem: %s",
-                cfg.get("copy_percentage"), cfg.get("max_trade_usdc"),
-                cfg.get("resume_threshold_usdc", 5), cfg.get("dry_run", False),
-                cfg.get("auto_redeem_settled", True))
-    logger.info("Take-profit price: %s | Take-profit gain: %s%% | Stop-loss: %s%%",
-                cfg.get("take_profit_price", 0.99), cfg.get("take_profit_pct", 0),
-                cfg.get("stop_loss_pct", 50))
-    logger.info("Proxy redeem: %s | Proxy withdraw: %s",
-                cfg.get("proxy_redeem", True), cfg.get("proxy_withdraw", True))
-    if cfg.get("arb_enabled"):
-        dyn_slugs = cfg.get("arb_dynamic_slugs", [])
-        dyn_legacy = cfg.get("arb_dynamic_slug", "").strip()
-        if dyn_slugs:
-            logger.info("Arbitrage: ENABLED | %d dynamic slug(s) | "
-                        "Min edge: %s%% | Size: $%s/side",
-                        len(dyn_slugs),
-                        cfg.get("arb_min_edge_pct", 1.0),
-                        cfg.get("arb_size_usdc", 10.0))
-            for s in dyn_slugs:
-                logger.info("  slug: '%s' (window %ds, format %s)",
-                            s.get("slug", "?"),
-                            s.get("window", 300),
-                            s.get("format", "timestamp"))
-        elif dyn_legacy:
-            logger.info("Arbitrage: ENABLED | Dynamic slug: '%s' (window %ds) | "
-                        "Min edge: %s%% | Size: $%s/side",
-                        dyn_legacy, cfg.get("arb_dynamic_window", 300),
-                        cfg.get("arb_min_edge_pct", 1.0),
-                        cfg.get("arb_size_usdc", 10.0))
-        else:
-            logger.info("Arbitrage: ENABLED | Markets: %d | Min edge: %s%% | Size: $%s/side",
-                        len(cfg.get("arb_condition_ids", [])),
-                        cfg.get("arb_min_edge_pct", 1.0),
-                        cfg.get("arb_size_usdc", 10.0))
+    logger.info("=== Polymarket Martingale Bot — Headless Mode ===")
+    logger.info("Dry run: %s | Auto-redeem: %s | Resume threshold: $%s",
+                cfg.get("dry_run", False),
+                cfg.get("auto_redeem_settled", True),
+                cfg.get("resume_threshold_usdc", 5))
     if cfg.get("martingale_enabled"):
         _ms = cfg.get("martingale_strategies") or []
         if _ms:
@@ -12765,7 +9666,7 @@ def run_headless():
     # Persist merged config so next restart picks up everything.
     save_user_config(cfg)
 
-    bot = CopyTraderBot(cfg, logger)
+    bot = MartingaleEngine(cfg, logger)
 
     # Start health-check HTTP server for App Platform
     health = HealthCheckServer(bot, logger)
@@ -12799,7 +9700,7 @@ def main():
     if headless:
         run_headless()
     else:
-        app = CopyTraderGUI()
+        app = MartingaleGUI()
         app.run()
 
 
@@ -12812,119 +9713,52 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 """
 =============================================================================
-POLYMARKET COPY TRADER BOT — USAGE INSTRUCTIONS
+POLYMARKET MARTINGALE BOT — USAGE INSTRUCTIONS
 =============================================================================
 
 1. REQUIRED INSTALLATIONS
    ----------------------
    pip install web3 requests py-clob-client
 
-   Optional (for .env support):
-   pip install python-dotenv
-
    Python 3.8+ is required. Tkinter is included with standard Python
    installations on most platforms.
-
-   The py-clob-client package is the official Polymarket Python SDK.
-   It handles API authentication (HMAC signing) and order creation.
 
 2. CONFIGURATION
    -------------
    All settings are entered through the GUI. In headless mode, use
-   environment variables (see section 5).
+   environment variables.
 
    Recommended Polygon RPC providers:
    - Alchemy:  https://alchemy.com  (free tier available)
    - Infura:   https://infura.io
    - QuickNode: https://quicknode.com
-   - Public:   https://polygon-rpc.com (rate limited)
 
-3. API CREDENTIALS & AUTHENTICATION
-   ---------------------------------
-   Polymarket's CLOB API requires L2 authentication (API key + HMAC)
-   for trade history and order placement endpoints.
-
-   Credentials are derived DETERMINISTICALLY from your wallet private key:
-
-   Option A – Automatic (recommended):
-     Enter your private key in the GUI, then click
-     "Derive Credentials from Private Key". The API key, secret, and
-     passphrase will be generated and stored in memory.
-
-   Option B – Automatic on first start:
-     If no credentials are saved but a private key is present, the bot
-     will derive them automatically when started.
-
-   Option C – Manual:
-     Use the py-clob-client SDK directly:
-       from py_clob_client.client import ClobClient
-       client = ClobClient("https://clob.polymarket.com", 137, key="0x...")
-       creds = client.create_or_derive_api_creds()
-       print(creds)
-     Then paste apiKey, secret, passphrase into the GUI.
-
-   IMPORTANT: Each wallet can only have ONE active API key at a time.
-   Calling create_or_derive_api_creds() is safe to repeat — it returns
-   the same key deterministically without invalidating it.
-
-4. PRIVATE KEY SETUP
-   -----------------
-   Enter your private key in the GUI. It will be saved to .private_key.
-
-   The file is created with 0600 permissions (owner-only read/write).
-
-   ⚠  SECURITY WARNINGS:
-   • NEVER share your private key with anyone.
-   • NEVER commit .private_key to version control.
-   • Consider using a dedicated hot wallet with limited funds.
-   • This bot has FULL control over the wallet whose key you provide.
-   • Run on a secure, trusted machine only.
-   • Use a hardware wallet or multisig for large holdings.
-
-5. RUNNING THE BOT
+3. RUNNING THE BOT
    ----------------
    python polymarket_copy_trader.py
 
    The Tkinter GUI will open. From there you can:
    - Configure RPC endpoints and your private key
    - Derive or enter CLOB API credentials
-   - Add trader wallet addresses to monitor
-   - Adjust copy percentage (1–100%) and max trade size
-   - Start/Stop the monitoring bot
+   - Configure martingale strategies
+   - Start/Stop the bot
    - View real-time logs in the Log tab
 
-6. HOW IT WORKS
-   -------------
-   The bot uses two complementary data sources:
+4. HEADLESS MODE
+   --------------
+   python polymarket_copy_trader.py --headless
 
-   a) Polymarket CLOB API (primary, recommended):
-      Uses authenticated requests via py-clob-client to fetch trades
-      for watched addresses. Orders are placed via the CLOB API using
-      EIP-712 signed order payloads.
+   Key environment variables:
+   - RPC_URL, WS_RPC_URL, PRIVATE_KEY
+   - MARTINGALE_ENABLED=1
+   - MARTINGALE_DIRECTION, MARTINGALE_START_BET
+   - MARTINGALE_SLUG_BASE, MARTINGALE_WINDOW
+   - MARTINGALE_STRATEGIES (JSON list for multi-strategy)
 
-   b) On-chain monitoring (fallback):
-      Scans new Polygon blocks for transactions from watched addresses
-      to Polymarket's CTF Exchange contracts. Requires a valid RPC URL.
-
-   When a new trade is detected, the bot:
-   1. Computes the copy amount (original size x copy percentage)
-   2. Caps it to max_trade_usdc and 95% of available USDC balance
-   3. Ensures USDC approval on the exchange contract
-   4. Places the order via the CLOB API (if SDK + credentials are available)
-   5. Logs the result
-
-6. LOGGING
-   -------
-   - Console: INFO level and above
-   - bot.log: DEBUG level (full detail)
-   - GUI Log tab: INFO level and above
-
-7. DISCLAIMER
+5. DISCLAIMER
    ----------
    This software is provided for EDUCATIONAL PURPOSES ONLY. Trading
-   on prediction markets involves substantial risk of loss. The authors
-   are not responsible for any financial losses incurred through the
-   use of this software. Use at your own risk. Ensure compliance with
-   all applicable laws and regulations in your jurisdiction.
+   on prediction markets involves substantial risk of loss. Use at
+   your own risk.
 =============================================================================
 """

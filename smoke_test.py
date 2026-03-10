@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Smoke Test for Polymarket Copy Trader Bot
-==========================================
+Smoke Test for Polymarket Martingale Bot
+========================================
 Run this to verify your environment and connectivity step-by-step.
 No trades will be executed — this is read-only.
 
 Usage:
-    python smoke_test.py                 # Run all checks
-    python smoke_test.py --rpc URL       # Specify an RPC URL
-    python smoke_test.py --address 0x... # Check a specific trader address
+    python smoke_test.py           # Run all checks
+    python smoke_test.py --rpc URL # Specify an RPC URL
 """
 
 import argparse
@@ -93,11 +92,8 @@ def check_config():
     print(f"   {INFO} WS RPC URL: {'set' if cfg.get('ws_rpc_url') else 'not set (enter in GUI)'}")
     print(f"   {INFO} CLOB API enabled: {cfg.get('use_clob_api', True)}")
     print(f"   {INFO} CLOB API key: {'set' if cfg.get('clob_api_key') else 'not set (enter in GUI)'}")
-    print(f"   {INFO} Copy percentage: {cfg.get('copy_percentage', 50)}%")
-    print(f"   {INFO} Max trade: {cfg.get('max_trade_usdc', 100)} USDC")
     print(f"   {INFO} Dry run: {cfg.get('dry_run', False)}")
-    n = len(cfg.get("watched_addresses", []))
-    print(f"   {INFO} Watched addresses: {n}")
+    print(f"   {INFO} Martingale enabled: {cfg.get('martingale_enabled', False)}")
     return cfg
 
 
@@ -242,13 +238,13 @@ def check_wallet_balance(w3, address):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Smoke test for Polymarket Copy Trader")
+    parser = argparse.ArgumentParser(description="Smoke test for Polymarket Martingale Bot")
     parser.add_argument("--rpc", help="Polygon RPC URL to test")
-    parser.add_argument("--address", help="Trader address to check activity for")
+    parser.add_argument("--address", help="Wallet address to check balance for")
     args = parser.parse_args()
 
     print("=" * 60)
-    print("  Polymarket Copy Trader — Smoke Test")
+    print("  Polymarket Martingale Bot — Smoke Test")
     print("=" * 60)
 
     results = []
@@ -271,15 +267,11 @@ def main():
     results.append(("CLOB API", check_clob_api()))
 
     address = args.address
-    if not address and cfg and cfg.get("watched_addresses"):
-        address = cfg["watched_addresses"][0]
-
     if address:
-        results.append(("Address activity", check_address_activity(address)))
         if w3:
             results.append(("Wallet balance", check_wallet_balance(w3, address)))
     else:
-        print(f"\n7. {SKIP} No address — pass --address 0x... to check activity")
+        print(f"\n7. {SKIP} No address — pass --address 0x... to check wallet balance")
 
     # Summary
     print("\n" + "=" * 60)
@@ -295,8 +287,8 @@ def main():
     else:
         print(f"\n  All checks passed! You're ready to run the bot.")
         print(f"\n  Recommended first steps:")
-        print(f"    1. Enable dry-run mode in the GUI")
-        print(f"    2. Add a known active trader address")
+        print(f"    1. Configure martingale settings in the GUI")
+        print(f"    2. Enable dry-run mode to test without real trades")
         print(f"    3. Start the bot and watch the logs")
         print(f"    4. Once you're happy, disable dry-run to go live")
 
