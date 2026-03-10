@@ -41,7 +41,7 @@ sys.modules.setdefault("py_clob_client", mock_clob)
 sys.modules.setdefault("py_clob_client.client", mock_clob)
 sys.modules.setdefault("py_clob_client.clob_types", mock_clob)
 
-import polymarket_copy_trader as bot
+import polymarket_martingale as bot
 
 
 class TestConfigHelpers(unittest.TestCase):

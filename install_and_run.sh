@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Polymarket Copy Trader Bot — Installer & Launcher
+# Polymarket Martingale Bot — Installer & Launcher
 # =============================================================================
 # This script:
 #   1. Checks for Python 3.8+
@@ -22,7 +22,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_DIR="$SCRIPT_DIR/.venv"
 
 echo "============================================="
-echo "  Polymarket Copy Trader Bot — Setup"
+echo "  Polymarket Martingale Bot — Setup"
 echo "============================================="
 echo ""
 
@@ -92,8 +92,8 @@ pip list --format=columns 2>/dev/null | grep -E "web3|requests|py-clob" || true
 echo ""
 
 # --- Run ---
-echo "Launching Polymarket Copy Trader Bot..."
+echo "Launching Polymarket Martingale Bot..."
 echo "(Close the GUI window to stop)"
 echo ""
 cd "$SCRIPT_DIR"
-"$PYTHON" polymarket_copy_trader.py
+"$PYTHON" polymarket_martingale.py

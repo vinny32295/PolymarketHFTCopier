@@ -13,7 +13,7 @@ _test_positions_path = os.path.join(_test_positions_dir, "positions.json")
 @pytest.fixture(autouse=True)
 def _isolate_positions_file(monkeypatch):
     """Point POSITIONS_FILE to a temp path and clean up after each test."""
-    import polymarket_copy_trader as bot
+    import polymarket_martingale as bot
     monkeypatch.setattr(bot, "POSITIONS_FILE", _test_positions_path)
     yield
     # Remove any positions file created during the test

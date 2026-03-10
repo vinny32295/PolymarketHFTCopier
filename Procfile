@@ -1,1 +1,1 @@
-web: python polymarket_copy_trader.py --headless
+web: python polymarket_martingale.py --headless

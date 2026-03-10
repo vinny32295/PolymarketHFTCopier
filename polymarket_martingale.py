@@ -9735,7 +9735,7 @@ POLYMARKET MARTINGALE BOT — USAGE INSTRUCTIONS
 
 3. RUNNING THE BOT
    ----------------
-   python polymarket_copy_trader.py
+   python polymarket_martingale.py
 
    The Tkinter GUI will open. From there you can:
    - Configure RPC endpoints and your private key
@@ -9746,7 +9746,7 @@ POLYMARKET MARTINGALE BOT — USAGE INSTRUCTIONS
 
 4. HEADLESS MODE
    --------------
-   python polymarket_copy_trader.py --headless
+   python polymarket_martingale.py --headless
 
    Key environment variables:
    - RPC_URL, WS_RPC_URL, PRIVATE_KEY

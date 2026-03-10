@@ -1,13 +1,13 @@
 @echo off
 REM =============================================================================
-REM Polymarket Copy Trader Bot — Windows Installer & Launcher
+REM Polymarket Martingale Bot — Windows Installer & Launcher
 REM =============================================================================
 REM Double-click this file or run from Command Prompt.
 REM Requires Python 3.8+ installed and on PATH.
 REM =============================================================================
 
 echo =============================================
-echo   Polymarket Copy Trader Bot — Setup
+echo   Polymarket Martingale Bot — Setup
 echo =============================================
 echo.
 
@@ -55,6 +55,6 @@ echo =============================================
 echo   Setup Complete! Launching bot...
 echo =============================================
 echo.
-python polymarket_copy_trader.py
+python polymarket_martingale.py
 
 pause
