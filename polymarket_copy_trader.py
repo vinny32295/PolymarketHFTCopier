@@ -6339,6 +6339,13 @@ class MartingaleBot(threading.Thread):
                 self._skip_reason = "USDC approval failed"
                 return False
 
+        # Snapshot token balance before placing the order so that phantom-fill
+        # detection can use the *delta* rather than the absolute balance
+        # (which may include pre-existing shares from earlier positions).
+        _pre_order_balance = self._check_phantom_fill(
+            token_id, neg_risk=neg_risk,
+        )
+
         result = self.clob_client.place_order(
             token_id=token_id,
             side="BUY",
@@ -6356,23 +6363,27 @@ class MartingaleBot(threading.Thread):
         if isinstance(result, dict) and result.get("status") == "network_error":
             self.logger.warning(
                 "MARTINGALE: FOK network error for %s @ $%.4f — "
-                "checking for phantom fill on-chain",
-                direction, ask_price,
+                "checking for phantom fill on-chain (pre-balance: %.1f raw)",
+                direction, ask_price, _pre_order_balance,
             )
             time.sleep(2)  # allow on-chain settlement
             raw_balance = self._check_phantom_fill(
                 token_id, neg_risk=neg_risk,
             )
-            if raw_balance > 0:
+            # Use the delta from the pre-order snapshot to exclude
+            # pre-existing shares that were already in the wallet.
+            raw_delta = raw_balance - _pre_order_balance
+            if raw_delta > 0:
                 actual_shares = float(
-                    Decimal(raw_balance) / Decimal("1000000")
+                    Decimal(raw_delta) / Decimal("1000000")
                 )
                 actual_cost = round(actual_shares * ask_price, 6)
                 self.logger.warning(
-                    "MARTINGALE: PHANTOM FILL DETECTED — %.1f shares of "
-                    "token %s on-chain (expected ~%.1f). "
-                    "Treating as successful fill.",
+                    "MARTINGALE: PHANTOM FILL DETECTED — %.1f new shares "
+                    "(delta) of token %s on-chain (expected ~%.1f, "
+                    "pre-balance: %.1f raw). Treating as successful fill.",
                     actual_shares, token_id[:16] + "...", target_shares,
+                    _pre_order_balance,
                 )
                 # Synthetic result so the success path below works
                 result = {
@@ -6384,8 +6395,9 @@ class MartingaleBot(threading.Thread):
                 }
             else:
                 self.logger.info(
-                    "MARTINGALE: no phantom fill (balance=0) — "
+                    "MARTINGALE: no phantom fill (delta=0, post=%d, pre=%d) — "
                     "will retry next poll",
+                    raw_balance, _pre_order_balance,
                 )
                 self._skip_reason = (
                     f"network error (no phantom fill) @ ${ask_price:.4f}"
