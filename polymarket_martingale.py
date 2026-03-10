@@ -7754,6 +7754,60 @@ class TextHandler(logging.Handler):
 
 
 # ---------------------------------------------------------------------------
+# Tooltip Helper
+# ---------------------------------------------------------------------------
+
+class ToolTip:
+    """Hover tooltip for any tkinter widget."""
+
+    _DELAY_MS = 400  # ms before tooltip appears
+    _WRAP_PX = 320   # text wrap width in pixels
+
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self._tip_window = None
+        self._after_id = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._cancel, add="+")
+        widget.bind("<ButtonPress>", self._cancel, add="+")
+
+    def _schedule(self, _event=None):
+        self._cancel()
+        self._after_id = self.widget.after(self._DELAY_MS, self._show)
+
+    def _cancel(self, _event=None):
+        if self._after_id:
+            self.widget.after_cancel(self._after_id)
+            self._after_id = None
+        self._hide()
+
+    def _show(self):
+        if self._tip_window:
+            return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(
+            tw, text=self.text, justify=tk.LEFT,
+            background="#ffffe0", foreground="#333",
+            relief=tk.SOLID, borderwidth=1,
+            wraplength=self._WRAP_PX,
+            font=("TkDefaultFont", 9),
+            padx=6, pady=4,
+        )
+        label.pack()
+        self._tip_window = tw
+
+    def _hide(self):
+        if self._tip_window:
+            self._tip_window.destroy()
+            self._tip_window = None
+
+
+# ---------------------------------------------------------------------------
 # Tkinter GUI Application
 # ---------------------------------------------------------------------------
 
@@ -8280,28 +8334,43 @@ class MartingaleGUI:
     def _build_config_tab(self, parent):
         # RPC URL
         row = 0
-        ttk.Label(parent, text="HTTP RPC URL:").grid(row=row, column=0, sticky=tk.W, pady=3)
+        _lbl = ttk.Label(parent, text="HTTP RPC URL:")
+        _lbl.grid(row=row, column=0, sticky=tk.W, pady=3)
         self.rpc_entry = ttk.Entry(parent, width=70)
         self.rpc_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, pady=3)
+        _tip = ("Polygon network HTTP RPC endpoint. You can get a free one from "
+                "Alchemy, Infura, or QuickNode. Example: https://polygon-rpc.com")
+        ToolTip(_lbl, _tip)
+        ToolTip(self.rpc_entry, _tip)
 
         row += 1
-        ttk.Label(parent, text="WebSocket RPC URL:").grid(row=row, column=0, sticky=tk.W, pady=3)
+        _lbl = ttk.Label(parent, text="WebSocket RPC URL:")
+        _lbl.grid(row=row, column=0, sticky=tk.W, pady=3)
         self.ws_rpc_entry = ttk.Entry(parent, width=70)
         self.ws_rpc_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, pady=3)
+        _tip = ("Polygon WebSocket RPC endpoint for real-time event streaming. "
+                "Usually starts with wss://. Optional — the bot falls back to HTTP polling.")
+        ToolTip(_lbl, _tip)
+        ToolTip(self.ws_rpc_entry, _tip)
 
         # Private key
         row += 1
-        ttk.Label(parent, text="Private Key:").grid(row=row, column=0, sticky=tk.W, pady=3)
+        _lbl = ttk.Label(parent, text="Private Key:")
+        _lbl.grid(row=row, column=0, sticky=tk.W, pady=3)
         self.pk_entry = ttk.Entry(parent, width=70, show="*")
         self.pk_entry.grid(row=row, column=1, sticky=tk.EW, pady=3)
-        ttk.Button(parent, text="Show/Hide", command=self._toggle_pk).grid(
-            row=row, column=2, padx=5
-        )
+        _pk_btn = ttk.Button(parent, text="Show/Hide", command=self._toggle_pk)
+        _pk_btn.grid(row=row, column=2, padx=5)
+        _tip = ("Your Polygon wallet private key (hex string starting with 0x). "
+                "This is used to sign transactions. Never share it with anyone.")
+        ToolTip(_lbl, _tip)
+        ToolTip(self.pk_entry, _tip)
+        ToolTip(_pk_btn, "Toggle visibility of the private key field.")
 
         row += 1
         ttk.Label(
             parent,
-            text="⚠ WARNING: Your private key controls your funds. "
+            text="\u26a0 WARNING: Your private key controls your funds. "
                  "Never share it. It is stored locally in a restricted file.",
             foreground="red",
             wraplength=600,
@@ -8309,45 +8378,64 @@ class MartingaleGUI:
 
         # Resume threshold
         row += 1
-        ttk.Label(parent, text="Resume Threshold (USDC):").grid(row=row, column=0, sticky=tk.W, pady=3)
+        _lbl = ttk.Label(parent, text="Resume Threshold (USDC):")
+        _lbl.grid(row=row, column=0, sticky=tk.W, pady=3)
         resume_frame = ttk.Frame(parent)
         resume_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
         self.resume_threshold_entry = ttk.Entry(resume_frame, width=10)
         self.resume_threshold_entry.pack(side=tk.LEFT)
         ttk.Label(resume_frame, text="(min balance to resume after pause)").pack(side=tk.LEFT, padx=5)
+        _tip = ("Minimum USDC wallet balance required before the bot will resume "
+                "betting after an automatic pause. Prevents betting with too little capital.")
+        ToolTip(_lbl, _tip)
+        ToolTip(self.resume_threshold_entry, _tip)
 
         # Kill switch — max loss
         row += 1
-        ttk.Label(parent, text="Max Loss Kill Switch (USDC):").grid(row=row, column=0, sticky=tk.W, pady=3)
+        _lbl = ttk.Label(parent, text="Max Loss Kill Switch (USDC):")
+        _lbl.grid(row=row, column=0, sticky=tk.W, pady=3)
         kill_frame = ttk.Frame(parent)
         kill_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
         self.max_loss_entry = ttk.Entry(kill_frame, width=10)
         self.max_loss_entry.pack(side=tk.LEFT)
         ttk.Label(kill_frame, text="(stop bot after losing this much, 0=off)").pack(side=tk.LEFT, padx=5)
+        _tip = ("Emergency stop: the bot shuts down entirely after cumulative losses "
+                "reach this USDC amount. Set to 0 to disable this safety limit.")
+        ToolTip(_lbl, _tip)
+        ToolTip(self.max_loss_entry, _tip)
 
         # Use CLOB API checkbox
         row += 1
         self.use_clob_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        _cb = ttk.Checkbutton(
             parent, text="Use Polymarket CLOB API (recommended)", variable=self.use_clob_var
-        ).grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=3)
+        )
+        _cb.grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=3)
+        ToolTip(_cb, "Use the Polymarket Central Limit Order Book API for placing trades. "
+                "This is faster and more reliable than on-chain transactions. Recommended.")
 
         # Dry-run mode checkbox
         row += 1
         self.dry_run_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
+        _cb = ttk.Checkbutton(
             parent, text="Dry Run Mode (detect trades but do NOT execute)",
             variable=self.dry_run_var
-        ).grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=3)
+        )
+        _cb.grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=3)
+        ToolTip(_cb, "Simulate everything without spending real money. The bot will log "
+                "what it would do but will not place any actual orders. Great for testing.")
 
         # Auto-redeem settled positions checkbox
         row += 1
         self.auto_redeem_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        _cb = ttk.Checkbutton(
             parent,
             text="Auto-redeem settled positions (convert winning tokens back to USDC)",
             variable=self.auto_redeem_var,
-        ).grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=3)
+        )
+        _cb.grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=3)
+        ToolTip(_cb, "Automatically convert winning outcome tokens back to USDC after "
+                "a market settles. Keeps your balance liquid for the next bet.")
 
         # --- CLOB API Credentials ---
         row += 1
@@ -8362,19 +8450,31 @@ class MartingaleGUI:
         ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=3)
 
         row += 1
-        ttk.Label(parent, text="API Key:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        _lbl = ttk.Label(parent, text="API Key:")
+        _lbl.grid(row=row, column=0, sticky=tk.W, pady=2)
         self.api_key_entry = ttk.Entry(parent, width=70)
         self.api_key_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, pady=2)
+        _tip = "Your Polymarket CLOB API key. Leave blank to auto-derive from your private key."
+        ToolTip(_lbl, _tip)
+        ToolTip(self.api_key_entry, _tip)
 
         row += 1
-        ttk.Label(parent, text="API Secret:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        _lbl = ttk.Label(parent, text="API Secret:")
+        _lbl.grid(row=row, column=0, sticky=tk.W, pady=2)
         self.api_secret_entry = ttk.Entry(parent, width=70, show="*")
         self.api_secret_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, pady=2)
+        _tip = "Your CLOB API secret. Leave blank to auto-derive from your private key."
+        ToolTip(_lbl, _tip)
+        ToolTip(self.api_secret_entry, _tip)
 
         row += 1
-        ttk.Label(parent, text="API Passphrase:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        _lbl = ttk.Label(parent, text="API Passphrase:")
+        _lbl.grid(row=row, column=0, sticky=tk.W, pady=2)
         self.api_passphrase_entry = ttk.Entry(parent, width=70, show="*")
         self.api_passphrase_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, pady=2)
+        _tip = "Your CLOB API passphrase. Leave blank to auto-derive from your private key."
+        ToolTip(_lbl, _tip)
+        ToolTip(self.api_passphrase_entry, _tip)
 
         row += 1
         self.derive_btn = ttk.Button(
@@ -8382,6 +8482,8 @@ class MartingaleGUI:
             command=self._derive_api_creds,
         )
         self.derive_btn.grid(row=row, column=1, sticky=tk.W, pady=3)
+        ToolTip(self.derive_btn, "Generate API Key, Secret, and Passphrase automatically "
+                "from your private key. This is the easiest way to set up credentials.")
 
         row += 1
         ttk.Label(
@@ -8405,20 +8507,32 @@ class MartingaleGUI:
         ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=3)
 
         row += 1
-        ttk.Label(parent, text="Bot Token:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        _lbl = ttk.Label(parent, text="Bot Token:")
+        _lbl.grid(row=row, column=0, sticky=tk.W, pady=2)
         self.tg_token_entry = ttk.Entry(parent, width=70, show="*")
         self.tg_token_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, pady=2)
+        _tip = ("Telegram bot token from @BotFather. Enables mobile notifications "
+                "for wins, losses, and bot status updates.")
+        ToolTip(_lbl, _tip)
+        ToolTip(self.tg_token_entry, _tip)
 
         row += 1
-        ttk.Label(parent, text="Chat ID:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        _lbl = ttk.Label(parent, text="Chat ID:")
+        _lbl.grid(row=row, column=0, sticky=tk.W, pady=2)
         tg_chat_frame = ttk.Frame(parent)
         tg_chat_frame.grid(row=row, column=1, columnspan=2, sticky=tk.EW, pady=2)
         self.tg_chat_entry = ttk.Entry(tg_chat_frame, width=20)
         self.tg_chat_entry.pack(side=tk.LEFT)
-        ttk.Button(
+        _test_btn = ttk.Button(
             tg_chat_frame, text="Test",
             command=self._test_telegram,
-        ).pack(side=tk.LEFT, padx=10)
+        )
+        _test_btn.pack(side=tk.LEFT, padx=10)
+        _tip = ("Your personal Telegram Chat ID. Send /start to your bot, "
+                "then message @userinfobot to find this number.")
+        ToolTip(_lbl, _tip)
+        ToolTip(self.tg_chat_entry, _tip)
+        ToolTip(_test_btn, "Send a test message to verify your Telegram setup works.")
 
         row += 1
         ttk.Label(
@@ -8434,10 +8548,13 @@ class MartingaleGUI:
     def _build_martingale_tab(self, parent):
         # Enable checkbox
         self.mart_enabled_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
+        _cb = ttk.Checkbutton(
             parent, text="Enable Martingale Mode",
             variable=self.mart_enabled_var,
-        ).pack(anchor=tk.W, pady=(0, 5))
+        )
+        _cb.pack(anchor=tk.W, pady=(0, 5))
+        ToolTip(_cb, "Turn Martingale betting on or off globally. "
+                "When disabled, no martingale bets will be placed.")
 
         ttk.Label(
             parent,
@@ -8477,48 +8594,79 @@ class MartingaleGUI:
         edit_frame = ttk.LabelFrame(top_frame, text="Strategy Settings", padding=5)
         edit_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Build the fields in a grid
+        # Build the fields in a grid — (label, key, width, tooltip)
         fields = [
-            ("Name:", "mart_e_name", 20),
-            ("Slug Base:", "mart_e_slug", 25),
-            ("Window (seconds):", "mart_e_window", 10),
-            ("Direction (Up/Down):", "mart_e_direction", 10),
-            ("Starting Bet (USDC):", "mart_e_start_bet", 10),
-            ("Max Bet (0=no limit):", "mart_e_max_bet", 10),
-            ("Max Streak (0=no limit):", "mart_e_max_streak", 10),
-            ("Poll Interval (seconds):", "mart_e_poll", 10),
-            ("Buy Price Min:", "mart_e_price_min", 10),
-            ("Buy Price Max:", "mart_e_price_max", 10),
-            ("Max Entry (sec into window):", "mart_e_max_entry", 10),
+            ("Name:", "mart_e_name", 20,
+             "A friendly label for this strategy (e.g. 'BTC 5m Up'). "
+             "Shown in the strategy list and logs."),
+            ("Slug Base:", "mart_e_slug", 25,
+             "The Polymarket market slug prefix (e.g. 'btc-updown-5m'). "
+             "The bot appends the current window timestamp to form the full market slug."),
+            ("Window (seconds):", "mart_e_window", 10,
+             "Duration of each betting window in seconds. For a 5-minute market use 300. "
+             "The bot aligns bets to these windows automatically."),
+            ("Direction (Up/Down):", "mart_e_direction", 10,
+             "Which side to bet on — 'Up' or 'Down'. "
+             "The bot always buys this outcome each window."),
+            ("Starting Bet (USDC):", "mart_e_start_bet", 10,
+             "Your initial wager in USDC. After a loss the bet doubles; "
+             "after a win it resets back to this amount."),
+            ("Max Bet (0=no limit):", "mart_e_max_bet", 10,
+             "Cap on the maximum single bet in USDC. If doubling would exceed "
+             "this amount, the bet is clamped here. Set 0 for no limit."),
+            ("Max Streak (0=no limit):", "mart_e_max_streak", 10,
+             "Maximum number of consecutive losses before the strategy pauses. "
+             "Useful as a safety valve. Set 0 for unlimited."),
+            ("Poll Interval (seconds):", "mart_e_poll", 10,
+             "How often (in seconds) the bot checks market prices and places bets. "
+             "Lower = more responsive but more API calls."),
+            ("Buy Price Min:", "mart_e_price_min", 10,
+             "Only buy when the token price is at or above this value (0.00–1.00). "
+             "Filters out unfavorable odds."),
+            ("Buy Price Max:", "mart_e_price_max", 10,
+             "Only buy when the token price is at or below this value (0.00–1.00). "
+             "Prevents buying at extremely high prices."),
+            ("Max Entry (sec into window):", "mart_e_max_entry", 10,
+             "Latest point (in seconds after window start) at which a bet can be placed. "
+             "Prevents entering too late when the outcome is nearly decided."),
         ]
         self._mart_entries = {}
-        for row, (label, attr, width) in enumerate(fields):
-            ttk.Label(edit_frame, text=label).grid(
-                row=row, column=0, sticky=tk.W, padx=2, pady=2,
-            )
+        for row, (label, attr, width, tip) in enumerate(fields):
+            lbl = ttk.Label(edit_frame, text=label)
+            lbl.grid(row=row, column=0, sticky=tk.W, padx=2, pady=2)
             entry = ttk.Entry(edit_frame, width=width)
             entry.grid(row=row, column=1, sticky=tk.W, padx=2, pady=2)
             self._mart_entries[attr] = entry
+            ToolTip(lbl, tip)
+            ToolTip(entry, tip)
 
-        ttk.Button(
+        _apply_btn = ttk.Button(
             edit_frame, text="Apply to Selected",
             command=self._mart_apply_edit,
-        ).grid(row=len(fields), column=0, columnspan=2, pady=(10, 0))
+        )
+        _apply_btn.grid(row=len(fields), column=0, columnspan=2, pady=(10, 0))
+        ToolTip(_apply_btn, "Save the current field values to the selected strategy in the list.")
 
         # --- Bottom: status + reset ---
         status_frame = ttk.Frame(parent)
         status_frame.pack(fill=tk.X, pady=(10, 0))
 
         self.mart_status_var = tk.StringVar(value="Martingale: idle")
-        ttk.Label(
+        _status_lbl = ttk.Label(
             status_frame, textvariable=self.mart_status_var,
             font=("Courier", 10, "bold"),
-        ).pack(side=tk.LEFT)
+        )
+        _status_lbl.pack(side=tk.LEFT)
+        ToolTip(_status_lbl, "Current martingale state: shows streak count, "
+                "current bet size, and last outcome.")
 
-        ttk.Button(
+        _reset_btn = ttk.Button(
             status_frame, text="Reset All State",
             command=self._reset_martingale_state,
-        ).pack(side=tk.RIGHT, padx=5)
+        )
+        _reset_btn.pack(side=tk.RIGHT, padx=5)
+        ToolTip(_reset_btn, "Reset all strategies back to their starting bet "
+                "and clear the loss streak counter. Does not delete strategies.")
 
     # -- Martingale strategy list helpers ------------------------------------
 
