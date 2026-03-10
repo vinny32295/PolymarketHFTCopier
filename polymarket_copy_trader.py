@@ -6396,20 +6396,24 @@ class MartingaleBot(threading.Thread):
         if isinstance(result, dict) and (
             result.get("status") == "fok_rejected" or result.get("error")
         ):
-            # Track per-window FOK retries to avoid unlimited retry loops
+            # Track per-window FOK retries
             if self._fok_retry_window_ts != current_window_ts:
                 self._fok_retry_count = 0
                 self._fok_retry_window_ts = current_window_ts
             self._fok_retry_count += 1
-            max_fok_retries = int(self._scfg(
-                "max_fok_retries", "martingale_max_fok_retries", 3,
+            # Keep retrying while still within the entry window
+            now_retry = int(time.time())
+            seconds_into_retry = now_retry - current_window_ts
+            max_entry = int(self._scfg(
+                "max_entry_seconds", "martingale_max_entry_seconds", 60,
             ))
-            if self._fok_retry_count >= max_fok_retries:
+            if max_entry > 0 and seconds_into_retry > max_entry:
                 self.logger.warning(
-                    "MARTINGALE: FOK rejected %d/%d times for %s @ $%.4f "
-                    "— giving up on window %d",
-                    self._fok_retry_count, max_fok_retries,
-                    direction, ask_price, current_window_ts,
+                    "MARTINGALE: FOK rejected %d times for %s @ $%.4f "
+                    "— out of time (%ds > %ds) on window %d",
+                    self._fok_retry_count,
+                    direction, ask_price,
+                    seconds_into_retry, max_entry, current_window_ts,
                 )
                 self._skip_reason = (
                     f"FOK rejected {self._fok_retry_count}x @ ${ask_price:.4f}"
@@ -6419,9 +6423,11 @@ class MartingaleBot(threading.Thread):
                 self._save_state()
                 return False
             self.logger.warning(
-                "MARTINGALE: FOK rejected for %s @ $%.4f — retry %d/%d",
+                "MARTINGALE: FOK rejected for %s @ $%.4f — retry %d "
+                "(%ds left in window)",
                 direction, ask_price,
-                self._fok_retry_count, max_fok_retries,
+                self._fok_retry_count,
+                max(0, max_entry - seconds_into_retry),
             )
             self._skip_reason = f"FOK rejected @ ${ask_price:.4f}"
             self._skip_price = ask_price
@@ -6433,15 +6439,19 @@ class MartingaleBot(threading.Thread):
                 self._fok_retry_count = 0
                 self._fok_retry_window_ts = current_window_ts
             self._fok_retry_count += 1
-            max_fok_retries = int(self._scfg(
-                "max_fok_retries", "martingale_max_fok_retries", 3,
+            # Keep retrying while still within the entry window
+            now_retry2 = int(time.time())
+            seconds_into_retry2 = now_retry2 - current_window_ts
+            max_entry2 = int(self._scfg(
+                "max_entry_seconds", "martingale_max_entry_seconds", 60,
             ))
-            if self._fok_retry_count >= max_fok_retries:
+            if max_entry2 > 0 and seconds_into_retry2 > max_entry2:
                 self.logger.warning(
-                    "MARTINGALE: order failed %d/%d times for %s "
-                    "— giving up on window %d",
-                    self._fok_retry_count, max_fok_retries,
-                    direction, current_window_ts,
+                    "MARTINGALE: order failed %d times for %s "
+                    "— out of time (%ds > %ds) on window %d",
+                    self._fok_retry_count,
+                    direction,
+                    seconds_into_retry2, max_entry2, current_window_ts,
                 )
                 self._skip_reason = (
                     f"order failed {self._fok_retry_count}x for {direction}"
@@ -6451,8 +6461,10 @@ class MartingaleBot(threading.Thread):
                 self._save_state()
                 return False
             self.logger.warning(
-                "MARTINGALE: order failed for %s — retry %d/%d",
-                direction, self._fok_retry_count, max_fok_retries,
+                "MARTINGALE: order failed for %s — retry %d "
+                "(%ds left in window)",
+                direction, self._fok_retry_count,
+                max(0, max_entry2 - seconds_into_retry2),
             )
             self._skip_reason = f"order failed for {direction}"
             self._skip_price = ask_price
