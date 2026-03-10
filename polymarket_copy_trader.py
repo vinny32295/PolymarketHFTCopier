@@ -5943,15 +5943,23 @@ class MartingaleBot(threading.Thread):
         if not price or price <= 0:
             return False
 
+        # "In our direction" means green (close >= open) for Up,
+        # red (close < open) for Down.
+        betting_down = direction != "Up"
+
         now = int(time.time())
 
         if self._streak_confirm_candle_ts == 0 or (now - self._streak_confirm_candle_ts) >= interval:
             # Close the previous candle if one was open
             if self._streak_confirm_candle_open is not None and self._streak_confirm_candle_ts > 0:
+                is_green = price >= self._streak_confirm_candle_open
+                # A candle is "in our favor" when it matches the bet direction
+                in_our_favor = (not is_green) if betting_down else is_green
                 candle = {
                     "open": self._streak_confirm_candle_open,
                     "close": price,
-                    "green": price >= self._streak_confirm_candle_open,
+                    "green": is_green,
+                    "favorable": in_our_favor,
                     "ts": self._streak_confirm_candle_ts,
                 }
                 self._streak_confirm_candles.append(candle)
@@ -5959,26 +5967,29 @@ class MartingaleBot(threading.Thread):
                 self._streak_confirm_candles = self._streak_confirm_candles[-n_total:]
                 self._save_state()
 
-                green_count = sum(1 for c in self._streak_confirm_candles if c["green"])
+                favorable_count = sum(
+                    1 for c in self._streak_confirm_candles if c.get("favorable", c["green"]))
                 total = len(self._streak_confirm_candles)
-                color = "GREEN" if candle["green"] else "RED"
+                color = "GREEN" if is_green else "RED"
+                favor_label = "IN FAVOR" if in_our_favor else "AGAINST"
                 self.logger.info(
-                    "MARTINGALE [%s] streak confirmation candle: %s (%.4f → %.4f) "
-                    "— %d/%d green (%d needed from %d candles)",
-                    self.strategy_name, color, candle["open"], candle["close"],
-                    green_count, total, n_green, n_total,
+                    "MARTINGALE [%s] streak confirmation candle: %s %s "
+                    "(%.4f → %.4f, dir=%s) — %d/%d favorable (%d needed from %d)",
+                    self.strategy_name, color, favor_label,
+                    candle["open"], candle["close"], direction,
+                    favorable_count, total, n_green, n_total,
                 )
 
-                if total >= n_total and green_count >= n_green:
+                if total >= n_total and favorable_count >= n_green:
                     return True
 
-                # If we have enough candles but NOT enough green, reset and
-                # start sampling fresh — trend not confirmed yet.
+                # If we have enough candles but NOT enough favorable, reset
+                # and start sampling fresh — trend not confirmed yet.
                 if total >= n_total:
                     self.logger.info(
-                        "MARTINGALE [%s] streak confirmation failed (%d/%d green) "
-                        "— resetting candles, will re-sample",
-                        self.strategy_name, green_count, n_total,
+                        "MARTINGALE [%s] streak confirmation failed "
+                        "(%d/%d favorable, dir=%s) — resetting, will re-sample",
+                        self.strategy_name, favorable_count, n_total, direction,
                     )
                     self._streak_confirm_candles = []
                     self._save_state()
@@ -5991,8 +6002,10 @@ class MartingaleBot(threading.Thread):
 
     def _resume_from_streak_confirmation(self):
         """Clear confirmation state after trend is confirmed — proceed to bet."""
-        green_count = sum(1 for c in self._streak_confirm_candles if c["green"])
+        favorable_count = sum(
+            1 for c in self._streak_confirm_candles if c.get("favorable", c["green"]))
         total = len(self._streak_confirm_candles)
+        direction = self._scfg("direction", "martingale_direction", self.direction)
 
         self._streak_confirming = False
         self._streak_confirm_candles = []
@@ -6002,14 +6015,16 @@ class MartingaleBot(threading.Thread):
 
         msg = (
             f"MARTINGALE [{self.strategy_name}] TREND CONFIRMED at streak "
-            f"{self.consecutive_losses}: {green_count}/{total} candles green "
+            f"{self.consecutive_losses}: {favorable_count}/{total} candles "
+            f"favorable (dir={direction}) "
             f"— proceeding with ${self.current_bet:.2f} bet"
         )
         self.logger.info(msg)
         self._log_event("streak_confirm_passed",
             streak=self.consecutive_losses,
-            green_candles=green_count,
+            favorable_candles=favorable_count,
             total_candles=total,
+            direction=direction,
         )
         if self.notify_callback:
             try:
