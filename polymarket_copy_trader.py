@@ -6621,15 +6621,39 @@ class MartingaleBot(threading.Thread):
         loss = bet["cost"]
         self.session_pnl -= loss
         self._session_losses += 1
-        self.consecutive_losses += 1
-        # Use geometric doubling from start_bet to keep the martingale
-        # progression clean and predictable: start_bet × 2^streak.
-        # Previously this doubled the actual exchange cost, which caused
-        # drift when place_order bumped the bet to meet Polymarket minimums
-        # (e.g. $2.50 bumped to $2.60 → doubled to $5.20 instead of $5.00).
-        self.current_bet = round(
+
+        # Check if the bet that just lost was in sync with the martingale
+        # progression.  If the actual bet size doesn't match what the
+        # progression predicted (start_bet × 2^streak), the bet was stale
+        # or carried over from a different start_bet — reset to base
+        # instead of advancing the streak.
+        expected_bet_before_loss = round(
             self.start_bet * (2 ** self.consecutive_losses), 2
         )
+        max_bet = float(self._scfg("max_bet", "martingale_max_bet", 0))
+        if max_bet > 0:
+            expected_bet_before_loss = min(expected_bet_before_loss, max_bet)
+        actual_bet = bet.get("bet_size", bet["cost"])
+        # Allow 10% tolerance for exchange rounding / minimum bumps
+        if abs(actual_bet - expected_bet_before_loss) > max(0.50, expected_bet_before_loss * 0.10):
+            self.logger.warning(
+                "MARTINGALE [%s]: bet $%.2f was out of sync with progression "
+                "(expected $%.2f at streak %d) — resetting to base $%.2f",
+                self.strategy_name, actual_bet, expected_bet_before_loss,
+                self.consecutive_losses, self.start_bet,
+            )
+            self.consecutive_losses = 0
+            self.current_bet = self.start_bet
+        else:
+            self.consecutive_losses += 1
+            # Use geometric doubling from start_bet to keep the martingale
+            # progression clean and predictable: start_bet × 2^streak.
+            # Previously this doubled the actual exchange cost, which caused
+            # drift when place_order bumped the bet to meet Polymarket minimums
+            # (e.g. $2.50 bumped to $2.60 → doubled to $5.20 instead of $5.00).
+            self.current_bet = round(
+                self.start_bet * (2 ** self.consecutive_losses), 2
+            )
 
         # Log if the actual cost diverged from intended bet size
         actual_cost = bet.get("cost", 0)
