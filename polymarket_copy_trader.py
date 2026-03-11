@@ -515,7 +515,7 @@ DEFAULT_CONFIG = {
     "martingale_max_streak": 0,        # stop after N consecutive losses (0 = no limit)
     "martingale_streak_reset": True,   # reset bet to start_bet when streak recovery completes
     "martingale_hard_reset_streak": 0, # at streak Y, just reset to start_bet and keep going (0 = disabled)
-    "martingale_recovery_candles": 6,   # number of candles to evaluate for recovery
+    "martingale_recovery_candles": 5,   # number of candles to evaluate for recovery
     "martingale_recovery_green": 3,     # how many of those candles must be green to resume
     "martingale_recovery_interval": 300, # candle interval in seconds for recovery sampling
     "martingale_post_recovery_confirm": True,  # require confirmation candles on every bet after recovery
@@ -1569,7 +1569,7 @@ class TelegramCommandBot:
                         n_needed = int(mg._scfg(
                             "recovery_green", "martingale_recovery_green", 3))
                         n_candles = int(mg._scfg(
-                            "recovery_candles", "martingale_recovery_candles", 6))
+                            "recovery_candles", "martingale_recovery_candles", 5))
                         status_extra = (
                             f" [PAUSED — recovery {favorable}/{total} "
                             f"favorable, need {n_needed}/{n_candles}]"
@@ -5314,7 +5314,7 @@ class MartingaleBot(threading.Thread):
                 interval = int(self._scfg(
                     "recovery_interval", "martingale_recovery_interval", 300))
                 n_candles = int(self._scfg(
-                    "recovery_candles", "martingale_recovery_candles", 6))
+                    "recovery_candles", "martingale_recovery_candles", 5))
                 cutoff = int(time.time()) - (n_candles * interval)
                 before = len(self._recovery_candles)
                 self._recovery_candles = [
@@ -5845,7 +5845,7 @@ class MartingaleBot(threading.Thread):
         interval = int(self._scfg(
             "recovery_interval", "martingale_recovery_interval", 300))
         n_candles = int(self._scfg(
-            "recovery_candles", "martingale_recovery_candles", 6))
+            "recovery_candles", "martingale_recovery_candles", 5))
         n_green = int(self._scfg(
             "recovery_green", "martingale_recovery_green", 3))
 
@@ -6136,7 +6136,7 @@ class MartingaleBot(threading.Thread):
             self._recovery_candle_ts = 0
             self._save_state()
             n_candles = int(self._scfg(
-                "recovery_candles", "martingale_recovery_candles", 6))
+                "recovery_candles", "martingale_recovery_candles", 5))
             n_green = int(self._scfg(
                 "recovery_green", "martingale_recovery_green", 3))
             msg = (
