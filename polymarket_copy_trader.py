@@ -4915,6 +4915,7 @@ class MartingaleBot(threading.Thread):
 
         # Streak-level trend confirmation (e.g. 2/3 candles green before betting at streak 7)
         self._streak_confirming = False        # True when waiting for trend confirmation
+        self._streak_confirmed = False         # One-shot flag: confirmation just passed, skip re-entry gate
         self._streak_confirm_candles = []      # list of {"open": px, "close": px, "green": bool}
         self._streak_confirm_candle_open = None
         self._streak_confirm_candle_ts = 0
@@ -6058,6 +6059,7 @@ class MartingaleBot(threading.Thread):
         direction = self._scfg("direction", "martingale_direction", self.direction)
 
         self._streak_confirming = False
+        self._streak_confirmed = True  # gate bypass for _try_place_bet in same cycle
         self._streak_confirm_candles = []
         self._streak_confirm_candle_open = None
         self._streak_confirm_candle_ts = 0
@@ -6137,7 +6139,7 @@ class MartingaleBot(threading.Thread):
             (confirm_at > 0 and self.consecutive_losses >= confirm_at)
             or self._post_recovery_mode
         )
-        if need_confirm and not self._streak_confirming:
+        if need_confirm and not self._streak_confirming and not getattr(self, '_streak_confirmed', False):
             self._streak_confirming = True
             self._streak_confirm_candles = []
             self._streak_confirm_candle_open = None
@@ -6169,6 +6171,9 @@ class MartingaleBot(threading.Thread):
 
         if self._streak_confirming:
             return False  # confirmation check happens in _cycle()
+
+        # Clear one-shot confirmation bypass flag
+        self._streak_confirmed = False
 
         # Safety: max bet
         max_bet = float(self._scfg("max_bet", "martingale_max_bet", 0))
