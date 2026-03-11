@@ -7891,6 +7891,11 @@ class MartingaleGUI:
         notebook.add(log_frame, text="Log")
         self._build_log_tab(log_frame)
 
+        # Tab 9: Help / User Guide
+        help_frame = ttk.Frame(notebook, padding=10)
+        notebook.add(help_frame, text="Help")
+        self._build_help_tab(help_frame)
+
         # Bottom control bar
         ctrl = ttk.Frame(self.root, padding=5)
         ctrl.pack(fill=tk.X)
@@ -8332,6 +8337,13 @@ class MartingaleGUI:
             return cached[0] if cached else None
 
     def _build_config_tab(self, parent):
+        # Helper to add a small gray description below a field
+        def _help(text, row, col=0, colspan=3):
+            ttk.Label(
+                parent, text=text, foreground="#666",
+                wraplength=580, font=("TkDefaultFont", 8),
+            ).grid(row=row, column=col, columnspan=colspan, sticky=tk.W, padx=(20, 0), pady=(0, 4))
+
         # RPC URL
         row = 0
         _lbl = ttk.Label(parent, text="HTTP RPC URL:")
@@ -8342,6 +8354,8 @@ class MartingaleGUI:
                 "Alchemy, Infura, or QuickNode. Example: https://polygon-rpc.com")
         ToolTip(_lbl, _tip)
         ToolTip(self.rpc_entry, _tip)
+        row += 1
+        _help("Polygon HTTP endpoint from Alchemy, Infura, or QuickNode (e.g. https://polygon-rpc.com)", row)
 
         row += 1
         _lbl = ttk.Label(parent, text="WebSocket RPC URL:")
@@ -8349,9 +8363,11 @@ class MartingaleGUI:
         self.ws_rpc_entry = ttk.Entry(parent, width=70)
         self.ws_rpc_entry.grid(row=row, column=1, columnspan=2, sticky=tk.EW, pady=3)
         _tip = ("Polygon WebSocket RPC endpoint for real-time event streaming. "
-                "Usually starts with wss://. Optional — the bot falls back to HTTP polling.")
+                "Usually starts with wss://. Optional \u2014 the bot falls back to HTTP polling.")
         ToolTip(_lbl, _tip)
         ToolTip(self.ws_rpc_entry, _tip)
+        row += 1
+        _help("Optional. WebSocket endpoint (wss://...) for faster updates. Falls back to HTTP if blank.", row)
 
         # Private key
         row += 1
@@ -8366,6 +8382,8 @@ class MartingaleGUI:
         ToolTip(_lbl, _tip)
         ToolTip(self.pk_entry, _tip)
         ToolTip(_pk_btn, "Toggle visibility of the private key field.")
+        row += 1
+        _help("Your Polygon wallet private key (starts with 0x). Export from MetaMask: Account Details \u2192 Export Private Key.", row)
 
         row += 1
         ttk.Label(
@@ -8384,11 +8402,12 @@ class MartingaleGUI:
         resume_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
         self.resume_threshold_entry = ttk.Entry(resume_frame, width=10)
         self.resume_threshold_entry.pack(side=tk.LEFT)
-        ttk.Label(resume_frame, text="(min balance to resume after pause)").pack(side=tk.LEFT, padx=5)
         _tip = ("Minimum USDC wallet balance required before the bot will resume "
                 "betting after an automatic pause. Prevents betting with too little capital.")
         ToolTip(_lbl, _tip)
         ToolTip(self.resume_threshold_entry, _tip)
+        row += 1
+        _help("Minimum USDC balance needed to resume betting after a pause. Prevents trading with insufficient funds.", row)
 
         # Kill switch — max loss
         row += 1
@@ -8398,11 +8417,12 @@ class MartingaleGUI:
         kill_frame.grid(row=row, column=1, sticky=tk.W, pady=3)
         self.max_loss_entry = ttk.Entry(kill_frame, width=10)
         self.max_loss_entry.pack(side=tk.LEFT)
-        ttk.Label(kill_frame, text="(stop bot after losing this much, 0=off)").pack(side=tk.LEFT, padx=5)
         _tip = ("Emergency stop: the bot shuts down entirely after cumulative losses "
                 "reach this USDC amount. Set to 0 to disable this safety limit.")
         ToolTip(_lbl, _tip)
         ToolTip(self.max_loss_entry, _tip)
+        row += 1
+        _help("Emergency stop \u2014 bot shuts down after losing this much total. Set 0 to disable.", row)
 
         # Use CLOB API checkbox
         row += 1
@@ -8413,6 +8433,8 @@ class MartingaleGUI:
         _cb.grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=3)
         ToolTip(_cb, "Use the Polymarket Central Limit Order Book API for placing trades. "
                 "This is faster and more reliable than on-chain transactions. Recommended.")
+        row += 1
+        _help("Routes orders through Polymarket's order book for faster, cheaper execution. Leave checked.", row)
 
         # Dry-run mode checkbox
         row += 1
@@ -8424,6 +8446,8 @@ class MartingaleGUI:
         _cb.grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=3)
         ToolTip(_cb, "Simulate everything without spending real money. The bot will log "
                 "what it would do but will not place any actual orders. Great for testing.")
+        row += 1
+        _help("Test mode \u2014 the bot logs what it would do but does NOT spend real money. Great for first-time setup.", row)
 
         # Auto-redeem settled positions checkbox
         row += 1
@@ -8436,6 +8460,8 @@ class MartingaleGUI:
         _cb.grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=3)
         ToolTip(_cb, "Automatically convert winning outcome tokens back to USDC after "
                 "a market settles. Keeps your balance liquid for the next bet.")
+        row += 1
+        _help("Automatically cashes out winning tokens to USDC after a market settles. Keeps your balance ready.", row)
 
         # --- CLOB API Credentials ---
         row += 1
@@ -8448,6 +8474,8 @@ class MartingaleGUI:
             parent, text="CLOB API Credentials (auto-derived from private key, or enter manually):",
             font=("TkDefaultFont", 9, "bold"),
         ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=3)
+        row += 1
+        _help("Most users can leave these blank \u2014 click 'Derive' or start the bot and they are generated automatically.", row)
 
         row += 1
         _lbl = ttk.Label(parent, text="API Key:")
@@ -8484,15 +8512,8 @@ class MartingaleGUI:
         self.derive_btn.grid(row=row, column=1, sticky=tk.W, pady=3)
         ToolTip(self.derive_btn, "Generate API Key, Secret, and Passphrase automatically "
                 "from your private key. This is the easiest way to set up credentials.")
-
         row += 1
-        ttk.Label(
-            parent,
-            text="Credentials are derived deterministically from your private key. "
-                 "They will be auto-generated on first bot start if left blank.",
-            foreground="gray",
-            wraplength=600,
-        ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
+        _help("Click to auto-generate all three fields from your private key. Or leave blank \u2014 they are created on first Start.", row)
 
         # --- Telegram Notifications ---
         row += 1
@@ -8502,9 +8523,11 @@ class MartingaleGUI:
 
         row += 1
         ttk.Label(
-            parent, text="Telegram Notifications (mobile alerts & commands):",
+            parent, text="Telegram Notifications (optional \u2014 get mobile alerts):",
             font=("TkDefaultFont", 9, "bold"),
         ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=3)
+        row += 1
+        _help("Optional. Receive push notifications on your phone for every bet, win, loss, and status change.", row)
 
         row += 1
         _lbl = ttk.Label(parent, text="Bot Token:")
@@ -8515,6 +8538,8 @@ class MartingaleGUI:
                 "for wins, losses, and bot status updates.")
         ToolTip(_lbl, _tip)
         ToolTip(self.tg_token_entry, _tip)
+        row += 1
+        _help("Get this from @BotFather on Telegram: send /newbot and follow the prompts.", row)
 
         row += 1
         _lbl = ttk.Label(parent, text="Chat ID:")
@@ -8533,15 +8558,8 @@ class MartingaleGUI:
         ToolTip(_lbl, _tip)
         ToolTip(self.tg_chat_entry, _tip)
         ToolTip(_test_btn, "Send a test message to verify your Telegram setup works.")
-
         row += 1
-        ttk.Label(
-            parent,
-            text="Create a bot via @BotFather on Telegram to get the token. "
-                 "Send /start to your bot, then use @userinfobot to find your Chat ID.",
-            foreground="gray",
-            wraplength=600,
-        ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
+        _help("Send /start to your bot, then message @userinfobot to get your numeric Chat ID. Click Test to verify.", row)
 
         parent.columnconfigure(1, weight=1)
 
@@ -8594,48 +8612,62 @@ class MartingaleGUI:
         edit_frame = ttk.LabelFrame(top_frame, text="Strategy Settings", padding=5)
         edit_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Build the fields in a grid — (label, key, width, tooltip)
+        # Build the fields in a grid — (label, key, width, tooltip, inline_help)
         fields = [
             ("Name:", "mart_e_name", 20,
              "A friendly label for this strategy (e.g. 'BTC 5m Up'). "
-             "Shown in the strategy list and logs."),
+             "Shown in the strategy list and logs.",
+             "Label shown in list & logs"),
             ("Slug Base:", "mart_e_slug", 25,
              "The Polymarket market slug prefix (e.g. 'btc-updown-5m'). "
-             "The bot appends the current window timestamp to form the full market slug."),
+             "The bot appends the current window timestamp to form the full market slug.",
+             "e.g. btc-updown-5m"),
             ("Window (seconds):", "mart_e_window", 10,
              "Duration of each betting window in seconds. For a 5-minute market use 300. "
-             "The bot aligns bets to these windows automatically."),
+             "The bot aligns bets to these windows automatically.",
+             "300 = 5 min, 60 = 1 min"),
             ("Direction (Up/Down):", "mart_e_direction", 10,
-             "Which side to bet on — 'Up' or 'Down'. "
-             "The bot always buys this outcome each window."),
+             "Which side to bet on \u2014 'Up' or 'Down'. "
+             "The bot always buys this outcome each window.",
+             "Up or Down"),
             ("Starting Bet (USDC):", "mart_e_start_bet", 10,
              "Your initial wager in USDC. After a loss the bet doubles; "
-             "after a win it resets back to this amount."),
+             "after a win it resets back to this amount.",
+             "First bet; doubles on loss"),
             ("Max Bet (0=no limit):", "mart_e_max_bet", 10,
              "Cap on the maximum single bet in USDC. If doubling would exceed "
-             "this amount, the bet is clamped here. Set 0 for no limit."),
+             "this amount, the bet is clamped here. Set 0 for no limit.",
+             "Safety cap on bet size"),
             ("Max Streak (0=no limit):", "mart_e_max_streak", 10,
              "Maximum number of consecutive losses before the strategy pauses. "
-             "Useful as a safety valve. Set 0 for unlimited."),
+             "Useful as a safety valve. Set 0 for unlimited.",
+             "Pause after N losses in a row"),
             ("Poll Interval (seconds):", "mart_e_poll", 10,
              "How often (in seconds) the bot checks market prices and places bets. "
-             "Lower = more responsive but more API calls."),
+             "Lower = more responsive but more API calls.",
+             "10 recommended"),
             ("Buy Price Min:", "mart_e_price_min", 10,
-             "Only buy when the token price is at or above this value (0.00–1.00). "
-             "Filters out unfavorable odds."),
+             "Only buy when the token price is at or above this value (0.00\u20131.00). "
+             "Filters out unfavorable odds.",
+             "0.00\u20131.00; skip cheap odds"),
             ("Buy Price Max:", "mart_e_price_max", 10,
-             "Only buy when the token price is at or below this value (0.00–1.00). "
-             "Prevents buying at extremely high prices."),
+             "Only buy when the token price is at or below this value (0.00\u20131.00). "
+             "Prevents buying at extremely high prices.",
+             "0.00\u20131.00; skip expensive odds"),
             ("Max Entry (sec into window):", "mart_e_max_entry", 10,
              "Latest point (in seconds after window start) at which a bet can be placed. "
-             "Prevents entering too late when the outcome is nearly decided."),
+             "Prevents entering too late when the outcome is nearly decided.",
+             "Don\u2019t bet after this many sec"),
         ]
         self._mart_entries = {}
-        for row, (label, attr, width, tip) in enumerate(fields):
+        for row, (label, attr, width, tip, inline) in enumerate(fields):
             lbl = ttk.Label(edit_frame, text=label)
             lbl.grid(row=row, column=0, sticky=tk.W, padx=2, pady=2)
             entry = ttk.Entry(edit_frame, width=width)
             entry.grid(row=row, column=1, sticky=tk.W, padx=2, pady=2)
+            ttk.Label(edit_frame, text=inline, foreground="#666",
+                      font=("TkDefaultFont", 8)).grid(
+                row=row, column=2, sticky=tk.W, padx=(6, 2), pady=2)
             self._mart_entries[attr] = entry
             ToolTip(lbl, tip)
             ToolTip(entry, tip)
@@ -9129,6 +9161,206 @@ class MartingaleGUI:
         )
         self.log_area.pack(fill=tk.BOTH, expand=True)
         ttk.Button(parent, text="Clear Log", command=self._clear_log).pack(anchor=tk.E, pady=3)
+
+    def _build_help_tab(self, parent):
+        """Built-in user guide displayed as a scrollable text widget."""
+        help_text = scrolledtext.ScrolledText(
+            parent, wrap=tk.WORD, font=("TkDefaultFont", 10), padx=10, pady=10,
+        )
+        help_text.pack(fill=tk.BOTH, expand=True)
+
+        # --- Insert formatted guide content ---
+        help_text.tag_configure("h1", font=("TkDefaultFont", 16, "bold"), spacing3=8)
+        help_text.tag_configure("h2", font=("TkDefaultFont", 13, "bold"), spacing1=14, spacing3=4)
+        help_text.tag_configure("h3", font=("TkDefaultFont", 11, "bold"), spacing1=10, spacing3=2)
+        help_text.tag_configure("body", font=("TkDefaultFont", 10), spacing1=2, lmargin1=10, lmargin2=10)
+        help_text.tag_configure("bullet", font=("TkDefaultFont", 10), lmargin1=24, lmargin2=36, spacing1=1)
+        help_text.tag_configure("field", font=("TkDefaultFont", 10, "bold"))
+        help_text.tag_configure("code", font=("Courier", 10), background="#f0f0f0")
+        help_text.tag_configure("warn", foreground="red", font=("TkDefaultFont", 10, "bold"))
+
+        def h1(t):
+            help_text.insert(tk.END, t + "\n", "h1")
+
+        def h2(t):
+            help_text.insert(tk.END, t + "\n", "h2")
+
+        def h3(t):
+            help_text.insert(tk.END, t + "\n", "h3")
+
+        def p(t):
+            help_text.insert(tk.END, t + "\n\n", "body")
+
+        def bullet(t):
+            help_text.insert(tk.END, "\u2022 " + t + "\n", "bullet")
+
+        def field_desc(name, desc):
+            help_text.insert(tk.END, name, "field")
+            help_text.insert(tk.END, " \u2014 " + desc + "\n", "bullet")
+
+        h1("Polymarket Martingale Bot \u2014 User Guide")
+        p(f"Version {VERSION}")
+
+        # ----- Quick Start -----
+        h2("Quick Start")
+        bullet("Install Python 3.8+ from python.org (check 'Add to PATH' on Windows)")
+        bullet("Clone or extract the bot folder to your Desktop")
+        bullet("Double-click install_and_run.bat (Windows) or run ./install_and_run.sh (Mac/Linux)")
+        bullet("Go to the Configuration tab and enter your Private Key and HTTP RPC URL")
+        bullet("Go to the Martingale tab, click Add, configure a strategy, enable Martingale Mode")
+        bullet("Click Start Bot at the bottom of the window")
+        help_text.insert(tk.END, "\n")
+
+        # ----- What Is Martingale? -----
+        h2("What Is Martingale Betting?")
+        p("The martingale strategy doubles your bet after every loss. When you win, "
+          "you recover all previous losses plus a profit equal to your starting bet.")
+        p("Example with a $5 starting bet:\n"
+          "  Round 1: Bet $5  \u2192 Loss  \u2192 Running P/L: -$5\n"
+          "  Round 2: Bet $10 \u2192 Loss  \u2192 Running P/L: -$15\n"
+          "  Round 3: Bet $20 \u2192 Win   \u2192 Running P/L: +$5")
+        p("After the win, the bet resets to $5 and the cycle starts again. "
+          "Use Max Bet and Max Streak limits to protect against long losing streaks.")
+
+        # ----- Dashboard Tab -----
+        h2("Dashboard Tab")
+        p("Your live overview of account status and open positions.")
+        field_desc("USDC Balance", "Current USDC balance on Polygon \u2014 your betting capital")
+        field_desc("MATIC Balance", "MATIC (POL) for gas fees \u2014 keep at least 1\u20132 MATIC")
+        field_desc("Open Positions", "Number of markets where you hold tokens")
+        field_desc("Floating P/L", "Unrealized profit/loss across all open positions")
+        field_desc("Session P/L", "Profit/loss since you last started the bot")
+        field_desc("Lifetime P/L", "Total accumulated profit/loss across all sessions")
+        field_desc("W/L", "Win/loss record (e.g. 12/5 = 12 wins, 5 losses)")
+        help_text.insert(tk.END, "\n")
+        p("The positions table shows Direction, Market, Shares, Avg Price, Current Price, "
+          "Cost Basis, Current Value, Floating P/L, P/L %, and Time Held for each position.")
+
+        # ----- Configuration Tab -----
+        h2("Configuration Tab")
+
+        h3("Connection")
+        field_desc("HTTP RPC URL",
+                   "Polygon HTTP endpoint \u2014 get a free one from Alchemy, Infura, or QuickNode")
+        field_desc("WebSocket RPC URL",
+                   "Optional WebSocket endpoint (wss://...) for faster updates")
+        help_text.insert(tk.END, "\n")
+
+        h3("Wallet")
+        field_desc("Private Key",
+                   "Your Polygon wallet private key (starts with 0x). "
+                   "Export from MetaMask: Account Details \u2192 Export Private Key")
+        help_text.insert(tk.END, "\n")
+
+        h3("Safety Limits")
+        field_desc("Resume Threshold (USDC)",
+                   "Minimum balance to resume betting after a pause")
+        field_desc("Max Loss Kill Switch (USDC)",
+                   "Bot shuts down after losing this much total. Set 0 to disable")
+        help_text.insert(tk.END, "\n")
+
+        h3("Mode Switches")
+        field_desc("Use Polymarket CLOB API",
+                   "Routes orders through Polymarket\u2019s order book. Faster & cheaper. Leave checked")
+        field_desc("Dry Run Mode",
+                   "Simulates everything without spending real money. Great for first-time testing")
+        field_desc("Auto-redeem settled positions",
+                   "Cashes out winning tokens to USDC automatically when markets settle")
+        help_text.insert(tk.END, "\n")
+
+        h3("CLOB API Credentials")
+        p("Leave blank \u2014 they are auto-generated from your private key on first start. "
+          "Or click 'Derive Credentials from Private Key' to generate them manually.")
+        field_desc("API Key / Secret / Passphrase",
+                   "Auto-derived from your private key. Only fill manually if you have custom credentials")
+        help_text.insert(tk.END, "\n")
+
+        h3("Telegram Notifications (Optional)")
+        field_desc("Bot Token",
+                   "From @BotFather on Telegram \u2014 send /newbot to create a bot")
+        field_desc("Chat ID",
+                   "Your numeric ID \u2014 message @userinfobot on Telegram to find it")
+        field_desc("Test button",
+                   "Sends a test message to verify your setup works")
+        help_text.insert(tk.END, "\n")
+
+        # ----- Martingale Tab -----
+        h2("Martingale Tab")
+        p("Configure one or more independent martingale betting strategies.")
+        field_desc("Enable Martingale Mode",
+                   "Master switch \u2014 must be checked for any bets to be placed")
+        help_text.insert(tk.END, "\n")
+
+        h3("Strategy List (Left Panel)")
+        p("Shows all your strategies. Use Add / Remove / Duplicate to manage them.")
+
+        h3("Strategy Settings (Right Panel)")
+        field_desc("Name", "Friendly label (e.g. 'BTC 5m Up')")
+        field_desc("Slug Base", "Market slug prefix (e.g. btc-updown-5m)")
+        field_desc("Window (seconds)", "Betting window duration \u2014 300 for 5-minute markets")
+        field_desc("Direction", "Up or Down \u2014 which outcome to buy each window")
+        field_desc("Starting Bet (USDC)", "Initial bet amount; doubles after each loss")
+        field_desc("Max Bet", "Maximum single bet cap in USDC (0 = no limit)")
+        field_desc("Max Streak", "Pause strategy after N consecutive losses (0 = unlimited)")
+        field_desc("Poll Interval", "Seconds between price checks (10 recommended)")
+        field_desc("Buy Price Min", "Only buy above this price (0.00\u20131.00)")
+        field_desc("Buy Price Max", "Only buy below this price (0.00\u20131.00)")
+        field_desc("Max Entry (sec)", "Don\u2019t enter a bet after this many seconds into the window")
+        help_text.insert(tk.END, "\n")
+        field_desc("Apply to Selected", "Saves your edits to the selected strategy")
+        field_desc("Reset All State", "Resets streaks and bet sizes to starting values (doesn\u2019t delete strategies)")
+        help_text.insert(tk.END, "\n")
+
+        # ----- Trade History Tab -----
+        h2("Trade History Tab")
+        p("Review all completed trades with columns: Closed At, Market, Shares, Entry, "
+          "Exit, P&L ($), Slippage ($), Result (WON/LOST), and Reason.")
+        field_desc("Export CSV", "Save full trade history to a spreadsheet file")
+        field_desc("Clear History", "Delete all saved trade history (cannot be undone)")
+        field_desc("Current Session Only", "Filter to show only this session\u2019s trades")
+        help_text.insert(tk.END, "\n")
+
+        # ----- Equity Tab -----
+        h2("Equity Tab")
+        p("Visual chart of your cumulative profit/loss over time. Green = profit, red = loss. "
+          "Hover over data points to see exact values. The zero line marks break-even.")
+        help_text.insert(tk.END, "\n")
+
+        # ----- Log Tab -----
+        h2("Log Tab")
+        p("Real-time scrolling log of all bot activity: market checks, bets, wins, losses, "
+          "errors, and status changes. Click Clear Log to erase the display.")
+
+        # ----- FAQ -----
+        h2("FAQ & Troubleshooting")
+
+        h3("\"Insufficient USDC balance\"")
+        p("Make sure your wallet has USDC on the Polygon network (not Ethereum mainnet).")
+
+        h3("\"API key derivation failed\"")
+        p("Check that your private key is correct and starts with 0x. "
+          "Click 'Derive Credentials from Private Key' to regenerate.")
+
+        h3("Bot is running but not placing bets")
+        bullet("Is Martingale Mode enabled?")
+        bullet("Do you have at least one strategy configured?")
+        bullet("Is the current price within your Buy Price Min/Max range?")
+        bullet("Is Dry Run Mode turned off?")
+        help_text.insert(tk.END, "\n")
+
+        h3("Running the bot 24/7")
+        p("Deploy to a cloud VPS and run: python polymarket_martingale.py --headless")
+
+        h3("Internet drops")
+        p("The bot retries connections automatically. Open positions settle on-chain "
+          "regardless of whether the bot is running.")
+
+        h3("Multiple strategies")
+        p("Yes \u2014 each strategy runs independently with its own bet size, streak counter, "
+          "and market slug. Add as many as you want.")
+
+        # Make read-only
+        help_text.configure(state="disabled")
 
     def _build_history_tab(self, parent):
         columns = (
