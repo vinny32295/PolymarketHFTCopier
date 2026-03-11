@@ -6194,8 +6194,10 @@ class MartingaleBot(threading.Thread):
         if self._streak_confirming:
             return False  # confirmation check happens in _cycle()
 
-        # Clear one-shot confirmation bypass flag
-        self._streak_confirmed = False
+        # NOTE: _streak_confirmed is cleared only after a bet is
+        # successfully placed (see below).  If we clear it here and
+        # the bet is skipped (e.g. low balance), the next cycle would
+        # restart the full confirmation candle process from scratch.
 
         # Safety: max bet
         max_bet = float(self._scfg("max_bet", "martingale_max_bet", 0))
@@ -6702,6 +6704,7 @@ class MartingaleBot(threading.Thread):
         if self.executor:
             self.executor._martingale_token_ids.add(token_id)
         self._last_window_ts = current_window_ts
+        self._streak_confirmed = False  # clear one-shot confirmation bypass
         self._skip_reason = None  # bet placed successfully
         self._skip_price = None
         self._skip_gap = None
