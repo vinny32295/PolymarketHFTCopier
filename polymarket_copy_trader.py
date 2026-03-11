@@ -12698,6 +12698,9 @@ class CopyTraderGUI:
             ("Buy Price Min:", "mart_e_price_min", 10),
             ("Buy Price Max:", "mart_e_price_max", 10),
             ("Max Entry (sec into window):", "mart_e_max_entry", 10),
+            ("Recovery Candles (total):", "mart_e_recovery_candles", 10),
+            ("Recovery Green (needed):", "mart_e_recovery_green", 10),
+            ("Recovery Interval (sec):", "mart_e_recovery_interval", 10),
         ]
         self._mart_entries = {}
         for row, (label, attr, width) in enumerate(fields):
@@ -12770,6 +12773,9 @@ class CopyTraderGUI:
             "mart_e_price_min": ("price_min", 0.40),
             "mart_e_price_max": ("price_max", 0.55),
             "mart_e_max_entry": ("max_entry_seconds", 60),
+            "mart_e_recovery_candles": ("recovery_candles", 5),
+            "mart_e_recovery_green": ("recovery_green", 3),
+            "mart_e_recovery_interval": ("recovery_interval", 300),
         }
         for attr, (key, default) in mapping.items():
             entry = self._mart_entries[attr]
@@ -12796,6 +12802,9 @@ class CopyTraderGUI:
             ("mart_e_price_min", "price_min", float),
             ("mart_e_price_max", "price_max", float),
             ("mart_e_max_entry", "max_entry_seconds", int),
+            ("mart_e_recovery_candles", "recovery_candles", int),
+            ("mart_e_recovery_green", "recovery_green", int),
+            ("mart_e_recovery_interval", "recovery_interval", int),
         ]:
             try:
                 s[key] = conv(self._mart_entries[attr].get().strip())
@@ -12824,6 +12833,9 @@ class CopyTraderGUI:
             "price_min": 0.40,
             "price_max": 0.55,
             "max_entry_seconds": 60,
+            "recovery_candles": 5,
+            "recovery_green": 3,
+            "recovery_interval": 300,
         })
         self._mart_refresh_listbox()
         # Select the new entry
