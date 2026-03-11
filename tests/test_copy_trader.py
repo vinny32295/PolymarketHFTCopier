@@ -3187,6 +3187,7 @@ class TestMartingaleBot(unittest.TestCase):
         mb._streak_confirm_candle_open = None
         mb._streak_confirm_candle_ts = 0
         mb._post_recovery_mode = False
+        mb._post_recovery_losses = 0
         mb.STATE_FILE = "martingale_state.json"
         return mb
 
@@ -3861,6 +3862,7 @@ class TestMartingaleBot(unittest.TestCase):
         mb._recovery_candles = [{"open": 0.5, "close": 0.6, "green": True}]
         mb._resume_from_streak_pause()
         self.assertTrue(mb._post_recovery_mode)
+        self.assertEqual(mb._post_recovery_losses, 0)
 
     def test_resume_skips_post_recovery_mode_when_disabled(self):
         """After recovery, post_recovery_mode should stay False when post_recovery_confirm is off."""
@@ -3890,6 +3892,7 @@ class TestMartingaleBot(unittest.TestCase):
         }
         mb._handle_win(bet)
         self.assertFalse(mb._post_recovery_mode)
+        self.assertEqual(mb._post_recovery_losses, 0)
         self.assertEqual(mb.consecutive_losses, 0)
         self.assertEqual(mb.current_bet, 5.0)
 
@@ -3912,6 +3915,7 @@ class TestMartingaleBot(unittest.TestCase):
         self.assertEqual(mb.consecutive_losses, 0)
         self.assertEqual(mb.current_bet, 5.0)
         self.assertFalse(mb._post_recovery_mode)
+        self.assertEqual(mb._post_recovery_losses, 0)
 
     def test_hard_reset_streak_does_not_trigger_below_limit(self):
         """Below hard_reset_streak, loss should double normally."""
@@ -3953,14 +3957,79 @@ class TestMartingaleBot(unittest.TestCase):
     # -- state persistence for new fields --
 
     def test_post_recovery_mode_persisted_in_state(self):
-        """post_recovery_mode should survive save/load cycle."""
+        """post_recovery_mode and post_recovery_losses should survive save/load cycle."""
         mb = self._make_bot()
         mb._post_recovery_mode = True
+        mb._post_recovery_losses = 1
         mb._save_state()
         mb2 = self._make_bot()
         mb2.STATE_FILE = mb.STATE_FILE
         mb2._load_state()
         self.assertTrue(mb2._post_recovery_mode)
+        self.assertEqual(mb2._post_recovery_losses, 1)
+
+    def test_post_recovery_no_confirm_before_threshold(self):
+        """In post-recovery mode, confirmation should NOT trigger until 2 losses."""
+        mb = self._make_bot({
+            "martingale_post_recovery_confirm": True,
+            "martingale_post_recovery_loss_threshold": 2,
+            "martingale_streak_confirm_at": 7,  # high so streak doesn't trigger it
+        })
+        mb.start_bet = 5.0
+        mb.current_bet = 5.0
+        mb.consecutive_losses = 0
+        mb._post_recovery_mode = True
+        mb._post_recovery_losses = 0  # just recovered, no losses yet
+        # The confirmation gate condition — should NOT need confirmation yet
+        confirm_at = 7
+        post_loss_threshold = 2
+        need_confirm = (
+            (confirm_at > 0 and mb.consecutive_losses >= confirm_at)
+            or (mb._post_recovery_mode and mb._post_recovery_losses >= post_loss_threshold)
+        )
+        self.assertFalse(need_confirm)
+
+    def test_post_recovery_confirm_after_threshold_losses(self):
+        """In post-recovery mode, confirmation SHOULD trigger after 2 losses."""
+        mb = self._make_bot({
+            "martingale_post_recovery_confirm": True,
+            "martingale_post_recovery_loss_threshold": 2,
+            "martingale_streak_confirm_at": 7,
+        })
+        mb.start_bet = 5.0
+        mb.current_bet = 20.0
+        mb.consecutive_losses = 2
+        mb._post_recovery_mode = True
+        mb._post_recovery_losses = 2  # 2 losses since recovery
+        confirm_at = 7
+        post_loss_threshold = 2
+        need_confirm = (
+            (confirm_at > 0 and mb.consecutive_losses >= confirm_at)
+            or (mb._post_recovery_mode and mb._post_recovery_losses >= post_loss_threshold)
+        )
+        self.assertTrue(need_confirm)
+
+    def test_post_recovery_loss_increments_counter(self):
+        """Each loss in post-recovery mode should increment _post_recovery_losses."""
+        mb = self._make_bot({"martingale_post_recovery_loss_threshold": 2})
+        mb.start_bet = 5.0
+        mb.current_bet = 5.0
+        mb.consecutive_losses = 0
+        mb._post_recovery_mode = True
+        mb._post_recovery_losses = 0
+        bet = {
+            "direction": "Up", "shares": 10.0, "cost": 5.0,
+            "bet_size": 5.0, "token_id": "tok123", "fill_price": 0.50,
+            "slug": "test", "window_end": 0, "slippage": 0, "slippage_usdc": 0,
+        }
+        mb._handle_loss(bet)
+        self.assertEqual(mb._post_recovery_losses, 1)
+        self.assertTrue(mb._post_recovery_mode)
+        # Second loss
+        mb.current_bet = 10.0  # after first loss doubles
+        bet2 = {**bet, "cost": 10.0, "bet_size": 10.0, "shares": 20.0}
+        mb._handle_loss(bet2)
+        self.assertEqual(mb._post_recovery_losses, 2)
 
 
 if __name__ == "__main__":

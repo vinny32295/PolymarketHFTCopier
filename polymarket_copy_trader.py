@@ -4928,6 +4928,7 @@ class MartingaleBot(threading.Thread):
         # Post-recovery confirmation mode — after recovery from streak pause,
         # require confirmation candles before EVERY bet until a win or hard reset.
         self._post_recovery_mode = False
+        self._post_recovery_losses = 0  # losses since recovery; confirmation kicks in after 2
 
         # Timing metrics
         self._bet_placed_at = None          # time.time() when bet was placed
@@ -5223,6 +5224,7 @@ class MartingaleBot(threading.Thread):
             "streak_confirming": self._streak_confirming,
             "streak_confirm_candles": self._streak_confirm_candles[-10:],
             "post_recovery_mode": self._post_recovery_mode,
+            "post_recovery_losses": self._post_recovery_losses,
         }
         try:
             tmp = self.STATE_FILE + ".tmp"
@@ -5276,6 +5278,7 @@ class MartingaleBot(threading.Thread):
             self._streak_confirming = bool(state.get("streak_confirming", False))
             self._streak_confirm_candles = state.get("streak_confirm_candles", [])
             self._post_recovery_mode = bool(state.get("post_recovery_mode", False))
+            self._post_recovery_losses = int(state.get("post_recovery_losses", 0))
 
             # On restart while confirming, reset candle sampling so we
             # start fresh with current market prices.
@@ -5391,6 +5394,7 @@ class MartingaleBot(threading.Thread):
         self._recovery_candle_open = None
         self._recovery_candle_ts = 0
         self._post_recovery_mode = False
+        self._post_recovery_losses = 0
         try:
             os.remove(self.STATE_FILE)
         except OSError:
@@ -5944,6 +5948,7 @@ class MartingaleBot(threading.Thread):
             post_confirm = post_confirm.lower() not in ("false", "0", "no")
         if post_confirm:
             self._post_recovery_mode = True
+            self._post_recovery_losses = 0  # first trade placed immediately; confirmation after 2 losses
 
         self._save_state()
 
@@ -5960,9 +5965,12 @@ class MartingaleBot(threading.Thread):
                 "streak_confirm_total", "martingale_streak_confirm_total", 3))
             n_green_c = int(self._scfg(
                 "streak_confirm_green", "martingale_streak_confirm_green", 2))
+            post_loss_threshold = int(self._scfg(
+                "post_recovery_loss_threshold", "martingale_post_recovery_loss_threshold", 2))
             confirm_note = (
-                f" [post-recovery: {n_green_c}/{n_total} confirmation "
-                f"required before each bet]"
+                f" [post-recovery: placing next trade immediately, "
+                f"{n_green_c}/{n_total} confirmation required after "
+                f"{post_loss_threshold} losses]"
             )
         msg = (
             f"MARTINGALE [{self.strategy_name}] RESUMED: recovery confirmed "
@@ -6154,12 +6162,14 @@ class MartingaleBot(threading.Thread):
 
         # Trend confirmation gate — triggered either by:
         # 1. Streak reaching streak_confirm_at (e.g. streak 7), OR
-        # 2. Post-recovery mode (every bet after recovery needs confirmation)
+        # 2. Post-recovery mode AFTER enough losses (default 2) since recovery
         confirm_at = int(self._scfg(
             "streak_confirm_at", "martingale_streak_confirm_at", 7))
+        post_loss_threshold = int(self._scfg(
+            "post_recovery_loss_threshold", "martingale_post_recovery_loss_threshold", 2))
         need_confirm = (
             (confirm_at > 0 and self.consecutive_losses >= confirm_at)
-            or self._post_recovery_mode
+            or (self._post_recovery_mode and self._post_recovery_losses >= post_loss_threshold)
         )
         if need_confirm and not self._streak_confirming and not getattr(self, '_streak_confirmed', False):
             self._streak_confirming = True
@@ -6800,6 +6810,7 @@ class MartingaleBot(threading.Thread):
         self._streak_confirm_candle_open = None
         self._streak_confirm_candle_ts = 0
         self._post_recovery_mode = False
+        self._post_recovery_losses = 0
         # Keep the token in _martingale_token_ids until the position is
         # actually redeemed/removed from _positions.  Removing it here
         # created a window where auto-exit could try to sell the resolved
@@ -6856,6 +6867,23 @@ class MartingaleBot(threading.Thread):
                 ((actual_cost - intended) / intended) * 100,
             )
 
+        # Track losses since recovery for post-recovery confirmation gating
+        if self._post_recovery_mode:
+            self._post_recovery_losses += 1
+            post_loss_threshold = int(self._scfg(
+                "post_recovery_loss_threshold", "martingale_post_recovery_loss_threshold", 2))
+            if self._post_recovery_losses >= post_loss_threshold:
+                n_total = int(self._scfg(
+                    "streak_confirm_total", "martingale_streak_confirm_total", 3))
+                n_green = int(self._scfg(
+                    "streak_confirm_green", "martingale_streak_confirm_green", 2))
+                self.logger.info(
+                    "MARTINGALE [%s] post-recovery: %d losses since recovery "
+                    "— %d/%d confirmation now required before next bet",
+                    self.strategy_name, self._post_recovery_losses,
+                    n_green, n_total,
+                )
+
         max_bet = float(self._scfg("max_bet", "martingale_max_bet", 0))
         if max_bet > 0 and self.current_bet > max_bet:
             self.current_bet = max_bet
@@ -6872,6 +6900,7 @@ class MartingaleBot(threading.Thread):
             self.consecutive_losses = 0
             self.current_bet = self.start_bet
             self._post_recovery_mode = False
+            self._post_recovery_losses = 0
             msg = (
                 f"MARTINGALE [{self.strategy_name}] HARD RESET: streak {old_streak} "
                 f"hit limit {hard_reset} — resetting to ${self.start_bet:.2f} "
