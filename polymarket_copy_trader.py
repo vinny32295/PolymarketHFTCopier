@@ -1559,11 +1559,9 @@ class TelegramCommandBot:
                 for mg in mgr.bots:
                     status_extra = ""
                     if mg._streak_paused:
-                        direction = mg._scfg("direction", "martingale_direction", mg.direction)
-                        favor_up = direction == "Up"
                         favorable = sum(
                             1 for c in mg._recovery_candles
-                            if c.get("green") == favor_up
+                            if c.get("green")
                         )
                         total = len(mg._recovery_candles)
                         n_needed = int(mg._scfg(
@@ -5333,11 +5331,9 @@ class MartingaleBot(threading.Thread):
                         n_candles - len(self._recovery_candles),
                     )
                     self._save_state()
-                direction = self._scfg("direction", "martingale_direction", self.direction)
-                favor_up = direction == "Up"
                 favorable = sum(
                     1 for c in self._recovery_candles
-                    if c["green"] == favor_up
+                    if c["green"]
                 )
                 self.logger.info(
                     "MARTINGALE [%s]: recovery status on restart: "
@@ -5873,7 +5869,7 @@ class MartingaleBot(threading.Thread):
                 candle = {
                     "open": self._recovery_candle_open,
                     "close": price,
-                    "green": price >= self._recovery_candle_open,
+                    "green": price > self._recovery_candle_open,
                     "ts": self._recovery_candle_ts,
                 }
                 self._recovery_candles.append(candle)
@@ -5881,15 +5877,15 @@ class MartingaleBot(threading.Thread):
                 self._recovery_candles = self._recovery_candles[-n_candles:]
                 self._save_state()
 
-                # "favorable" = green when betting Up, red when betting Down
-                favor_up = direction == "Up"
+                # "favorable" = green on our token (rising price = market
+                # favors our direction) regardless of Up/Down.  We always
+                # sample *our* token, so green = good for us.
                 favorable = sum(
-                    1 for c in self._recovery_candles
-                    if c["green"] == favor_up
+                    1 for c in self._recovery_candles if c["green"]
                 )
                 total = len(self._recovery_candles)
                 color = "GREEN" if candle["green"] else "RED"
-                favor_label = "favorable" if candle["green"] == favor_up else "unfavorable"
+                favor_label = "favorable" if candle["green"] else "unfavorable"
                 self.logger.info(
                     "MARTINGALE [%s] recovery candle: %s/%s (%.4f → %.4f) "
                     "— %d/%d favorable (%d needed from %d candles)",
@@ -5916,10 +5912,8 @@ class MartingaleBot(threading.Thread):
             mins = int(delta.total_seconds() // 60)
             paused_dur = f" (paused for {mins}m)"
 
-        direction = self._scfg("direction", "martingale_direction", self.direction)
-        favor_up = direction == "Up"
         favorable_count = sum(
-            1 for c in self._recovery_candles if c["green"] == favor_up
+            1 for c in self._recovery_candles if c["green"]
         )
         total = len(self._recovery_candles)
 
