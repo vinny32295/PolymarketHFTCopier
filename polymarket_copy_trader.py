@@ -5389,6 +5389,8 @@ class MartingaleBot(threading.Thread):
         self._recovery_candles = []
         self._recovery_candle_open = None
         self._recovery_candle_ts = 0
+        self._recovery_pause_window_ts = 0
+        self._recovery_last_logged_ts = 0
         self._post_recovery_mode = False
         self._post_recovery_losses = 0
         try:
@@ -5865,15 +5867,14 @@ class MartingaleBot(threading.Thread):
     # -- streak recovery (market resolution based) -----------------------------
 
     def _check_streak_recovery(self):
-        """Check resolved past windows to determine if market has recovered.
+        """Check windows that resolved AFTER the pause to see if market recovered.
 
         Called each cycle while ``_streak_paused`` is True.  Returns True
-        when the recovery condition is met (N out of M recent windows
-        resolved in our favor).
+        when the recovery condition is met (N out of M windows resolved
+        in our favor, counting only windows since we paused).
 
-        Instead of sampling noisy token ask prices, this checks how actual
-        5-minute windows resolved on Polymarket — the definitive answer
-        for whether BTC went up or down in each window.
+        Uses actual market resolution (Up/Down) — the definitive answer
+        for whether BTC went up or down in each 5-minute window.
         """
         n_candles = int(self._scfg(
             "recovery_candles", "martingale_recovery_candles", 5))
@@ -5886,41 +5887,57 @@ class MartingaleBot(threading.Thread):
         now = int(time.time())
         current_window_ts = now - (now % window)
 
-        # Look back at the last n_candles completed windows (before current)
+        # Determine the first window to check: the one AFTER we paused.
+        # _streak_paused_at is a datetime; convert to epoch and find next window.
+        pause_epoch = getattr(self, "_recovery_pause_window_ts", 0)
+        if not pause_epoch and self._streak_paused_at:
+            pause_time = int(self._streak_paused_at.timestamp())
+            # The window that was active when we paused (we lost this one)
+            paused_window = pause_time - (pause_time % window)
+            # First window to evaluate is the NEXT one after the pause
+            pause_epoch = paused_window + window
+            self._recovery_pause_window_ts = pause_epoch
+
+        if not pause_epoch:
+            return False
+
+        # Scan forward from the first post-pause window up to (but not
+        # including) the current in-progress window.
         resolved_results = []
-        for i in range(1, n_candles + 1):
-            past_ts = current_window_ts - (i * window)
-            result = self._check_window_resolution(past_ts)
+        check_ts = pause_epoch
+        while check_ts < current_window_ts:
+            result = self._check_window_resolution(check_ts)
             if result is not None:
-                resolved_results.append((past_ts, result))
+                resolved_results.append((check_ts, result))
+            check_ts += window
 
         if not resolved_results:
             return False
 
-        # Only check the most recent n_candles resolved windows
-        resolved_results.sort(key=lambda x: x[0], reverse=True)
-        resolved_results = resolved_results[:n_candles]
+        # Take the last n_candles results (most recent)
+        resolved_results = resolved_results[-n_candles:]
 
         favorable = sum(1 for _, r in resolved_results if r == direction)
         total = len(resolved_results)
 
         # Only log when we have a new window to report (avoid spam)
-        newest_ts = resolved_results[0][0] if resolved_results else 0
+        newest_ts = resolved_results[-1][0] if resolved_results else 0
         last_logged = getattr(self, "_recovery_last_logged_ts", 0)
         if newest_ts != last_logged:
             self._recovery_last_logged_ts = newest_ts
 
-            # Build candle summary string
+            # Build candle summary string (oldest → newest)
             candle_str = " ".join(
                 "UP" if r == "Up" else "DN"
                 for _, r in resolved_results
             )
-            favor_label = "favorable" if resolved_results[0][1] == direction else "unfavorable"
+            latest_result = resolved_results[-1][1]
+            favor_label = "favorable" if latest_result == direction else "unfavorable"
             self.logger.info(
                 "MARTINGALE [%s] recovery window: %s/%s (latest=%s) "
                 "— %d/%d favorable (%d needed from %d) [%s]",
                 self.strategy_name,
-                resolved_results[0][1], favor_label,
+                latest_result, favor_label,
                 time.strftime("%H:%M:%S", time.localtime(newest_ts)),
                 favorable, total, n_green, n_candles, candle_str,
             )
@@ -5949,7 +5966,8 @@ class MartingaleBot(threading.Thread):
             paused_dur = f" (paused for {mins}m)"
 
         favorable_count = sum(
-            1 for c in self._recovery_candles if c["green"]
+            1 for c in self._recovery_candles
+            if c.get("favorable", c.get("green"))
         )
         total = len(self._recovery_candles)
 
@@ -5958,6 +5976,8 @@ class MartingaleBot(threading.Thread):
         self._recovery_candles = []
         self._recovery_candle_open = None
         self._recovery_candle_ts = 0
+        self._recovery_pause_window_ts = 0
+        self._recovery_last_logged_ts = 0
 
         streak_reset = self._scfg("streak_reset", "martingale_streak_reset", True)
         # Normalize string/bool — config may come as "true"/"false" string
@@ -6020,11 +6040,11 @@ class MartingaleBot(threading.Thread):
     # -- streak-level trend confirmation ------------------------------------
 
     def _check_streak_confirmation(self):
-        """Sample candles to confirm the trend before placing a high-streak bet.
+        """Check windows resolved AFTER confirmation started to confirm trend.
 
         Called each cycle while ``_streak_confirming`` is True.  Returns True
-        when the confirmation condition is met (e.g. 2 out of 3 candles green),
-        meaning the bot should proceed to place the bet.
+        when the confirmation condition is met (e.g. 2 out of 3 windows
+        resolved in our favor, counting only windows since confirmation began).
 
         Uses actual market resolution data (not the Polymarket token ask)
         so that candle colors match the real chart.
@@ -6040,25 +6060,33 @@ class MartingaleBot(threading.Thread):
         now = int(time.time())
         current_window_ts = now - (now % window)
 
-        # Look back at the last n_total completed windows (before current)
+        # Determine the first window to check: the one AFTER confirmation started.
+        start_epoch = getattr(self, "_confirm_start_epoch", 0)
+        if not start_epoch:
+            return False
+        start_window = start_epoch - (start_epoch % window)
+        first_window = start_window + window
+
+        # Scan forward from the first post-confirmation window
         resolved_results = []
-        for i in range(1, n_total + 1):
-            past_ts = current_window_ts - (i * window)
-            result = self._check_window_resolution(past_ts)
+        check_ts = first_window
+        while check_ts < current_window_ts:
+            result = self._check_window_resolution(check_ts)
             if result is not None:
-                resolved_results.append((past_ts, result))
+                resolved_results.append((check_ts, result))
+            check_ts += window
 
         if not resolved_results:
             return False
 
-        resolved_results.sort(key=lambda x: x[0], reverse=True)
-        resolved_results = resolved_results[:n_total]
+        # Take the last n_total results (most recent)
+        resolved_results = resolved_results[-n_total:]
 
         favorable_count = sum(1 for _, r in resolved_results if r == direction)
         total = len(resolved_results)
 
         # Only log when we have a new window to report
-        newest_ts = resolved_results[0][0] if resolved_results else 0
+        newest_ts = resolved_results[-1][0] if resolved_results else 0
         last_logged = getattr(self, "_confirm_last_logged_ts", 0)
         if newest_ts != last_logged:
             self._confirm_last_logged_ts = newest_ts
@@ -6067,12 +6095,13 @@ class MartingaleBot(threading.Thread):
                 "UP" if r == "Up" else "DN"
                 for _, r in resolved_results
             )
-            favor_label = "IN FAVOR" if resolved_results[0][1] == direction else "AGAINST"
+            latest_result = resolved_results[-1][1]
+            favor_label = "IN FAVOR" if latest_result == direction else "AGAINST"
             self.logger.info(
                 "MARTINGALE [%s] streak confirmation window: %s %s "
                 "(latest=%s, dir=%s) — %d/%d favorable (%d needed from %d) [%s]",
                 self.strategy_name,
-                resolved_results[0][1], favor_label,
+                latest_result, favor_label,
                 time.strftime("%H:%M:%S", time.localtime(newest_ts)),
                 direction, favorable_count, total, n_green, n_total,
                 candle_str,
@@ -6104,6 +6133,8 @@ class MartingaleBot(threading.Thread):
         self._streak_confirm_candles = []
         self._streak_confirm_candle_open = None
         self._streak_confirm_candle_ts = 0
+        self._confirm_start_epoch = 0
+        self._confirm_last_logged_ts = 0
         self._save_state()
 
         msg = (
@@ -6187,6 +6218,7 @@ class MartingaleBot(threading.Thread):
             self._streak_confirm_candles = []
             self._streak_confirm_candle_open = None
             self._streak_confirm_candle_ts = 0
+            self._confirm_start_epoch = int(time.time())
             self._save_state()
             n_total = int(self._scfg(
                 "streak_confirm_total", "martingale_streak_confirm_total", 3))
