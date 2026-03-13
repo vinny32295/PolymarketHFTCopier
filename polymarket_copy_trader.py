@@ -1561,16 +1561,20 @@ class TelegramCommandBot:
                     if mg._streak_paused:
                         favorable = sum(
                             1 for c in mg._recovery_candles
-                            if c.get("green")
+                            if c.get("favorable", c.get("green"))
                         )
                         total = len(mg._recovery_candles)
                         n_needed = int(mg._scfg(
                             "recovery_green", "martingale_recovery_green", 3))
                         n_candles = int(mg._scfg(
                             "recovery_candles", "martingale_recovery_candles", 5))
+                        paused_mins = ""
+                        if mg._streak_paused_at:
+                            delta = datetime.now() - mg._streak_paused_at
+                            paused_mins = f", paused {int(delta.total_seconds() // 60)}m"
                         status_extra = (
                             f" [PAUSED — recovery {favorable}/{total} "
-                            f"favorable, need {n_needed}/{n_candles}]"
+                            f"favorable, need {n_needed}/{n_candles}{paused_mins}]"
                         )
                     lines.append(
                         f"  Martingale [{mg.strategy_name}]: "
@@ -5940,6 +5944,21 @@ class MartingaleBot(threading.Thread):
             check_ts += window
 
         if not resolved_results:
+            # Log periodic status so user can see we're waiting
+            now_mono = time.monotonic()
+            last_wait_log = getattr(self, "_recovery_wait_logged_at", 0)
+            if now_mono - last_wait_log >= 60:  # log at most once per minute
+                self._recovery_wait_logged_at = now_mono
+                next_check = pause_epoch
+                wait_secs = max(0, next_check + window - now)
+                self.logger.info(
+                    "MARTINGALE [%s] RECOVERY: waiting for first post-pause "
+                    "window to resolve — next window %s (~%ds away), "
+                    "need %d/%d favorable",
+                    self.strategy_name,
+                    time.strftime("%H:%M:%S", time.localtime(next_check)),
+                    wait_secs, n_green, n_candles,
+                )
             return False
 
         # Take the last n_candles results (most recent)
@@ -5948,7 +5967,15 @@ class MartingaleBot(threading.Thread):
         favorable = sum(1 for _, r in resolved_results if r == direction)
         total = len(resolved_results)
 
-        # Only log when we have a new window to report (avoid spam)
+        # Always update _recovery_candles so heartbeat has current data
+        self._recovery_candles = [
+            {"ts": ts, "green": r == "Up",
+             "favorable": r == direction,
+             "resolution": r}
+            for ts, r in resolved_results
+        ]
+
+        # Only log detail when we have a new window to report (avoid spam)
         newest_ts = resolved_results[-1][0] if resolved_results else 0
         last_logged = getattr(self, "_recovery_last_logged_ts", 0)
         if newest_ts != last_logged:
@@ -5962,21 +5989,13 @@ class MartingaleBot(threading.Thread):
             latest_result = resolved_results[-1][1]
             favor_label = "favorable" if latest_result == direction else "unfavorable"
             self.logger.info(
-                "MARTINGALE [%s] recovery window: %s/%s (latest=%s) "
+                "MARTINGALE [%s] RECOVERY: %s/%s (latest=%s) "
                 "— %d/%d favorable (%d needed from %d) [%s]",
                 self.strategy_name,
                 latest_result, favor_label,
                 time.strftime("%H:%M:%S", time.localtime(newest_ts)),
                 favorable, total, n_green, n_candles, candle_str,
             )
-
-            # Update _recovery_candles for state/heartbeat compatibility
-            self._recovery_candles = [
-                {"ts": ts, "green": r == "Up",
-                 "favorable": r == direction,
-                 "resolution": r}
-                for ts, r in resolved_results
-            ]
             self._save_state()
 
         # Check recovery condition
