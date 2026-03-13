@@ -5825,18 +5825,51 @@ class MartingaleBot(threading.Thread):
         except Exception as exc:
             self.logger.debug("MARTINGALE: prefetch failed: %s", exc)
 
+    # -- BTC price feed (for recovery candle accuracy) ------------------------
+
+    def _fetch_btc_price(self):
+        """Fetch the current BTC/USDT price from Binance.
+
+        Returns the price as a float, or None on failure.
+        Uses a simple cache to avoid hammering the API (5-second TTL).
+        """
+        now = time.time()
+        # Return cached value if fresh (within 5 seconds)
+        cached = getattr(self, "_btc_price_cache", None)
+        if cached and (now - cached[1]) < 5:
+            return cached[0]
+
+        try:
+            resp = requests.get(
+                "https://api.binance.com/api/v3/ticker/price",
+                params={"symbol": "BTCUSDT"},
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                price = float(resp.json()["price"])
+                self._btc_price_cache = (price, now)
+                return price
+        except Exception as exc:
+            self.logger.debug("MARTINGALE: Binance BTC price fetch failed: %s", exc)
+
+        # Fallback: return cached value even if stale
+        if cached:
+            return cached[0]
+        return None
+
     # -- streak recovery (candle sampling) ------------------------------------
 
     def _check_streak_recovery(self):
-        """Sample price to build candles and check if market has recovered.
+        """Sample BTC price to build candles and check if market has recovered.
 
         Called each cycle while ``_streak_paused`` is True.  Returns True
         when the recovery condition is met (N out of M candles are favorable),
         meaning the bot should resume trading.
 
-        A "candle" is simply the price at the start and end of each
-        *recovery_interval* period.  Green = close >= open.
-        "Favorable" = green when betting Up, red when betting Down.
+        Uses actual BTC price from Binance (not the Polymarket token ask)
+        so that candle colors match the real chart.  A candle is GREEN when
+        BTC price went up over the interval, RED when it went down.
+        "Favorable" = GREEN when betting Up, RED when betting Down.
         """
         interval = int(self._scfg(
             "recovery_interval", "martingale_recovery_interval", 300))
@@ -5845,20 +5878,12 @@ class MartingaleBot(threading.Thread):
         n_green = int(self._scfg(
             "recovery_green", "martingale_recovery_green", 3))
 
-        # Get a token_id to sample — use the current window's market
-        slug = self._generate_slug()
-        market = self._fetch_market(slug)
-        if not market:
-            return False  # can't sample yet
-
         direction = self._scfg("direction", "martingale_direction", self.direction)
-        token_id = (
-            market["up_token"] if direction == "Up"
-            else market["down_token"]
-        )
-        price, _ = self._get_best_ask(token_id)
-        if not price or price <= 0:
-            return False  # no asks — can't sample
+
+        # Use actual BTC price for candle coloring
+        price = self._fetch_btc_price()
+        if not price:
+            return False  # can't sample yet
 
         now = int(time.time())
 
@@ -5866,10 +5891,16 @@ class MartingaleBot(threading.Thread):
         if self._recovery_candle_ts == 0 or (now - self._recovery_candle_ts) >= interval:
             # Close the previous candle if one was open
             if self._recovery_candle_open is not None and self._recovery_candle_ts > 0:
+                is_green = price > self._recovery_candle_open
+                # "favorable" depends on bet direction:
+                # Up → green (BTC went up) is favorable
+                # Down → red (BTC went down) is favorable
+                is_favorable = is_green if direction == "Up" else not is_green
                 candle = {
                     "open": self._recovery_candle_open,
                     "close": price,
-                    "green": price > self._recovery_candle_open,
+                    "green": is_green,
+                    "favorable": is_favorable,
                     "ts": self._recovery_candle_ts,
                 }
                 self._recovery_candles.append(candle)
@@ -5877,17 +5908,14 @@ class MartingaleBot(threading.Thread):
                 self._recovery_candles = self._recovery_candles[-n_candles:]
                 self._save_state()
 
-                # "favorable" = green on our token (rising price = market
-                # favors our direction) regardless of Up/Down.  We always
-                # sample *our* token, so green = good for us.
                 favorable = sum(
-                    1 for c in self._recovery_candles if c["green"]
+                    1 for c in self._recovery_candles if c.get("favorable", c["green"])
                 )
                 total = len(self._recovery_candles)
-                color = "GREEN" if candle["green"] else "RED"
-                favor_label = "favorable" if candle["green"] else "unfavorable"
+                color = "GREEN" if is_green else "RED"
+                favor_label = "favorable" if is_favorable else "unfavorable"
                 self.logger.info(
-                    "MARTINGALE [%s] recovery candle: %s/%s (%.4f → %.4f) "
+                    "MARTINGALE [%s] recovery candle (BTC): %s/%s ($%.2f → $%.2f) "
                     "— %d/%d favorable (%d needed from %d candles)",
                     self.strategy_name, color, favor_label,
                     candle["open"], candle["close"],
@@ -5990,8 +6018,9 @@ class MartingaleBot(threading.Thread):
         when the confirmation condition is met (e.g. 2 out of 3 candles green),
         meaning the bot should proceed to place the bet.
 
-        Uses the same candle logic as recovery sampling but with its own
-        (typically shorter) window: confirm_total candles, confirm_green needed.
+        Uses actual BTC price from Binance (not the Polymarket token ask)
+        so that candle colors match the real chart.  Same approach as
+        recovery sampling but with its own (typically shorter) window.
         """
         interval = int(self._scfg(
             "recovery_interval", "martingale_recovery_interval", 300))
@@ -6000,23 +6029,14 @@ class MartingaleBot(threading.Thread):
         n_green = int(self._scfg(
             "streak_confirm_green", "martingale_streak_confirm_green", 2))
 
-        # Get a token_id to sample — use the current window's market
-        slug = self._generate_slug()
-        market = self._fetch_market(slug)
-        if not market:
-            return False
-
         direction = self._scfg("direction", "martingale_direction", self.direction)
-        token_id = (
-            market["up_token"] if direction == "Up"
-            else market["down_token"]
-        )
-        price, _ = self._get_best_ask(token_id)
-        if not price or price <= 0:
+
+        # Use actual BTC price for candle coloring
+        price = self._fetch_btc_price()
+        if not price:
             return False
 
-        # "In our direction" means green (close >= open) for Up,
-        # red (close < open) for Down.
+        # "In our direction" means green (BTC up) for Up, red (BTC down) for Down.
         betting_down = direction != "Up"
 
         now = int(time.time())
@@ -6045,8 +6065,8 @@ class MartingaleBot(threading.Thread):
                 color = "GREEN" if is_green else "RED"
                 favor_label = "IN FAVOR" if in_our_favor else "AGAINST"
                 self.logger.info(
-                    "MARTINGALE [%s] streak confirmation candle: %s %s "
-                    "(%.4f → %.4f, dir=%s) — %d/%d favorable (%d needed from %d)",
+                    "MARTINGALE [%s] streak confirmation candle (BTC): %s %s "
+                    "($%.2f → $%.2f, dir=%s) — %d/%d favorable (%d needed from %d)",
                     self.strategy_name, color, favor_label,
                     candle["open"], candle["close"], direction,
                     favorable_count, total, n_green, n_total,
