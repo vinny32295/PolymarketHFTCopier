@@ -5179,17 +5179,44 @@ class MartingaleBot(threading.Thread):
         if self._post_recovery_mode and not self._streak_paused:
             status += " [POST-RECOVERY]"
 
+        recovery_info = ""
+        recovery_event_data = {}
+        if self._streak_paused:
+            favorable = sum(
+                1 for c in self._recovery_candles
+                if c.get("favorable", c.get("green"))
+            )
+            total = len(self._recovery_candles)
+            n_needed = int(self._scfg(
+                "recovery_green", "martingale_recovery_green", 3))
+            n_candles = int(self._scfg(
+                "recovery_candles", "martingale_recovery_candles", 5))
+            paused_mins = ""
+            if self._streak_paused_at:
+                delta = datetime.now() - self._streak_paused_at
+                paused_mins = f", paused {int(delta.total_seconds() // 60)}m"
+            recovery_info = (
+                f" | recovery={favorable}/{total} favorable "
+                f"(need {n_needed}/{n_candles}){paused_mins}"
+            )
+            recovery_event_data = {
+                "recovery_favorable": favorable,
+                "recovery_total": total,
+                "recovery_needed_green": n_needed,
+                "recovery_needed_candles": n_candles,
+            }
+
         self.logger.info(
             "MARTINGALE [%s] HEARTBEAT: status=%s | W/L=%d/%d (%.1f%%) | "
             "P&L=$%.4f | bet=$%.2f | streak=%d | avg_resolution=%.1fs | "
             "windows_attempted=%d | missed=%d | "
-            "fok_errors=%d | fok_rejects=%d | phantom_fills=%d",
+            "fok_errors=%d | fok_rejects=%d | phantom_fills=%d%s",
             self.strategy_name, status, self._session_wins,
             self._session_losses, win_rate, self.session_pnl,
             self.current_bet, self.consecutive_losses, avg_res,
             self._windows_attempted, len(self._missed_windows),
             self._fok_network_errors, self._fok_rejections,
-            self._phantom_fills,
+            self._phantom_fills, recovery_info,
         )
 
         self._log_event("heartbeat",
@@ -5203,6 +5230,7 @@ class MartingaleBot(threading.Thread):
             fok_network_errors=self._fok_network_errors,
             fok_rejections=self._fok_rejections,
             phantom_fills=self._phantom_fills,
+            **recovery_event_data,
         )
 
     # -- persistence --------------------------------------------------------
