@@ -5942,7 +5942,7 @@ class MartingaleBot(threading.Thread):
             post_confirm = post_confirm.lower() not in ("false", "0", "no")
         if post_confirm:
             self._post_recovery_mode = True
-            self._post_recovery_losses = 0  # first trade placed immediately; confirmation after 2 losses
+            self._post_recovery_losses = 0
 
         self._save_state()
 
@@ -5959,12 +5959,9 @@ class MartingaleBot(threading.Thread):
                 "streak_confirm_total", "martingale_streak_confirm_total", 3))
             n_green_c = int(self._scfg(
                 "streak_confirm_green", "martingale_streak_confirm_green", 2))
-            post_loss_threshold = int(self._scfg(
-                "post_recovery_loss_threshold", "martingale_post_recovery_loss_threshold", 2))
             confirm_note = (
-                f" [post-recovery: placing next trade immediately, "
-                f"{n_green_c}/{n_total} confirmation required after "
-                f"{post_loss_threshold} losses]"
+                f" [post-recovery: requiring {n_green_c}/{n_total} "
+                f"candle confirmation before next trade]"
             )
         msg = (
             f"MARTINGALE [{self.strategy_name}] RESUMED: recovery confirmed "
@@ -6163,7 +6160,7 @@ class MartingaleBot(threading.Thread):
             "post_recovery_loss_threshold", "martingale_post_recovery_loss_threshold", 2))
         need_confirm = (
             (confirm_at > 0 and self.consecutive_losses >= confirm_at)
-            or (self._post_recovery_mode and self._post_recovery_losses >= post_loss_threshold)
+            or self._post_recovery_mode  # always require candle confirmation after recovery
         )
         if need_confirm and not self._streak_confirming and not getattr(self, '_streak_confirmed', False):
             self._streak_confirming = True
