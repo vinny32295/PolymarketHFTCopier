@@ -6529,18 +6529,93 @@ class MartingaleBot(threading.Thread):
                 network_errors_session=self._fok_network_errors,
                 reason=result.get("reason", ""),
             )
-            time.sleep(2)  # allow on-chain settlement
-            raw_balance = self._check_phantom_fill(
-                token_id, neg_risk=neg_risk,
-            )
+            # Retry on-chain balance checks with increasing delays.
+            # A single 2 s wait was insufficient in practice — on-chain
+            # settlement can take 5-10 s under load.
+            _phantom_delays = [2, 3, 5]
+            raw_delta = 0
+            raw_balance = _pre_order_balance
+            for _pd_i, _pd_wait in enumerate(_phantom_delays):
+                time.sleep(_pd_wait)
+                raw_balance = self._check_phantom_fill(
+                    token_id, neg_risk=neg_risk,
+                )
+                raw_delta = raw_balance - _pre_order_balance
+                if raw_delta > 0:
+                    self.logger.info(
+                        "MARTINGALE: phantom fill found on on-chain check %d/%d "
+                        "(after %ds total wait)",
+                        _pd_i + 1, len(_phantom_delays),
+                        sum(_phantom_delays[:_pd_i + 1]),
+                    )
+                    break
+                self.logger.debug(
+                    "MARTINGALE: phantom fill check %d/%d — no delta yet "
+                    "(post=%d, pre=%d)",
+                    _pd_i + 1, len(_phantom_delays),
+                    raw_balance, _pre_order_balance,
+                )
+
+            # Secondary signal: check CLOB trades API for a recent fill
+            # on this token, in case on-chain balance is still lagging.
+            if raw_delta <= 0 and self.executor:
+                try:
+                    _addr = self.executor.address
+                    _recent = self.clob_client.get_trades_for_address(_addr, limit=5)
+                    _now = time.time()
+                    for _rt in (_recent or []):
+                        _rt_asset = str(
+                            _rt.get("asset_id") or _rt.get("token_id") or ""
+                        )
+                        if _rt_asset != token_id:
+                            continue
+                        # Check if this trade happened in the last 30 s
+                        _rt_ts = _rt.get("match_time") or _rt.get("timestamp") or ""
+                        try:
+                            if isinstance(_rt_ts, (int, float)):
+                                _rt_epoch = float(_rt_ts)
+                            else:
+                                from datetime import timezone
+                                _rt_epoch = datetime.fromisoformat(
+                                    str(_rt_ts).replace("Z", "+00:00")
+                                ).timestamp()
+                        except Exception:
+                            _rt_epoch = 0
+                        if _now - _rt_epoch < 30:
+                            _rt_size = float(_rt.get("size") or 0)
+                            _rt_price = float(_rt.get("price") or ask_price)
+                            if _rt_size > 0:
+                                raw_delta = 1  # sentinel — use trade data
+                                raw_balance = _pre_order_balance + 1
+                                # Override shares/cost from the actual trade
+                                target_shares = _rt_size
+                                ask_price = _rt_price
+                                self.logger.warning(
+                                    "MARTINGALE: PHANTOM FILL via CLOB trades API — "
+                                    "%.1f shares @ $%.4f for token %s "
+                                    "(on-chain balance lagged)",
+                                    _rt_size, _rt_price, token_id[:16] + "...",
+                                )
+                                break
+                except Exception as _trades_exc:
+                    self.logger.debug(
+                        "MARTINGALE: CLOB trades check failed: %s", _trades_exc,
+                    )
+
             # Use the delta from the pre-order snapshot to exclude
             # pre-existing shares that were already in the wallet.
-            raw_delta = raw_balance - _pre_order_balance
+            _from_trades_api = (raw_delta == 1 and
+                                raw_balance == _pre_order_balance + 1)
             if raw_delta > 0:
-                actual_shares = float(
-                    Decimal(raw_delta) / Decimal("1000000")
-                )
-                actual_cost = round(actual_shares * ask_price, 6)
+                if _from_trades_api:
+                    # Shares/cost already set from the trades API data
+                    actual_shares = target_shares
+                    actual_cost = round(actual_shares * ask_price, 6)
+                else:
+                    actual_shares = float(
+                        Decimal(raw_delta) / Decimal("1000000")
+                    )
+                    actual_cost = round(actual_shares * ask_price, 6)
                 self._phantom_fills += 1
                 self.logger.warning(
                     "MARTINGALE: PHANTOM FILL DETECTED — %.1f new shares "
