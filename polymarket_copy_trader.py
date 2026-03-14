@@ -5869,6 +5869,7 @@ class MartingaleBot(threading.Thread):
 
         Falls back to pre-cached condition_ids when the Gamma ``/events``
         endpoint no longer returns data for resolved/past events.
+        Also tries the ``/markets`` endpoint with slug query as a fallback.
         """
         base = self._scfg("slug_base", "martingale_slug_base", "btc-updown-5m")
         slug = f"{base}-{window_ts}"
@@ -5881,29 +5882,50 @@ class MartingaleBot(threading.Thread):
         if not hasattr(self, "_window_resolution_cache"):
             self._window_resolution_cache = {}
 
-        # Try to get condition_id — first via slug lookup, then from pre-cache
+        # Try to get condition_id — first from pre-cache, then via API
         cid = None
-        market = self._fetch_market(slug)
-        if market:
-            cid = market.get("condition_id")
-            # Store in cid cache for future lookups
-            if cid:
-                if not hasattr(self, "_window_cid_cache"):
-                    self._window_cid_cache = {}
-                self._window_cid_cache[window_ts] = cid
+        cid_cache = getattr(self, "_window_cid_cache", {})
+        cid = cid_cache.get(window_ts)
 
-        # Fallback: use pre-cached condition_id if slug lookup returned nothing
-        # (Gamma API often stops returning event data after resolution)
+        # Only call _fetch_market if we don't have a cached cid AND
+        # the window hasn't already been marked as unfetchable.
+        # This avoids hammering the Gamma API with requests for past
+        # windows that will never return data (rate-limiting the API
+        # and preventing pre-cache from working for active windows).
+        fetch_failed = getattr(self, "_window_cid_fetch_failed", set())
+        if not cid and window_ts not in fetch_failed:
+            market = self._fetch_market(slug)
+            if market:
+                cid = market.get("condition_id")
+                if cid:
+                    if not hasattr(self, "_window_cid_cache"):
+                        self._window_cid_cache = {}
+                    self._window_cid_cache[window_ts] = cid
+            else:
+                # If this is a past window and slug lookup returned nothing,
+                # try the /markets endpoint with slug as a fallback.
+                now = int(time.time())
+                current_window_ts = now - (now % int(self._scfg(
+                    "window", "martingale_window", 300)))
+                if window_ts < current_window_ts:
+                    cid = self._fetch_cid_via_markets_slug(slug)
+                    if cid:
+                        if not hasattr(self, "_window_cid_cache"):
+                            self._window_cid_cache = {}
+                        self._window_cid_cache[window_ts] = cid
+                    else:
+                        # Mark as failed so we don't keep retrying
+                        if not hasattr(self, "_window_cid_fetch_failed"):
+                            self._window_cid_fetch_failed = set()
+                        self._window_cid_fetch_failed.add(window_ts)
+
         if not cid:
-            cid_cache = getattr(self, "_window_cid_cache", {})
-            cid = cid_cache.get(window_ts)
-            if not cid:
-                self.logger.debug(
-                    "MARTINGALE RECOVERY: no market data for window %s (%s) "
-                    "— slug lookup empty, no cached cid",
-                    time.strftime("%H:%M:%S", time.localtime(window_ts)), slug,
-                )
-                return None
+            self.logger.debug(
+                "MARTINGALE RECOVERY: no market data for window %s (%s) "
+                "— slug lookup empty, no cached cid",
+                time.strftime("%H:%M:%S", time.localtime(window_ts)), slug,
+            )
+            return None
 
         # Check resolution using "Up" as direction — if resolved and won,
         # the window resolved Up; if resolved and lost, it resolved Down.
@@ -5915,6 +5937,32 @@ class MartingaleBot(threading.Thread):
         # Cache the result (resolved windows never change)
         self._window_resolution_cache[window_ts] = result
         return result
+
+    def _fetch_cid_via_markets_slug(self, slug):
+        """Try to get condition_id from the Gamma /markets endpoint by slug.
+
+        The /events endpoint drops resolved events, but /markets may retain
+        them longer.  Returns condition_id string or None.
+        """
+        try:
+            url = f"{GAMMA_API_BASE}/markets"
+            data = self.clob_client._get_public(
+                url, params={"slug": slug},
+            )
+            market = None
+            if isinstance(data, list) and data:
+                market = data[0]
+            elif isinstance(data, dict):
+                market = data
+            if market:
+                cid = market.get("condition_id")
+                if cid:
+                    self.logger.info(
+                        "MARTINGALE RECOVERY: got cid via /markets for %s", slug)
+                    return cid
+        except Exception:
+            pass
+        return None
 
     # -- streak recovery (market resolution based) -----------------------------
 
@@ -5973,22 +6021,34 @@ class MartingaleBot(threading.Thread):
             while cache_ts <= cache_end:
                 if (cache_ts not in self._window_cid_cache
                         and cache_ts not in self._window_cid_fetch_failed):
+                    slug = f"{base}-{cache_ts}"
+                    cid = None
                     try:
-                        slug = f"{base}-{cache_ts}"
                         mkt = self._fetch_market(slug)
                         if mkt and mkt.get("condition_id"):
-                            self._window_cid_cache[cache_ts] = mkt["condition_id"]
-                            self.logger.info(
-                                "MARTINGALE RECOVERY: cached cid for window %s",
-                                time.strftime("%H:%M:%S", time.localtime(cache_ts)),
-                            )
-                        elif cache_ts < current_window_ts:
-                            # Past window — API no longer has it, don't retry
-                            self._window_cid_fetch_failed.add(cache_ts)
-                        # else: current/future window not available yet, retry next cycle
+                            cid = mkt["condition_id"]
                     except Exception:
-                        if cache_ts < current_window_ts:
-                            self._window_cid_fetch_failed.add(cache_ts)
+                        pass
+                    # Fallback: try /markets endpoint (retains data longer
+                    # than /events which drops resolved markets quickly).
+                    if not cid:
+                        cid = self._fetch_cid_via_markets_slug(slug)
+                    if cid:
+                        self._window_cid_cache[cache_ts] = cid
+                        self.logger.info(
+                            "MARTINGALE RECOVERY: cached cid for window %s",
+                            time.strftime("%H:%M:%S", time.localtime(cache_ts)),
+                        )
+                    elif cache_ts < current_window_ts:
+                        # Past window — API no longer has it, don't retry
+                        self._window_cid_fetch_failed.add(cache_ts)
+                        self.logger.debug(
+                            "MARTINGALE RECOVERY: could not get cid for past "
+                            "window %s (%s) — marked as unfetchable",
+                            time.strftime("%H:%M:%S", time.localtime(cache_ts)),
+                            slug,
+                        )
+                    # else: current/future window not available yet, retry next cycle
                 cache_ts += window
 
         # Scan forward from the first post-pause window up to (but not
@@ -6002,28 +6062,52 @@ class MartingaleBot(threading.Thread):
             check_ts += window
 
         if not resolved_results:
+            # Count how many windows we tried but couldn't resolve
+            n_checked = max(0, (current_window_ts - pause_epoch) // window)
+
             # Log periodic status so user can see we're waiting
             now_mono = time.monotonic()
             last_wait_log = getattr(self, "_recovery_wait_logged_at", 0)
             if now_mono - last_wait_log >= 60:  # log at most once per minute
                 self._recovery_wait_logged_at = now_mono
-                # Count how many windows we tried but couldn't resolve
-                n_checked = max(0, (current_window_ts - pause_epoch) // window)
                 n_cached = sum(
                     1 for ts in self._window_cid_cache
                     if pause_epoch <= ts < current_window_ts
                 ) if hasattr(self, "_window_cid_cache") else 0
+                n_failed = sum(
+                    1 for ts in self._window_cid_fetch_failed
+                    if pause_epoch <= ts < current_window_ts
+                ) if hasattr(self, "_window_cid_fetch_failed") else 0
                 next_check = pause_epoch
                 wait_secs = max(0, next_check + window - now)
                 self.logger.info(
-                    "MARTINGALE [%s] RECOVERY: waiting for first post-pause "
-                    "window to resolve — next window %s (~%ds away), "
-                    "need %d/%d favorable | checked %d windows, %d have cached cid",
+                    "MARTINGALE [%s] RECOVERY: waiting for post-pause "
+                    "windows to resolve — first window %s (~%ds away), "
+                    "need %d/%d favorable | checked %d windows, "
+                    "%d cached cid, %d unfetchable",
                     self.strategy_name,
                     time.strftime("%H:%M:%S", time.localtime(next_check)),
                     wait_secs, n_green, n_candles,
-                    n_checked, n_cached,
+                    n_checked, n_cached, n_failed,
                 )
+
+            # Safety valve: if we have checked enough windows and ALL
+            # of them are unfetchable (no cid from any source), resume
+            # trading rather than staying paused forever.  This handles
+            # the case where the Gamma API has changed or is rate-limiting.
+            if n_checked >= n_candles:
+                n_unfetchable = sum(
+                    1 for ts in getattr(self, "_window_cid_fetch_failed", set())
+                    if pause_epoch <= ts < current_window_ts
+                )
+                if n_unfetchable >= n_checked and n_unfetchable >= n_candles:
+                    self.logger.warning(
+                        "MARTINGALE [%s] RECOVERY: %d/%d windows unfetchable "
+                        "— API may be unavailable. Force-resuming to avoid "
+                        "infinite pause.",
+                        self.strategy_name, n_unfetchable, n_checked,
+                    )
+                    return True
             return False
 
         # Take the last n_candles results (most recent)
@@ -6310,9 +6394,12 @@ class MartingaleBot(threading.Thread):
                 except Exception:
                     pass
 
-            # Immediately pre-cache condition_ids for the next 2 windows so
-            # recovery can check them after they resolve (the Gamma /events
-            # API drops resolved events, so we must grab cids while active).
+            # Immediately pre-cache condition_ids for the next few windows
+            # so recovery can check them after they resolve (the Gamma
+            # /events API drops resolved events, so we must grab cids
+            # while active).  Also init the failed set.
+            if not hasattr(self, "_window_cid_fetch_failed"):
+                self._window_cid_fetch_failed = set()
             try:
                 base = self._scfg("slug_base", "martingale_slug_base", "btc-updown-5m")
                 w = int(self._scfg("window", "martingale_window", 300))
@@ -6320,19 +6407,32 @@ class MartingaleBot(threading.Thread):
                 cur_w = now_ts - (now_ts % w)
                 if not hasattr(self, "_window_cid_cache"):
                     self._window_cid_cache = {}
-                for offset_w in (w, 2 * w):  # next window + one after
+                for offset_w in (w, 2 * w, 3 * w):  # next 3 windows
                     target_ts = cur_w + offset_w
                     if target_ts not in self._window_cid_cache:
                         slug = f"{base}-{target_ts}"
+                        cid = None
                         mkt = self._fetch_market(slug)
                         if mkt and mkt.get("condition_id"):
-                            self._window_cid_cache[target_ts] = mkt["condition_id"]
+                            cid = mkt["condition_id"]
+                        if not cid:
+                            cid = self._fetch_cid_via_markets_slug(slug)
+                        if cid:
+                            self._window_cid_cache[target_ts] = cid
                             self.logger.info(
                                 "MARTINGALE RECOVERY: pre-cached cid at pause for %s",
                                 time.strftime("%H:%M:%S", time.localtime(target_ts)),
                             )
-            except Exception:
-                pass
+                        else:
+                            self.logger.info(
+                                "MARTINGALE RECOVERY: could not pre-cache cid "
+                                "at pause for %s (%s) — will retry in recovery loop",
+                                time.strftime("%H:%M:%S", time.localtime(target_ts)),
+                                slug,
+                            )
+            except Exception as exc:
+                self.logger.debug(
+                    "MARTINGALE RECOVERY: pre-cache at pause failed: %s", exc)
 
             return False
 
