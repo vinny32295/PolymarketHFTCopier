@@ -6091,23 +6091,6 @@ class MartingaleBot(threading.Thread):
                     n_checked, n_cached, n_failed,
                 )
 
-            # Safety valve: if we have checked enough windows and ALL
-            # of them are unfetchable (no cid from any source), resume
-            # trading rather than staying paused forever.  This handles
-            # the case where the Gamma API has changed or is rate-limiting.
-            if n_checked >= n_candles:
-                n_unfetchable = sum(
-                    1 for ts in getattr(self, "_window_cid_fetch_failed", set())
-                    if pause_epoch <= ts < current_window_ts
-                )
-                if n_unfetchable >= n_checked and n_unfetchable >= n_candles:
-                    self.logger.warning(
-                        "MARTINGALE [%s] RECOVERY: %d/%d windows unfetchable "
-                        "— API may be unavailable. Force-resuming to avoid "
-                        "infinite pause.",
-                        self.strategy_name, n_unfetchable, n_checked,
-                    )
-                    return True
             return False
 
         # Take the last n_candles results (most recent)
