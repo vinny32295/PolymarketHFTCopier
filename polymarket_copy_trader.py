@@ -11327,6 +11327,42 @@ class CopyTraderBot:
                                     "Config hot-reload: %s changed %s → %s",
                                     k, old, disk_cfg[k],
                                 )
+                        # --- Hot-reload martingale strategy parameters ---
+                        if (hasattr(self, "_martingale_mgr")
+                                and self._martingale_mgr is not None):
+                            disk_strategies = disk_cfg.get("martingale_strategies") or []
+                            if isinstance(disk_strategies, list) and disk_strategies:
+                                _HOT_KEYS = {
+                                    "max_streak", "start_bet", "max_bet",
+                                    "price_min", "price_max",
+                                    "max_entry_seconds", "direction",
+                                    "recovery_candles", "recovery_green",
+                                    "recovery_interval",
+                                    "price_max_streak",
+                                    "hard_reset_streak", "streak_reset",
+                                }
+                                for bot in self._martingale_mgr.bots:
+                                    # Match disk strategy to bot by name
+                                    disk_strat = None
+                                    for ds in disk_strategies:
+                                        if ds.get("name") == bot.strategy_name:
+                                            disk_strat = ds
+                                            break
+                                    if disk_strat is None:
+                                        continue
+                                    for hk in _HOT_KEYS:
+                                        if hk not in disk_strat:
+                                            continue
+                                        old_val = bot.strategy.get(hk)
+                                        new_val = disk_strat[hk]
+                                        if old_val != new_val:
+                                            bot.strategy[hk] = new_val
+                                            self.logger.info(
+                                                "Config hot-reload [%s]: %s "
+                                                "changed %s → %s",
+                                                bot.strategy_name, hk,
+                                                old_val, new_val,
+                                            )
                     except Exception:
                         pass  # config.json may not exist or be corrupt
 
