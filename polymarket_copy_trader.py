@@ -5867,10 +5867,10 @@ class MartingaleBot(threading.Thread):
         Returns ``"Up"`` if Up won, ``"Down"`` if Down won, or ``None``
         if the window hasn't resolved yet or we can't determine the result.
 
-        Uses the same orderbook/LTP approach as normal bet resolution
-        (``_check_resolution_orderbook``) — checks the Up token's ask price
-        and last-trade-price to determine the outcome near-instantly after
-        window close, with no dependency on the Gamma API for resolution.
+        Resolution order (same as normal bet resolution):
+        1. Orderbook ask prices / last-trade-prices (near-instant)
+        2. Gamma API ``_check_resolution`` fallback (handles empty books
+           after large moves where both sides' orderbooks drain)
         """
         # Check resolution cache first (already resolved)
         cache = getattr(self, "_window_resolution_cache", {})
@@ -5890,70 +5890,82 @@ class MartingaleBot(threading.Thread):
         up_token = tokens["up_token"]
         down_token = tokens["down_token"]
 
-        # Check Up token orderbook/LTP — same logic as
-        # _check_resolution_orderbook but keyed to Up/Down not win/loss.
-        try:
-            # 1. Up token ask price
-            ask_price, _ = self._get_best_ask(up_token)
-            if ask_price is not None:
-                if ask_price >= 0.95:
-                    result = "Up"
-                elif ask_price <= 0.05:
-                    result = "Down"
-                else:
-                    ask_price = None  # inconclusive, try next signal
+        # --- Orderbook / LTP checks (fastest) ---
+        result = self._resolve_direction_from_orderbook(up_token, down_token)
 
-            # 2. Up token last-trade-price
-            if ask_price is None:
-                up_ltp = self.clob_client.get_last_trade_price(up_token)
-                if up_ltp is not None:
-                    if up_ltp >= 0.95:
-                        result = "Up"
-                    elif up_ltp <= 0.05:
-                        result = "Down"
-                    else:
-                        up_ltp = None
+        # --- Gamma API fallback (handles empty books after large moves) ---
+        if result is None:
+            cid = tokens.get("condition_id")
+            if cid:
+                try:
+                    resolved, up_won = self._check_resolution(cid, "Up")
+                    if resolved:
+                        result = "Up" if up_won else "Down"
+                except Exception:
+                    pass
 
-                # 3. Down token last-trade-price
-                if up_ltp is None:
-                    down_ltp = self.clob_client.get_last_trade_price(down_token)
-                    if down_ltp is not None:
-                        if down_ltp >= 0.95:
-                            result = "Down"
-                        elif down_ltp <= 0.05:
-                            result = "Up"
-                        else:
-                            down_ltp = None
-
-                    # 4. Down token ask price
-                    if down_ltp is None:
-                        down_ask, _ = self._get_best_ask(down_token)
-                        if down_ask is not None:
-                            if down_ask >= 0.95:
-                                result = "Down"
-                            elif down_ask <= 0.05:
-                                result = "Up"
-                            else:
-                                return None  # all signals inconclusive
-                        else:
-                            return None
-        except Exception:
+        if result is None:
             return None
 
         # Cache the result (resolved windows never change)
         self._window_resolution_cache[window_ts] = result
         self.logger.info(
-            "MARTINGALE RECOVERY: window %s resolved %s (orderbook)",
+            "MARTINGALE RECOVERY: window %s resolved %s",
             time.strftime("%H:%M:%S", time.localtime(window_ts)), result,
         )
         return result
+
+    def _resolve_direction_from_orderbook(self, up_token, down_token):
+        """Determine Up/Down from orderbook + LTP signals.
+
+        Returns ``"Up"``, ``"Down"``, or ``None`` if inconclusive.
+        Checks Up token first (ask, LTP), then Down token (LTP, ask).
+        """
+        try:
+            # 1. Up token ask price
+            ask_price, _ = self._get_best_ask(up_token)
+            if ask_price is not None:
+                if ask_price >= 0.95:
+                    return "Up"
+                if ask_price <= 0.05:
+                    return "Down"
+
+            # 2. Up token last-trade-price
+            up_ltp = self.clob_client.get_last_trade_price(up_token)
+            if up_ltp is not None:
+                if up_ltp >= 0.95:
+                    return "Up"
+                if up_ltp <= 0.05:
+                    return "Down"
+
+            # 3. Down token last-trade-price
+            down_ltp = self.clob_client.get_last_trade_price(down_token)
+            if down_ltp is not None:
+                if down_ltp >= 0.95:
+                    return "Down"
+                if down_ltp <= 0.05:
+                    return "Up"
+
+            # 4. Down token ask price
+            down_ask, _ = self._get_best_ask(down_token)
+            if down_ask is not None:
+                if down_ask >= 0.95:
+                    return "Down"
+                if down_ask <= 0.05:
+                    return "Up"
+
+        except Exception:
+            pass
+        return None  # all signals inconclusive or unavailable
 
     def _observe_window_tokens(self, window_ts):
         """Fetch and cache the Up/Down token IDs for a window.
 
         Called during recovery/confirmation to grab each window's market
         data while it's still active, so we can check orderbook resolution
-        after the window closes.  Throttles to avoid API spam.
+        after the window closes.  Also stores the condition_id as a
+        fallback for Gamma API resolution when orderbooks are empty
+        (e.g. after large moves that drain both sides' books).
         """
         token_cache = getattr(self, "_window_token_cache", {})
         if window_ts in token_cache:
@@ -5971,6 +5983,7 @@ class MartingaleBot(threading.Thread):
                 self._window_token_cache[window_ts] = {
                     "up_token": market["up_token"],
                     "down_token": market["down_token"],
+                    "condition_id": market.get("condition_id"),
                 }
                 self.logger.info(
                     "MARTINGALE RECOVERY: cached tokens for window %s",
