@@ -5866,22 +5866,44 @@ class MartingaleBot(threading.Thread):
 
         Returns ``"Up"`` if Up won, ``"Down"`` if Down won, or ``None``
         if the window hasn't resolved yet.  Uses Gamma API market data.
+
+        Falls back to pre-cached condition_ids when the Gamma ``/events``
+        endpoint no longer returns data for resolved/past events.
         """
         base = self._scfg("slug_base", "martingale_slug_base", "btc-updown-5m")
         slug = f"{base}-{window_ts}"
 
-        # Check cache first
+        # Check resolution cache first (already resolved)
         cache = getattr(self, "_window_resolution_cache", {})
         if window_ts in cache:
             return cache[window_ts]
 
-        market = self._fetch_market(slug)
-        if not market:
-            return None
+        if not hasattr(self, "_window_resolution_cache"):
+            self._window_resolution_cache = {}
 
-        cid = market.get("condition_id")
+        # Try to get condition_id — first via slug lookup, then from pre-cache
+        cid = None
+        market = self._fetch_market(slug)
+        if market:
+            cid = market.get("condition_id")
+            # Store in cid cache for future lookups
+            if cid:
+                if not hasattr(self, "_window_cid_cache"):
+                    self._window_cid_cache = {}
+                self._window_cid_cache[window_ts] = cid
+
+        # Fallback: use pre-cached condition_id if slug lookup returned nothing
+        # (Gamma API often stops returning event data after resolution)
         if not cid:
-            return None
+            cid_cache = getattr(self, "_window_cid_cache", {})
+            cid = cid_cache.get(window_ts)
+            if not cid:
+                self.logger.debug(
+                    "MARTINGALE RECOVERY: no market data for window %s (%s) "
+                    "— slug lookup empty, no cached cid",
+                    time.strftime("%H:%M:%S", time.localtime(window_ts)), slug,
+                )
+                return None
 
         # Check resolution using "Up" as direction — if resolved and won,
         # the window resolved Up; if resolved and lost, it resolved Down.
@@ -5891,8 +5913,6 @@ class MartingaleBot(threading.Thread):
 
         result = "Up" if up_won else "Down"
         # Cache the result (resolved windows never change)
-        if not hasattr(self, "_window_resolution_cache"):
-            self._window_resolution_cache = {}
         self._window_resolution_cache[window_ts] = result
         return result
 
@@ -5933,6 +5953,39 @@ class MartingaleBot(threading.Thread):
         if not pause_epoch:
             return False
 
+        # Pre-cache the CURRENT in-progress window's condition_id so we can
+        # check its resolution in a future cycle (after it closes).  The Gamma
+        # API only returns event data while the window is still active, so we
+        # must grab it now before it disappears.
+        base = self._scfg("slug_base", "martingale_slug_base", "btc-updown-5m")
+        cid_cache = getattr(self, "_window_cid_cache", {})
+        if not hasattr(self, "_window_cid_cache"):
+            self._window_cid_cache = {}
+            cid_cache = self._window_cid_cache
+        if current_window_ts not in cid_cache:
+            current_slug = f"{base}-{current_window_ts}"
+            try:
+                cur_market = self._fetch_market(current_slug)
+                if cur_market and cur_market.get("condition_id"):
+                    self._window_cid_cache[current_window_ts] = cur_market["condition_id"]
+                    self.logger.debug(
+                        "MARTINGALE RECOVERY: pre-cached cid for window %s (%s)",
+                        time.strftime("%H:%M:%S", time.localtime(current_window_ts)),
+                        current_slug,
+                    )
+            except Exception:
+                pass
+        # Also try to pre-cache the NEXT window (one ahead of current)
+        next_window_ts = current_window_ts + window
+        if next_window_ts not in self._window_cid_cache:
+            next_slug = f"{base}-{next_window_ts}"
+            try:
+                nxt_market = self._fetch_market(next_slug)
+                if nxt_market and nxt_market.get("condition_id"):
+                    self._window_cid_cache[next_window_ts] = nxt_market["condition_id"]
+            except Exception:
+                pass
+
         # Scan forward from the first post-pause window up to (but not
         # including) the current in-progress window.
         resolved_results = []
@@ -5949,15 +6002,22 @@ class MartingaleBot(threading.Thread):
             last_wait_log = getattr(self, "_recovery_wait_logged_at", 0)
             if now_mono - last_wait_log >= 60:  # log at most once per minute
                 self._recovery_wait_logged_at = now_mono
+                # Count how many windows we tried but couldn't resolve
+                n_checked = max(0, (current_window_ts - pause_epoch) // window)
+                n_cached = sum(
+                    1 for ts in self._window_cid_cache
+                    if pause_epoch <= ts < current_window_ts
+                ) if hasattr(self, "_window_cid_cache") else 0
                 next_check = pause_epoch
                 wait_secs = max(0, next_check + window - now)
                 self.logger.info(
                     "MARTINGALE [%s] RECOVERY: waiting for first post-pause "
                     "window to resolve — next window %s (~%ds away), "
-                    "need %d/%d favorable",
+                    "need %d/%d favorable | checked %d windows, %d have cached cid",
                     self.strategy_name,
                     time.strftime("%H:%M:%S", time.localtime(next_check)),
                     wait_secs, n_green, n_candles,
+                    n_checked, n_cached,
                 )
             return False
 
