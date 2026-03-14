@@ -11066,50 +11066,99 @@ class CopyTraderBot:
 
         # --- Display active configuration at startup ---
         watched = self.cfg.get("watched_addresses", [])
-        self.logger.info("=" * 60)
-        self.logger.info("COPY TRADER CONFIGURATION")
-        self.logger.info("=" * 60)
-        self.logger.info("  Watched addresses:      %d", len(watched))
-        for i, addr in enumerate(watched):
-            self.logger.info("    [%d] %s", i + 1, addr)
-        self.logger.info("  Copy percentage:        %s%%",
-                         self.cfg.get("copy_percentage", 50))
-        self.logger.info("  Max trade size:         $%s",
-                         self.cfg.get("max_trade_usdc", 100))
-        self.logger.info("  Slippage tolerance:     %s bps",
-                         self.cfg.get("slippage_tolerance_bps", 0))
-        self.logger.info("  Poll interval:          %ss",
-                         self.cfg.get("poll_interval_seconds", 2))
-        self.logger.info("  Order TTL:              %ss",
-                         self.cfg.get("order_ttl_seconds", 10))
-        self.logger.info("  Max price deviation:    %s%%",
-                         self.cfg.get("max_price_deviation_pct", 2))
-        self.logger.info("  Trade max age:          %ss",
-                         self.cfg.get("trade_max_age_seconds", 30))
-        self.logger.info("  Resume threshold:       $%s",
-                         self.cfg.get("resume_threshold_usdc", 5))
-        self.logger.info("  Dry run:                %s",
-                         self.cfg.get("dry_run", False))
-        self.logger.info("  Auto redeem settled:    %s",
-                         self.cfg.get("auto_redeem_settled", True))
-        ws_status = "disabled"
-        if self.cfg.get("ws_rpc_url"):
-            ws_status = "enabled" if HAS_WS_CLIENT else "no websocket-client"
-        self.logger.info("  WebSocket detection:    %s", ws_status)
-        arb_status = "disabled"
-        if self.cfg.get("arb_enabled"):
-            dynamic_slug = self.cfg.get("arb_dynamic_slug", "").strip()
-            if dynamic_slug:
-                arb_status = (
-                    f"enabled (dynamic '{dynamic_slug}' every "
-                    f"{self.cfg.get('arb_dynamic_window', 300)}s, "
-                    f"min edge {self.cfg.get('arb_min_edge_pct', 1.0)}%)"
-                )
-            else:
-                n_arb = len(self.cfg.get("arb_condition_ids", []))
-                arb_status = f"enabled ({n_arb} market(s), min edge {self.cfg.get('arb_min_edge_pct', 1.0)}%)"
-        self.logger.info("  Arbitrage mode:         %s", arb_status)
-        self.logger.info("=" * 60)
+        if self.cfg.get("martingale_enabled"):
+            strategies = self.cfg.get("martingale_strategies") or []
+            if not isinstance(strategies, list) or not strategies:
+                strategies = [{
+                    "name": self.cfg.get("martingale_slug_base", "btc-updown-5m"),
+                    "slug_base": self.cfg.get("martingale_slug_base", "btc-updown-5m"),
+                    "window": self.cfg.get("martingale_window", 300),
+                    "direction": self.cfg.get("martingale_direction", "Up"),
+                    "start_bet": self.cfg.get("martingale_start_bet", 5.0),
+                    "max_bet": self.cfg.get("martingale_max_bet", 0),
+                    "max_streak": self.cfg.get("martingale_max_streak", 0),
+                    "price_min": self.cfg.get("martingale_price_min", 0.40),
+                    "price_max": self.cfg.get("martingale_price_max", 0.55),
+                    "max_entry_seconds": self.cfg.get("martingale_max_entry_seconds", 60),
+                    "recovery_candles": self.cfg.get("martingale_recovery_candles", 5),
+                    "recovery_green": self.cfg.get("martingale_recovery_green", 3),
+                    "hard_reset_streak": self.cfg.get("martingale_hard_reset_streak", 0),
+                }]
+            self.logger.info("=" * 60)
+            self.logger.info("MARTINGALE CONFIGURATION — %d strategy(ies)", len(strategies))
+            self.logger.info("=" * 60)
+            for i, s in enumerate(strategies):
+                self.logger.info("  [%d] %s", i + 1, s.get("name", "unnamed"))
+                self.logger.info("      Slug:               %s", s.get("slug_base", "?"))
+                self.logger.info("      Window:             %ds", s.get("window", 300))
+                self.logger.info("      Direction:          %s", s.get("direction", "Up"))
+                self.logger.info("      Start bet:          $%s", s.get("start_bet", 5.0))
+                max_bet = s.get("max_bet", 0)
+                self.logger.info("      Max bet:            %s",
+                                 f"${max_bet}" if max_bet else "no limit")
+                max_str = s.get("max_streak", 0)
+                self.logger.info("      Max streak (losses):%s",
+                                 f" {max_str}" if max_str else " no limit")
+                self.logger.info("      Price range:        $%.2f – $%.2f",
+                                 s.get("price_min", 0.40), s.get("price_max", 0.55))
+                self.logger.info("      Max entry:          %ds into window",
+                                 s.get("max_entry_seconds", 60))
+                self.logger.info("      Recovery:           %d/%d favorable candles",
+                                 s.get("recovery_green", 3),
+                                 s.get("recovery_candles", 5))
+                hard_rst = s.get("hard_reset_streak", 0)
+                if hard_rst:
+                    self.logger.info("      Hard reset at:      streak %d", hard_rst)
+            self.logger.info("  Auto redeem settled:    %s",
+                             self.cfg.get("auto_redeem_settled", True))
+            self.logger.info("  Dry run:                %s",
+                             self.cfg.get("dry_run", False))
+            self.logger.info("=" * 60)
+        else:
+            self.logger.info("=" * 60)
+            self.logger.info("COPY TRADER CONFIGURATION")
+            self.logger.info("=" * 60)
+            self.logger.info("  Watched addresses:      %d", len(watched))
+            for i, addr in enumerate(watched):
+                self.logger.info("    [%d] %s", i + 1, addr)
+            self.logger.info("  Copy percentage:        %s%%",
+                             self.cfg.get("copy_percentage", 50))
+            self.logger.info("  Max trade size:         $%s",
+                             self.cfg.get("max_trade_usdc", 100))
+            self.logger.info("  Slippage tolerance:     %s bps",
+                             self.cfg.get("slippage_tolerance_bps", 0))
+            self.logger.info("  Poll interval:          %ss",
+                             self.cfg.get("poll_interval_seconds", 2))
+            self.logger.info("  Order TTL:              %ss",
+                             self.cfg.get("order_ttl_seconds", 10))
+            self.logger.info("  Max price deviation:    %s%%",
+                             self.cfg.get("max_price_deviation_pct", 2))
+            self.logger.info("  Trade max age:          %ss",
+                             self.cfg.get("trade_max_age_seconds", 30))
+            self.logger.info("  Resume threshold:       $%s",
+                             self.cfg.get("resume_threshold_usdc", 5))
+            self.logger.info("  Dry run:                %s",
+                             self.cfg.get("dry_run", False))
+            self.logger.info("  Auto redeem settled:    %s",
+                             self.cfg.get("auto_redeem_settled", True))
+            ws_status = "disabled"
+            if self.cfg.get("ws_rpc_url"):
+                ws_status = "enabled" if HAS_WS_CLIENT else "no websocket-client"
+            self.logger.info("  WebSocket detection:    %s", ws_status)
+            arb_status = "disabled"
+            if self.cfg.get("arb_enabled"):
+                dynamic_slug = self.cfg.get("arb_dynamic_slug", "").strip()
+                if dynamic_slug:
+                    arb_status = (
+                        f"enabled (dynamic '{dynamic_slug}' every "
+                        f"{self.cfg.get('arb_dynamic_window', 300)}s, "
+                        f"min edge {self.cfg.get('arb_min_edge_pct', 1.0)}%)"
+                    )
+                else:
+                    n_arb = len(self.cfg.get("arb_condition_ids", []))
+                    arb_status = f"enabled ({n_arb} market(s), min edge {self.cfg.get('arb_min_edge_pct', 1.0)}%)"
+            self.logger.info("  Arbitrage mode:         %s", arb_status)
+            self.logger.info("=" * 60)
 
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
