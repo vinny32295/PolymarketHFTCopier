@@ -2628,9 +2628,14 @@ class PolymarketCLOBClient:
 
                         # When target_shares is set (slippage normalization),
                         # recalculate USDC so the retry still targets the
-                        # correct share count at the new price.
+                        # correct share count at the new price.  Cap at 110%
+                        # of the original order to prevent runaway spend.
                         if target_shares and side.upper() == "BUY" and retry_price > 0:
-                            retry_usdc = round(target_shares * retry_price, 2)
+                            retry_usdc = round(
+                                min(target_shares * retry_price,
+                                    actual_usdc * 1.10),
+                                2,
+                            )
                         else:
                             retry_usdc = round(actual_usdc, 2)
                         retry_tokens = round(retry_usdc / retry_price, 2) if retry_price > 0 else 0
@@ -3904,6 +3909,12 @@ class MartingaleBot(threading.Thread):
             token_id, neg_risk=neg_risk,
         )
 
+        # Only propagate target share count to the FOK retry when slippage
+        # normalization actually adjusted the bet upward.  When normalization
+        # is inactive (ask <= fair), the retry should keep the same USDC
+        # amount — NOT chase an inflated share count derived from a low ask.
+        norm_target = expected_shares if order_bet > self.current_bet else None
+
         result = self.clob_client.place_order(
             token_id=token_id,
             side="BUY",
@@ -3912,7 +3923,7 @@ class MartingaleBot(threading.Thread):
             use_fok=True,
             max_retry_price=price_max,
             neg_risk=neg_risk,
-            target_shares=target_shares,
+            target_shares=norm_target,
         )
 
         if isinstance(result, dict) and (
