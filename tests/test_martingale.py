@@ -1856,6 +1856,7 @@ class TestMartingaleBot(unittest.TestCase):
         mb._skip_gap = None
         mb._miss_recorded_for_ts = 0
         mb._missed_windows = []
+        mb._phantom_fills = 0
         return mb
 
     # -- slug generation --
@@ -1974,7 +1975,8 @@ class TestMartingaleBot(unittest.TestCase):
         call_args = mb.clob_client.place_order.call_args
         self.assertEqual(call_args[1]["token_id"], "tok_down")
 
-    def test_try_place_bet_fok_rejected(self):
+    @patch("time.sleep")
+    def test_try_place_bet_fok_rejected(self, mock_sleep):
         mb = self._make_bot()
         mb.clob_client._get_public.return_value = [{
             "markets": [{
@@ -1990,6 +1992,9 @@ class TestMartingaleBot(unittest.TestCase):
         mb.clob_client.place_order.return_value = {
             "status": "fok_rejected",
         }
+        mb.clob_client.address = "0xtest"
+        mb.clob_client._get_token_balance = MagicMock(return_value=0)
+        mb.clob_client.get_trades_for_address = MagicMock(return_value=[])
         mb._try_place_bet()
         self.assertIsNone(mb._active_bet)
 
@@ -2152,6 +2157,86 @@ class TestMartingaleBot(unittest.TestCase):
         self.assertEqual(mb._active_bet["bet_size"], 5.0)
         self.assertEqual(mb._active_bet["order_bet"], 5.50)
         self.assertEqual(mb._active_bet["expected_shares"], 10.0)
+
+    @patch("time.sleep")
+    def test_phantom_fill_detected_on_fok_rejection(self, mock_sleep):
+        """If FOK is rejected but on-chain balance shows tokens, treat as fill."""
+        mb = self._make_bot()
+        mb.clob_client._get_public.return_value = [{
+            "markets": [{
+                "condition_id": "cid1",
+                "question": "BTC Up?",
+                "clobTokenIds": '["tok_up", "tok_down"]',
+                "outcomes": '["Up", "Down"]',
+            }]
+        }]
+        mb.clob_client.get_order_book.return_value = {
+            "asks": [{"price": "0.50", "size": "100"}],
+        }
+        mb.clob_client.place_order.return_value = {
+            "status": "fok_rejected",
+        }
+        # Simulate: pre-balance=0, then on-chain shows 10M raw (10 shares)
+        mb.clob_client.address = "0xtest"
+        mb.clob_client._get_token_balance = MagicMock(
+            side_effect=[0, 10_000_000],  # pre-order=0, first check=10 shares
+        )
+        mb.clob_client.get_trades_for_address = MagicMock(return_value=[])
+        result = mb._try_place_bet()
+        self.assertTrue(result)
+        self.assertIsNotNone(mb._active_bet)
+        self.assertEqual(mb._phantom_fills, 1)
+
+    @patch("time.sleep")
+    def test_no_phantom_fill_returns_false(self, mock_sleep):
+        """If FOK rejected and no on-chain tokens, return False normally."""
+        mb = self._make_bot()
+        mb.clob_client._get_public.return_value = [{
+            "markets": [{
+                "condition_id": "cid1",
+                "question": "BTC?",
+                "clobTokenIds": '["tok_up", "tok_down"]',
+                "outcomes": '["Up", "Down"]',
+            }]
+        }]
+        mb.clob_client.get_order_book.return_value = {
+            "asks": [{"price": "0.50", "size": "100"}],
+        }
+        mb.clob_client.place_order.return_value = {
+            "status": "fok_rejected",
+        }
+        mb.clob_client.address = "0xtest"
+        mb.clob_client._get_token_balance = MagicMock(return_value=0)
+        mb.clob_client.get_trades_for_address = MagicMock(return_value=[])
+        result = mb._try_place_bet()
+        self.assertFalse(result)
+        self.assertIsNone(mb._active_bet)
+        self.assertEqual(mb._phantom_fills, 0)
+
+    @patch("time.sleep")
+    def test_phantom_fill_on_none_result(self, mock_sleep):
+        """If place_order returns None but tokens appeared, treat as fill."""
+        mb = self._make_bot()
+        mb.clob_client._get_public.return_value = [{
+            "markets": [{
+                "condition_id": "cid1",
+                "question": "BTC?",
+                "clobTokenIds": '["tok_up", "tok_down"]',
+                "outcomes": '["Up", "Down"]',
+            }]
+        }]
+        mb.clob_client.get_order_book.return_value = {
+            "asks": [{"price": "0.50", "size": "100"}],
+        }
+        mb.clob_client.place_order.return_value = None
+        mb.clob_client.address = "0xtest"
+        mb.clob_client._get_token_balance = MagicMock(
+            side_effect=[0, 0, 10_000_000],  # appears on second check
+        )
+        mb.clob_client.get_trades_for_address = MagicMock(return_value=[])
+        result = mb._try_place_bet()
+        self.assertTrue(result)
+        self.assertEqual(mb._phantom_fills, 1)
 
     def test_try_place_bet_window_too_old(self):
         """Should skip if too far into the current window."""

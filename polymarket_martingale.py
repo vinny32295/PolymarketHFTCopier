@@ -2875,6 +2875,7 @@ class MartingaleBot(threading.Thread):
         self._windows_attempted = 0     # windows where we tried to bet
         self._windows_no_market = 0     # market slug not found on Gamma API
         self._missed_windows = []       # windows skipped due to price/book/balance
+        self._phantom_fills = 0         # phantom fills detected this session
 
         # Streak-pause recovery state
         self._streak_paused = False     # True when max_streak hit, waiting for recovery
@@ -3872,6 +3873,12 @@ class MartingaleBot(threading.Thread):
             except Exception as exc:
                 self.logger.warning("MARTINGALE: approval failed (%s) — proceeding", exc)
 
+        # Snapshot token balance before the order so phantom-fill
+        # detection can use the delta (excludes pre-existing shares).
+        _pre_order_balance = self._check_phantom_fill(
+            token_id, neg_risk=neg_risk,
+        )
+
         result = self.clob_client.place_order(
             token_id=token_id,
             side="BUY",
@@ -3885,21 +3892,39 @@ class MartingaleBot(threading.Thread):
         if isinstance(result, dict) and (
             result.get("status") == "fok_rejected" or result.get("error")
         ):
-            self.logger.warning(
-                "MARTINGALE: FOK rejected for %s @ $%.4f — will retry",
-                direction, ask_price,
+            # FOK was rejected — but the order may have actually filled
+            # on-chain with the response lost.  Check quickly.
+            phantom = self._detect_phantom_fill(
+                token_id, _pre_order_balance, ask_price,
+                target_shares, neg_risk=neg_risk,
             )
-            self._skip_reason = f"FOK rejected @ ${ask_price:.4f}"
-            self._skip_price = ask_price
-            return False
+            if phantom:
+                result = phantom
+            else:
+                self.logger.warning(
+                    "MARTINGALE: FOK rejected for %s @ $%.4f — will retry",
+                    direction, ask_price,
+                )
+                self._skip_reason = f"FOK rejected @ ${ask_price:.4f}"
+                self._skip_price = ask_price
+                return False
 
         if not result:
-            self.logger.warning(
-                "MARTINGALE: order failed for %s — will retry", direction,
+            # Order returned None — network error likely.  Check for
+            # phantom fill before giving up on this window.
+            phantom = self._detect_phantom_fill(
+                token_id, _pre_order_balance, ask_price,
+                target_shares, neg_risk=neg_risk,
             )
-            self._skip_reason = f"order failed for {direction}"
-            self._skip_price = ask_price
-            return False
+            if phantom:
+                result = phantom
+            else:
+                self.logger.warning(
+                    "MARTINGALE: order failed for %s — will retry", direction,
+                )
+                self._skip_reason = f"order failed for {direction}"
+                self._skip_price = ask_price
+                return False
 
         actual_shares = float(result.get("takingAmount", 0)) or target_shares
         actual_cost = float(result.get("makingAmount", 0)) or self.current_bet
@@ -4105,6 +4130,104 @@ class MartingaleBot(threading.Thread):
 
         # --- Persist to dedicated martingale history & summary ---
         self._persist_martingale_record(record)
+
+    def _check_phantom_fill(self, token_id, neg_risk=False):
+        """Return the raw on-chain token balance for *token_id*.
+
+        Used before and after placing an order to detect phantom fills
+        (orders that matched on-chain but whose HTTP response was lost).
+        """
+        try:
+            addr = self.clob_client.address
+            return self.clob_client._get_token_balance(addr, token_id, neg_risk=neg_risk)
+        except Exception:
+            return 0
+
+    def _detect_phantom_fill(self, token_id, pre_balance, ask_price,
+                             target_shares, neg_risk=False):
+        """Fast phantom fill detection after a network error or ambiguous failure.
+
+        Checks on-chain balance with quick retries (1s, 1s, 2s) and falls
+        back to the CLOB trades API.  Returns a synthetic result dict if a
+        fill is detected, or ``None`` if no fill found.
+        """
+        delays = [1, 1, 2]
+        raw_delta = 0
+        raw_balance = pre_balance
+        for i, wait in enumerate(delays):
+            time.sleep(wait)
+            raw_balance = self._check_phantom_fill(token_id, neg_risk=neg_risk)
+            raw_delta = raw_balance - pre_balance
+            if raw_delta > 0:
+                self.logger.info(
+                    "MARTINGALE: phantom fill found on check %d/%d "
+                    "(after %ds total wait)",
+                    i + 1, len(delays), sum(delays[:i + 1]),
+                )
+                break
+
+        # Secondary: check CLOB trades API if on-chain balance hasn't moved
+        from_trades = False
+        if raw_delta <= 0:
+            try:
+                addr = self.clob_client.address
+                recent = self.clob_client.get_trades_for_address(addr, limit=5)
+                now = time.time()
+                for rt in (recent or []):
+                    rt_asset = str(rt.get("asset_id") or rt.get("token_id") or "")
+                    if rt_asset != token_id:
+                        continue
+                    rt_ts = rt.get("match_time") or rt.get("timestamp") or ""
+                    try:
+                        if isinstance(rt_ts, (int, float)):
+                            rt_epoch = float(rt_ts)
+                        else:
+                            from datetime import timezone
+                            rt_epoch = datetime.fromisoformat(
+                                str(rt_ts).replace("Z", "+00:00")
+                            ).timestamp()
+                    except Exception:
+                        rt_epoch = 0
+                    if now - rt_epoch < 30:
+                        rt_size = float(rt.get("size") or 0)
+                        rt_price = float(rt.get("price") or ask_price)
+                        if rt_size > 0:
+                            from_trades = True
+                            target_shares = rt_size
+                            ask_price = rt_price
+                            self.logger.warning(
+                                "MARTINGALE: PHANTOM FILL via CLOB trades API — "
+                                "%.1f shares @ $%.4f",
+                                rt_size, rt_price,
+                            )
+                            break
+            except Exception as exc:
+                self.logger.debug("MARTINGALE: CLOB trades check failed: %s", exc)
+
+        if raw_delta > 0 or from_trades:
+            self._phantom_fills += 1
+            if from_trades:
+                actual_shares = target_shares
+                actual_cost = round(actual_shares * ask_price, 6)
+            else:
+                actual_shares = float(
+                    Decimal(raw_delta) / Decimal("1000000")
+                )
+                actual_cost = round(actual_shares * ask_price, 6)
+            self.logger.warning(
+                "MARTINGALE: PHANTOM FILL DETECTED — %.1f shares "
+                "(pre=%d, post=%d). Treating as successful fill. "
+                "[phantom_fills=%d this session]",
+                actual_shares, pre_balance, raw_balance,
+                self._phantom_fills,
+            )
+            return {
+                "takingAmount": str(actual_shares),
+                "makingAmount": str(actual_cost),
+                "status": "matched",
+                "_phantom_fill": True,
+            }
+        return None
 
     def _normalize_bet_for_slippage(self, base_bet, ask_price):
         """Adjust bet size upward when ask exceeds fair price so we receive
