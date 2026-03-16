@@ -8821,6 +8821,18 @@ class MartingaleGUI:
              "Latest point (in seconds after window start) at which a bet can be placed. "
              "Prevents entering too late when the outcome is nearly decided.",
              "Don\u2019t bet after this many sec"),
+            ("Recovery Candles:", "mart_e_recovery_candles", 10,
+             "Number of candles to evaluate when deciding whether to resume "
+             "after a max-streak pause. More candles = more confirmation.",
+             "Candles to sample after pause"),
+            ("Recovery Green:", "mart_e_recovery_green", 10,
+             "How many of the recovery candles must be green (close >= open) "
+             "before the bot resumes betting.",
+             "Green candles needed to resume"),
+            ("Recovery Interval (sec):", "mart_e_recovery_interval", 10,
+             "Duration of each recovery candle in seconds. "
+             "Controls how long the bot waits between price samples.",
+             "Seconds per recovery candle"),
         ]
         self._mart_entries = {}
         for row, (label, attr, width, tip, inline) in enumerate(fields):
@@ -8896,6 +8908,9 @@ class MartingaleGUI:
             "mart_e_price_min": ("price_min", 0.40),
             "mart_e_price_max": ("price_max", 0.55),
             "mart_e_max_entry": ("max_entry_seconds", 60),
+            "mart_e_recovery_candles": ("recovery_candles", 10),
+            "mart_e_recovery_green": ("recovery_green", 5),
+            "mart_e_recovery_interval": ("recovery_interval", 300),
         }
         for attr, (key, default) in mapping.items():
             entry = self._mart_entries[attr]
@@ -8920,6 +8935,9 @@ class MartingaleGUI:
             ("mart_e_price_min", "price_min", float),
             ("mart_e_price_max", "price_max", float),
             ("mart_e_max_entry", "max_entry_seconds", int),
+            ("mart_e_recovery_candles", "recovery_candles", int),
+            ("mart_e_recovery_green", "recovery_green", int),
+            ("mart_e_recovery_interval", "recovery_interval", int),
         ]:
             try:
                 s[key] = conv(self._mart_entries[attr].get().strip())
@@ -8945,6 +8963,9 @@ class MartingaleGUI:
             "price_min": 0.40,
             "price_max": 0.55,
             "max_entry_seconds": 60,
+            "recovery_candles": 10,
+            "recovery_green": 5,
+            "recovery_interval": 300,
         })
         self._mart_refresh_listbox()
         # Select the new entry
