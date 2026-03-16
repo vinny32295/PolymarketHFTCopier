@@ -2547,6 +2547,14 @@ class PolymarketCLOBClient:
 
             # --- FOK (Fill-or-Kill) attempt for instant fills ---
             if use_fok and MarketOrderArgs is not None:
+                # Snapshot balance before FOK so we can detect phantom fills
+                _fok_pre_bal = 0
+                try:
+                    _fok_pre_bal = self._get_token_balance(
+                        self.address, token_id, neg_risk=neg_risk,
+                    )
+                except Exception:
+                    pass
                 try:
                     if side.upper() == "BUY":
                         fok_args = MarketOrderArgs(
@@ -2582,6 +2590,40 @@ class PolymarketCLOBClient:
                         "FOK rejected (%s) — retrying with refreshed price",
                         fok_exc,
                     )
+
+                    # ── Phantom fill guard ──
+                    # Network errors (status_code=None) mean the order may
+                    # have actually filled on-chain despite the exception.
+                    # Check if token balance increased since the pre-FOK
+                    # snapshot to avoid placing a duplicate retry order.
+                    try:
+                        time.sleep(1.5)  # brief pause for on-chain state
+                        _fok_post_bal = self._get_token_balance(
+                            self.address, token_id, neg_risk=neg_risk,
+                        )
+                        _fok_delta = _fok_post_bal - _fok_pre_bal
+                        if _fok_delta > 0:
+                            delta_shares = float(
+                                Decimal(_fok_delta) / Decimal("1000000")
+                            )
+                            self.logger.warning(
+                                "FOK phantom fill detected — balance "
+                                "increased by %d (pre=%d, post=%d, "
+                                "~%.1f shares). Skipping retry.",
+                                _fok_delta, _fok_pre_bal, _fok_post_bal,
+                                delta_shares,
+                            )
+                            return {
+                                "takingAmount": str(delta_shares),
+                                "makingAmount": str(actual_usdc),
+                                "status": "matched",
+                                "_phantom_fill": True,
+                            }
+                    except Exception as pf_exc:
+                        self.logger.debug(
+                            "FOK phantom fill check failed: %s", pf_exc,
+                        )
+
                     try:
                         retry_book = self.get_order_book(token_id)
                         retry_bids = (retry_book or {}).get("bids") or []
@@ -3938,10 +3980,28 @@ class MartingaleBot(threading.Thread):
             if phantom:
                 result = phantom
             else:
-                self.logger.warning(
-                    "MARTINGALE: FOK rejected for %s @ $%.4f — will retry",
-                    direction, ask_price,
+                # Check if this was a network error (order may have filled
+                # silently).  If so, lock out the window to prevent
+                # duplicate bets — accept a missed window over a triple fill.
+                reason = result.get("reason", "") if isinstance(result, dict) else ""
+                is_network_error = (
+                    "Request exception" in reason
+                    or "status_code=None" in reason
+                    or "ConnectionError" in reason
+                    or "Timeout" in reason
                 )
+                if is_network_error:
+                    self.logger.warning(
+                        "MARTINGALE: FOK network error for %s @ $%.4f — "
+                        "locking window to prevent duplicate bet",
+                        direction, ask_price,
+                    )
+                    self._last_window_ts = current_window_ts
+                else:
+                    self.logger.warning(
+                        "MARTINGALE: FOK rejected for %s @ $%.4f — will retry",
+                        direction, ask_price,
+                    )
                 self._skip_reason = f"FOK rejected @ ${ask_price:.4f}"
                 self._skip_price = ask_price
                 return False
@@ -3956,9 +4016,13 @@ class MartingaleBot(threading.Thread):
             if phantom:
                 result = phantom
             else:
+                # Network error → lock window to prevent duplicate bets
                 self.logger.warning(
-                    "MARTINGALE: order failed for %s — will retry", direction,
+                    "MARTINGALE: order failed (network) for %s — "
+                    "locking window to prevent duplicate",
+                    direction,
                 )
+                self._last_window_ts = current_window_ts
                 self._skip_reason = f"order failed for {direction}"
                 self._skip_price = ask_price
                 return False
