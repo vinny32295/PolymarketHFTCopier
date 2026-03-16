@@ -2462,7 +2462,8 @@ class PolymarketCLOBClient:
         return None
 
     def place_order(self, token_id, side, size_usdc, price, neg_risk=False,
-                    use_fok=False, max_retry_price=None):
+                    use_fok=False, max_retry_price=None,
+                    target_shares=None):
         """Place an order on the Polymarket CLOB.
 
         By default places a GTC (Good-Till-Cancelled) limit order.  When
@@ -2482,6 +2483,10 @@ class PolymarketCLOBClient:
                 arb orders to prevent the retry from accepting a fill
                 price that destroys the arb edge.  If the refreshed ask
                 exceeds this cap, the retry is aborted.
+            target_shares: If set (from slippage normalization), the FOK
+                retry recalculates USDC spend as target_shares × retry_price
+                so that the retry still targets the correct share count
+                instead of reusing the original dollar amount at a worse price.
 
         Returns:
             Order response dict, or None on failure.
@@ -2621,8 +2626,14 @@ class PolymarketCLOBClient:
                             self.logger.warning("FOK retry: no orderbook — aborting")
                             return {"status": "fok_rejected", "reason": str(fok_exc)}
 
-                        retry_usdc = round(actual_usdc, 2)
-                        retry_tokens = round(actual_usdc / retry_price, 2) if retry_price > 0 else 0
+                        # When target_shares is set (slippage normalization),
+                        # recalculate USDC so the retry still targets the
+                        # correct share count at the new price.
+                        if target_shares and side.upper() == "BUY" and retry_price > 0:
+                            retry_usdc = round(target_shares * retry_price, 2)
+                        else:
+                            retry_usdc = round(actual_usdc, 2)
+                        retry_tokens = round(retry_usdc / retry_price, 2) if retry_price > 0 else 0
                         if side.upper() == "BUY":
                             fok_args2 = MarketOrderArgs(
                                 token_id=token_id,
@@ -2643,7 +2654,7 @@ class PolymarketCLOBClient:
                         )
                         self.logger.info(
                             "FOK retry filled: %s $%.2f @ %.4f (was %.4f) for token %s — %s",
-                            side, actual_usdc, retry_price, price,
+                            side, retry_usdc, retry_price, price,
                             token_id[:16] + "...", resp2,
                         )
                         return resp2
@@ -3901,6 +3912,7 @@ class MartingaleBot(threading.Thread):
             use_fok=True,
             max_retry_price=price_max,
             neg_risk=neg_risk,
+            target_shares=target_shares,
         )
 
         if isinstance(result, dict) and (
