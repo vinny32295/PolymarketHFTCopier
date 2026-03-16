@@ -771,6 +771,14 @@ class TelegramCommandBot:
         self._thread = None
         self._last_update_id = 0
 
+    def send(self, message, parse_mode=None):
+        """Send a message to the configured Telegram chat."""
+        try:
+            send_telegram(self.token, self.chat_id, message,
+                          logger=self.logger, parse_mode=parse_mode)
+        except Exception as exc:
+            self.logger.warning("Telegram send failed: %s", exc)
+
     def start(self):
         if not self._verify_token():
             return  # token invalid — don't start polling
@@ -2836,7 +2844,8 @@ class MartingaleBot(threading.Thread):
 
     STATE_FILE = "martingale_state.json"
 
-    def __init__(self, clob_client, cfg, logger=None, strategy=None):
+    def __init__(self, clob_client, cfg, logger=None, strategy=None,
+                 executor=None):
         self.strategy = strategy or {}
         self.strategy_name = self.strategy.get("name", "default")
 
@@ -2852,6 +2861,7 @@ class MartingaleBot(threading.Thread):
         super().__init__(daemon=True, name=thread_name)
 
         self.clob_client = clob_client
+        self.executor = executor  # TradeExecutor for on-chain operations
         self.cfg = cfg
         self.logger = logger or logging.getLogger("martingale")
         self._stop_event = threading.Event()
@@ -3473,15 +3483,16 @@ class MartingaleBot(threading.Thread):
             # Pre-run USDC approval so it's not on the critical path.
             # Use the next bet size (current_bet after potential doubling).
             neg_risk = market.get("neg_risk", False)
-            try:
-                raw_amount = int(self.current_bet * 2 * 1_000_000)  # approve 2x for headroom
-                self.clob_client.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
-                if neg_risk:
-                    self.clob_client.ensure_usdc_approval(
-                        NEG_RISK_CTF_EXCHANGE_ADDRESS, raw_amount,
-                    )
-            except Exception as exc:
-                self.logger.debug("MARTINGALE: prefetch approval failed (%s)", exc)
+            if self.executor:
+                try:
+                    raw_amount = int(self.current_bet * 2 * 1_000_000)  # approve 2x for headroom
+                    self.executor.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
+                    if neg_risk:
+                        self.executor.ensure_usdc_approval(
+                            NEG_RISK_CTF_EXCHANGE_ADDRESS, raw_amount,
+                        )
+                except Exception as exc:
+                    self.logger.debug("MARTINGALE: prefetch approval failed (%s)", exc)
 
             # Pre-check balance so we know early if we're short.
             balance_ok = True
@@ -3865,12 +3876,12 @@ class MartingaleBot(threading.Thread):
 
         # Ensure USDC approval — skip if prefetch already handled it.
         neg_risk = market.get("neg_risk", False)
-        if not prefetch_approval_done:
+        if not prefetch_approval_done and self.executor:
             try:
                 raw_amount = int(order_bet * 1_000_000)
-                self.clob_client.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
+                self.executor.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
                 if neg_risk:
-                    self.clob_client.ensure_usdc_approval(
+                    self.executor.ensure_usdc_approval(
                         NEG_RISK_CTF_EXCHANGE_ADDRESS, raw_amount,
                     )
             except Exception as exc:
@@ -4495,10 +4506,11 @@ class MartingaleManager:
         ]
     """
 
-    def __init__(self, clob_client, cfg, logger=None):
+    def __init__(self, clob_client, cfg, logger=None, executor=None):
         self.clob_client = clob_client
         self.cfg = cfg
         self.logger = logger or logging.getLogger("martingale")
+        self.executor = executor
         self._bots = []  # list[MartingaleBot]
 
         strategies = cfg.get("martingale_strategies") or []
@@ -4523,6 +4535,7 @@ class MartingaleManager:
         for strat in strategies:
             bot = MartingaleBot(
                 clob_client, cfg, logger=self.logger, strategy=strat,
+                executor=executor,
             )
             self._bots.append(bot)
 
@@ -7453,6 +7466,7 @@ class MartingaleEngine:
         if self.cfg.get("martingale_enabled") and self.clob_client:
             self._martingale_mgr = MartingaleManager(
                 self.clob_client, self.cfg, self.logger,
+                executor=self.executor,
             )
             self._martingale_mgr.set_notify_callback(self._notify)
             self._martingale_mgr.set_log_trade_callback(self._append_trade_history)
