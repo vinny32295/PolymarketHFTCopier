@@ -2085,6 +2085,74 @@ class TestMartingaleBot(unittest.TestCase):
         self.assertTrue(result)
         self.assertIsNotNone(mb._active_bet)
 
+    def test_normalize_bet_for_slippage_overbets_above_fair(self):
+        """When ask > fair ($0.50), bet should increase to get expected shares."""
+        mb = self._make_bot()
+        adjusted, expected = mb._normalize_bet_for_slippage(5.0, 0.55)
+        # expected shares = 5.0 / 0.50 = 10
+        self.assertEqual(expected, 10.0)
+        # adjusted = 10 * 0.55 = 5.50
+        self.assertEqual(adjusted, 5.50)
+
+    def test_normalize_bet_for_slippage_no_change_below_fair(self):
+        """When ask <= fair ($0.50), bet stays the same (no reduction)."""
+        mb = self._make_bot()
+        adjusted, expected = mb._normalize_bet_for_slippage(5.0, 0.45)
+        self.assertEqual(expected, 10.0)
+        # Should NOT reduce — keep flat bet amount
+        self.assertEqual(adjusted, 5.0)
+
+    def test_normalize_bet_for_slippage_no_change_at_fair(self):
+        """When ask == fair, no adjustment needed."""
+        mb = self._make_bot()
+        adjusted, expected = mb._normalize_bet_for_slippage(5.0, 0.50)
+        self.assertEqual(expected, 10.0)
+        self.assertEqual(adjusted, 5.0)
+
+    def test_normalize_bet_disabled(self):
+        """When normalize_slippage is False, bet is never adjusted."""
+        mb = self._make_bot({"martingale_normalize_slippage": False})
+        adjusted, expected = mb._normalize_bet_for_slippage(5.0, 0.55)
+        self.assertEqual(adjusted, 5.0)
+
+    def test_normalize_bet_custom_fair_price(self):
+        """Custom fair_price should be respected."""
+        mb = self._make_bot({"martingale_fair_price": 0.40})
+        adjusted, expected = mb._normalize_bet_for_slippage(4.0, 0.50)
+        # expected shares = 4.0 / 0.40 = 10
+        self.assertEqual(expected, 10.0)
+        # adjusted = 10 * 0.50 = 5.00
+        self.assertEqual(adjusted, 5.0)
+
+    def test_try_place_bet_uses_normalized_amount(self):
+        """place_order should be called with the normalized bet, not current_bet."""
+        mb = self._make_bot()
+        mb.clob_client._get_public.return_value = [{
+            "markets": [{
+                "condition_id": "cid1",
+                "question": "BTC Up?",
+                "clobTokenIds": '["tok_up", "tok_down"]',
+                "outcomes": '["Up", "Down"]',
+            }]
+        }]
+        mb.clob_client.get_order_book.return_value = {
+            "asks": [{"price": "0.55", "size": "100"}],
+        }
+        mb.clob_client.place_order.return_value = {
+            "takingAmount": "10.0",
+            "makingAmount": "5.50",
+        }
+        result = mb._try_place_bet()
+        self.assertTrue(result)
+        # current_bet is $5, but ask is $0.55 > fair $0.50, so
+        # order_bet = (5/0.50) * 0.55 = $5.50
+        call_args = mb.clob_client.place_order.call_args
+        self.assertEqual(call_args[1]["size_usdc"], 5.50)
+        # active_bet should track both amounts
+        self.assertEqual(mb._active_bet["bet_size"], 5.0)
+        self.assertEqual(mb._active_bet["order_bet"], 5.50)
+        self.assertEqual(mb._active_bet["expected_shares"], 10.0)
+
     def test_try_place_bet_window_too_old(self):
         """Should skip if too far into the current window."""
         mb = self._make_bot({"martingale_max_entry_seconds": 10})

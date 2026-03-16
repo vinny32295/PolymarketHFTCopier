@@ -489,6 +489,8 @@ DEFAULT_CONFIG = {
     "martingale_price_min": 0.40,      # min ask price to accept (lower bound of buy range)
     "martingale_price_max": 0.55,      # max ask price to accept (upper bound of buy range)
     "martingale_max_entry_seconds": 60, # only bet in the first N seconds of a window
+    "martingale_normalize_slippage": True,  # overbet when ask > fair to get expected shares
+    "martingale_fair_price": 0.50,          # fair price per share for normalization
     # --- Multi-strategy martingale (overrides flat keys above when set) ---
     # List of strategy dicts, each with keys: name, slug_base, window,
     # direction, start_bet, max_bet, max_streak, price_min, price_max,
@@ -513,6 +515,7 @@ _PERSISTENT_CONFIG_KEYS = [
     "martingale_max_bet", "martingale_max_streak",
     "martingale_slug_base", "martingale_window", "martingale_poll_seconds",
     "martingale_price_min", "martingale_price_max", "martingale_max_entry_seconds",
+    "martingale_normalize_slippage", "martingale_fair_price",
     "martingale_recovery_candles", "martingale_recovery_green",
     "martingale_recovery_interval",
     "martingale_strategies",
@@ -3803,10 +3806,17 @@ class MartingaleBot(threading.Thread):
             self._skip_gap = gap_dir
             return False  # don't mark skipped — price might come back
 
+        # Normalize bet for slippage — overbet when ask > fair so we
+        # still receive the expected number of shares.  Never reduces
+        # the bet when ask < fair (caller keeps the bonus shares).
+        order_bet, expected_shares = self._normalize_bet_for_slippage(
+            self.current_bet, ask_price,
+        )
+
         # Check aggregate depth across all ask levels up to price_max.
         # FOK/market orders sweep multiple levels, so single-level
         # size is not the right measure.
-        target_shares = self.current_bet / ask_price
+        target_shares = order_bet / ask_price
         book_depth = self._get_book_depth(token_id, price_max)
         if book_depth < target_shares:
             self.logger.warning(
@@ -3821,8 +3831,8 @@ class MartingaleBot(threading.Thread):
         # Dry run guard
         if self.cfg.get("dry_run", False):
             self.logger.info(
-                "MARTINGALE DRY RUN: would buy %s @ $%.4f, $%.2f",
-                direction, ask_price, self.current_bet,
+                "MARTINGALE DRY RUN: would buy %s @ $%.4f, $%.2f (order $%.2f)",
+                direction, ask_price, self.current_bet, order_bet,
             )
             self._last_window_ts = current_window_ts
             return False
@@ -3839,12 +3849,12 @@ class MartingaleBot(threading.Thread):
             # No prefetch data — check now
             try:
                 usdc_bal = float(self.clob_client.get_usdc_balance(max_age_seconds=0))
-                if usdc_bal < self.current_bet:
+                if usdc_bal < order_bet:
                     self.logger.warning(
                         "MARTINGALE [%s]: USDC balance $%.2f < bet $%.2f — skipping",
-                        self.strategy_name, usdc_bal, self.current_bet,
+                        self.strategy_name, usdc_bal, order_bet,
                     )
-                    self._skip_reason = f"low balance (${usdc_bal:.2f} < ${self.current_bet:.2f})"
+                    self._skip_reason = f"low balance (${usdc_bal:.2f} < ${order_bet:.2f})"
                     return False
             except Exception as exc:
                 self.logger.debug("MARTINGALE: balance check failed (%s) — proceeding", exc)
@@ -3853,7 +3863,7 @@ class MartingaleBot(threading.Thread):
         neg_risk = market.get("neg_risk", False)
         if not prefetch_approval_done:
             try:
-                raw_amount = int(self.current_bet * 1_000_000)
+                raw_amount = int(order_bet * 1_000_000)
                 self.clob_client.ensure_usdc_approval(CTF_EXCHANGE_ADDRESS, raw_amount)
                 if neg_risk:
                     self.clob_client.ensure_usdc_approval(
@@ -3865,7 +3875,7 @@ class MartingaleBot(threading.Thread):
         result = self.clob_client.place_order(
             token_id=token_id,
             side="BUY",
-            size_usdc=self.current_bet,
+            size_usdc=order_bet,
             price=ask_price,
             use_fok=True,
             max_retry_price=price_max,
@@ -3923,6 +3933,8 @@ class MartingaleBot(threading.Thread):
             "opposite_token_id": opposite_token,
             "direction": direction,
             "bet_size": self.current_bet,
+            "order_bet": order_bet,
+            "expected_shares": round(expected_shares, 2),
             "fill_price": fill_price,
             "shares": actual_shares,
             "cost": actual_cost,
@@ -4093,6 +4105,34 @@ class MartingaleBot(threading.Thread):
 
         # --- Persist to dedicated martingale history & summary ---
         self._persist_martingale_record(record)
+
+    def _normalize_bet_for_slippage(self, base_bet, ask_price):
+        """Adjust bet size upward when ask exceeds fair price so we receive
+        the expected number of shares.  Never adjusts *downward* — if the ask
+        is at or below fair, the original bet is returned unchanged (the caller
+        gets bonus shares from favorable pricing).
+
+        Returns ``(adjusted_bet, expected_shares)`` where *expected_shares* is
+        the number of shares we expect at fair value.
+        """
+        normalize = self._scfg(
+            "normalize_slippage", "martingale_normalize_slippage", True,
+        )
+        fair = float(self._scfg(
+            "fair_price", "martingale_fair_price", 0.50,
+        ))
+        expected_shares = base_bet / fair
+        if not normalize or ask_price <= fair:
+            return base_bet, expected_shares
+        adjusted = round(expected_shares * ask_price, 2)
+        if adjusted > base_bet:
+            self.logger.info(
+                "MARTINGALE [%s]: slippage normalization — ask $%.4f > fair "
+                "$%.4f, overbetting $%.2f -> $%.2f to target %.1f shares",
+                self.strategy_name, ask_price, fair,
+                base_bet, adjusted, expected_shares,
+            )
+        return adjusted, expected_shares
 
     @staticmethod
     def _aggregate_slippage(records):
