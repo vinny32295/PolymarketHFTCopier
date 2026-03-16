@@ -782,6 +782,9 @@ class TelegramCommandBot:
         self.logger.info("Telegram command bot started (chat_id=%s)", self.chat_id)
         self.send("Commands active — type /help for available commands.")
 
+    def stop(self):
+        self._stop_event.set()
+
     def _verify_token(self):
         """Call getMe to verify the bot token is valid."""
         try:
@@ -7205,6 +7208,7 @@ class MartingaleEngine:
         self.cfg = cfg
         self.logger = logger
         self.running = False
+        self._stop_event = threading.Event()
         self._thread = None
         self._session_start = None
 
@@ -7424,6 +7428,7 @@ class MartingaleEngine:
 
     def stop(self):
         self.running = False
+        self._stop_event.set()
         # Stop Martingale bots if running
         if self._martingale_mgr:
             self._martingale_mgr.stop()
@@ -7688,8 +7693,8 @@ class MartingaleEngine:
                 self.running = False
                 break
 
-            # Wait for next cycle
-            time.sleep(float(poll_interval))
+            # Wait for next cycle — use event so stop() interrupts immediately
+            self._stop_event.wait(timeout=float(poll_interval))
 
         try:
             self._generate_stop_report()
@@ -8918,7 +8923,11 @@ class MartingaleGUI:
             entry.insert(0, str(s.get(key, default)))
 
     def _mart_apply_edit(self):
-        """Write the edit fields back into the selected strategy dict."""
+        """Write the edit fields back into the selected strategy dict.
+
+        If the bot is currently running, automatically restarts it so the
+        new configuration takes effect immediately.
+        """
         idx = self._mart_selected_idx
         if idx is None or idx >= len(self._mart_strategies):
             return
@@ -8947,6 +8956,23 @@ class MartingaleGUI:
         # Re-select the same index
         if idx < self.mart_listbox.size():
             self.mart_listbox.selection_set(idx)
+
+        # Auto-restart: if the bot is running, stop and restart with new config
+        if self.bot and self.bot.running:
+            self.logger.info("Config changed — restarting bot with new settings")
+            self._stop_bot()
+            self._pending_restart = True
+            self._poll_restart()
+
+    def _poll_restart(self):
+        """Poll until the bot thread exits, then restart."""
+        thread = self.bot._thread if self.bot else None
+        if thread and thread.is_alive():
+            self.root.after(250, self._poll_restart)
+            return
+        if getattr(self, "_pending_restart", False):
+            self._pending_restart = False
+            self._start_bot()
 
     def _mart_add_strategy(self):
         """Add a new strategy with defaults."""
