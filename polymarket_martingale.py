@@ -2966,6 +2966,7 @@ class MartingaleBot(threading.Thread):
         self._recovery_candles = []     # list of {"open": px, "close": px, "green": bool}
         self._recovery_candle_open = None   # price at start of current candle
         self._recovery_candle_ts = 0    # epoch when current candle opened
+        self._streak_just_resumed = False  # True for one cycle after resume so bet can be placed
 
         # Pre-bet candle confirmation for recovery (any streak > 0)
         self._confirm_candles = []      # recent candles for direction confirmation
@@ -3047,6 +3048,7 @@ class MartingaleBot(threading.Thread):
             "last_window_ts": self._last_window_ts,
             "missed_windows": self._missed_windows[-500:],  # cap at 500
             "streak_paused": self._streak_paused,
+            "streak_just_resumed": self._streak_just_resumed,
             "streak_paused_at": self._streak_paused_at.isoformat() if self._streak_paused_at else None,
             "recovery_candles": self._recovery_candles[-20:],
             "confirm_candles": self._confirm_candles[-10:],
@@ -3072,6 +3074,7 @@ class MartingaleBot(threading.Thread):
             self._last_window_ts = int(state.get("last_window_ts", 0))
             self._missed_windows = state.get("missed_windows", [])
             self._streak_paused = bool(state.get("streak_paused", False))
+            self._streak_just_resumed = bool(state.get("streak_just_resumed", False))
             paused_at_str = state.get("streak_paused_at")
             if paused_at_str:
                 try:
@@ -3159,6 +3162,7 @@ class MartingaleBot(threading.Thread):
         self._last_window_ts = 0
         self._streak_paused = False
         self._streak_paused_at = None
+        self._streak_just_resumed = False
         self._recovery_candles = []
         self._recovery_candle_open = None
         self._recovery_candle_ts = 0
@@ -3785,6 +3789,7 @@ class MartingaleBot(threading.Thread):
         self._recovery_candles = []
         self._recovery_candle_open = None
         self._recovery_candle_ts = 0
+        self._streak_just_resumed = True  # skip streak check once so bet can be placed
         # Keep consecutive_losses and current_bet — the streak pause
         # waits for favorable conditions, it does NOT forgive losses.
         # The next bet must still be sized to recover all prior losses.
@@ -3811,8 +3816,9 @@ class MartingaleBot(threading.Thread):
         Returns ``True`` if a bet was placed, ``False`` otherwise.
         """
         # Safety: max streak — pause and wait for bullish recovery
+        # Skip this check if we just resumed — allow the recovery bet to be placed
         max_streak = int(self._scfg("max_streak", "martingale_max_streak", 0))
-        if max_streak > 0 and self.consecutive_losses >= max_streak and not self._streak_paused:
+        if max_streak > 0 and self.consecutive_losses >= max_streak and not self._streak_paused and not self._streak_just_resumed:
             self._streak_paused = True
             self._streak_paused_at = datetime.now()
             self._recovery_candles = []
@@ -4247,6 +4253,7 @@ class MartingaleBot(threading.Thread):
         self.current_bet = self.start_bet
         self.consecutive_losses = 0
         self._active_bet = None
+        self._streak_just_resumed = False
         # Clear candle confirmation — no confirmation needed at streak 0
         self._confirm_candles = []
         self._confirm_candle_open = None
@@ -4309,6 +4316,7 @@ class MartingaleBot(threading.Thread):
             )
 
         self._active_bet = None
+        self._streak_just_resumed = False
         # Start candle confirmation for the recovery bet
         self._confirm_candles = []
         self._confirm_candle_open = None
