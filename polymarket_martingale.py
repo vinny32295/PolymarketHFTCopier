@@ -2620,9 +2620,63 @@ class PolymarketCLOBClient:
                             "prevent double bet. Checking for phantom fill.",
                             fok_exc,
                         )
-                        # Give chain a moment then check if it actually filled
+                        # ── Primary: CLOB trades API (instant) ──
+                        # Polymarket's matching engine knows about fills
+                        # immediately — no need to wait for on-chain
+                        # confirmation.
+                        _phantom_found = False
                         try:
-                            time.sleep(2.0)
+                            time.sleep(0.5)  # brief settle
+                            recent = self.get_trades_for_address(
+                                self.address, limit=5,
+                            )
+                            _now = time.time()
+                            for rt in (recent or []):
+                                rt_asset = str(
+                                    rt.get("asset_id")
+                                    or rt.get("token_id") or ""
+                                )
+                                if rt_asset != token_id:
+                                    continue
+                                rt_ts = (rt.get("match_time")
+                                         or rt.get("timestamp") or "")
+                                try:
+                                    if isinstance(rt_ts, (int, float)):
+                                        rt_epoch = float(rt_ts)
+                                    else:
+                                        rt_epoch = datetime.fromisoformat(
+                                            str(rt_ts).replace(
+                                                "Z", "+00:00")
+                                        ).timestamp()
+                                except Exception:
+                                    rt_epoch = 0
+                                if _now - rt_epoch < 15:
+                                    rt_size = float(
+                                        rt.get("size") or 0)
+                                    rt_price = float(
+                                        rt.get("price") or price)
+                                    if rt_size > 0:
+                                        self.logger.warning(
+                                            "FOK phantom fill via trades "
+                                            "API — %.1f shares @ $%.4f",
+                                            rt_size, rt_price,
+                                        )
+                                        return {
+                                            "takingAmount": str(rt_size),
+                                            "makingAmount": str(
+                                                round(rt_size * rt_price,
+                                                      6)),
+                                            "status": "matched",
+                                            "_phantom_fill": True,
+                                        }
+                        except Exception as ta_exc:
+                            self.logger.debug(
+                                "FOK trades API check failed: %s", ta_exc,
+                            )
+
+                        # ── Fallback: on-chain balance check ──
+                        try:
+                            time.sleep(1.5)
                             _fok_post_bal = self._get_token_balance(
                                 self.address, token_id, neg_risk=neg_risk,
                             )
@@ -2632,9 +2686,9 @@ class PolymarketCLOBClient:
                                     Decimal(_fok_delta) / Decimal("1000000")
                                 )
                                 self.logger.warning(
-                                    "FOK phantom fill confirmed — balance "
-                                    "increased by %d (pre=%d, post=%d, "
-                                    "~%.1f shares). Treating as filled.",
+                                    "FOK phantom fill confirmed on-chain — "
+                                    "balance increased by %d (pre=%d, "
+                                    "post=%d, ~%.1f shares).",
                                     _fok_delta, _fok_pre_bal, _fok_post_bal,
                                     delta_shares,
                                 )
@@ -2646,7 +2700,8 @@ class PolymarketCLOBClient:
                                 }
                         except Exception as pf_exc:
                             self.logger.debug(
-                                "FOK phantom fill check failed: %s", pf_exc,
+                                "FOK on-chain phantom check failed: %s",
+                                pf_exc,
                             )
                         # No phantom fill detected — return as network error
                         # so caller locks the window
@@ -2663,10 +2718,55 @@ class PolymarketCLOBClient:
                     )
 
                     # ── Phantom fill guard ──
-                    # Even for non-network rejections, check balance to be
-                    # safe before retrying.
+                    # Check trades API first (instant), then on-chain
+                    # balance as fallback, before retrying.
                     try:
-                        time.sleep(1.5)  # brief pause for on-chain state
+                        time.sleep(0.5)
+                        recent = self.get_trades_for_address(
+                            self.address, limit=5,
+                        )
+                        _now = time.time()
+                        for rt in (recent or []):
+                            rt_asset = str(
+                                rt.get("asset_id")
+                                or rt.get("token_id") or ""
+                            )
+                            if rt_asset != token_id:
+                                continue
+                            rt_ts = (rt.get("match_time")
+                                     or rt.get("timestamp") or "")
+                            try:
+                                if isinstance(rt_ts, (int, float)):
+                                    rt_epoch = float(rt_ts)
+                                else:
+                                    rt_epoch = datetime.fromisoformat(
+                                        str(rt_ts).replace("Z", "+00:00")
+                                    ).timestamp()
+                            except Exception:
+                                rt_epoch = 0
+                            if _now - rt_epoch < 15:
+                                rt_size = float(rt.get("size") or 0)
+                                rt_price = float(rt.get("price") or price)
+                                if rt_size > 0:
+                                    self.logger.warning(
+                                        "FOK phantom fill via trades API "
+                                        "— %.1f shares @ $%.4f. "
+                                        "Skipping retry.",
+                                        rt_size, rt_price,
+                                    )
+                                    return {
+                                        "takingAmount": str(rt_size),
+                                        "makingAmount": str(
+                                            round(rt_size * rt_price, 6)),
+                                        "status": "matched",
+                                        "_phantom_fill": True,
+                                    }
+                    except Exception as ta_exc:
+                        self.logger.debug(
+                            "FOK trades API check failed: %s", ta_exc,
+                        )
+                    try:
+                        time.sleep(1.0)
                         _fok_post_bal = self._get_token_balance(
                             self.address, token_id, neg_risk=neg_risk,
                         )
@@ -2676,7 +2776,7 @@ class PolymarketCLOBClient:
                                 Decimal(_fok_delta) / Decimal("1000000")
                             )
                             self.logger.warning(
-                                "FOK phantom fill detected — balance "
+                                "FOK phantom fill on-chain — balance "
                                 "increased by %d (pre=%d, post=%d, "
                                 "~%.1f shares). Skipping retry.",
                                 _fok_delta, _fok_pre_bal, _fok_post_bal,
@@ -2690,7 +2790,7 @@ class PolymarketCLOBClient:
                             }
                     except Exception as pf_exc:
                         self.logger.debug(
-                            "FOK phantom fill check failed: %s", pf_exc,
+                            "FOK on-chain phantom check failed: %s", pf_exc,
                         )
 
                     try:
