@@ -3163,6 +3163,7 @@ class MartingaleBot(threading.Thread):
         self._windows_no_market = 0     # market slug not found on Gamma API
         self._missed_windows = []       # windows skipped due to price/book/balance
         self._phantom_fills = 0         # phantom fills detected this session
+        self._deferred_phantom = None   # pending deferred phantom fill check
 
         # Streak-pause recovery state
         self._streak_paused = False     # True when max_streak hit, waiting for recovery
@@ -4507,6 +4508,21 @@ class MartingaleBot(threading.Thread):
                         direction, ask_price,
                     )
                     self._last_window_ts = current_window_ts
+                    # Schedule deferred phantom check — the network was
+                    # down so immediate detection failed, but the order
+                    # may have filled on-chain.
+                    self._deferred_phantom = {
+                        "token_id": token_id,
+                        "pre_balance": _pre_order_balance,
+                        "ask_price": ask_price,
+                        "target_shares": target_shares,
+                        "neg_risk": neg_risk,
+                        "direction": direction,
+                        "market": market,
+                        "window_ts": current_window_ts,
+                        "order_bet": order_bet,
+                        "scheduled_at": time.time(),
+                    }
                 else:
                     self.logger.warning(
                         "MARTINGALE: FOK rejected for %s @ $%.4f — will retry",
@@ -4534,6 +4550,19 @@ class MartingaleBot(threading.Thread):
                     direction,
                 )
                 self._last_window_ts = current_window_ts
+                # Schedule deferred phantom check
+                self._deferred_phantom = {
+                    "token_id": token_id,
+                    "pre_balance": _pre_order_balance,
+                    "ask_price": ask_price,
+                    "target_shares": target_shares,
+                    "neg_risk": neg_risk,
+                    "direction": direction,
+                    "market": market,
+                    "window_ts": current_window_ts,
+                    "order_bet": order_bet,
+                    "scheduled_at": time.time(),
+                }
                 self._skip_reason = f"order failed for {direction}"
                 self._skip_price = ask_price
                 self._skip_token_id = token_id
@@ -4748,8 +4777,8 @@ class MartingaleBot(threading.Thread):
         self._save_state()
 
     def handle_late_phantom_fill(self, token_id, cost, shares, entry_price,
-                                 market_name=None):
-        """Incorporate a late-discovered phantom fill as a martingale loss.
+                                 exit_price=0.0, market_name=None):
+        """Incorporate a late-discovered phantom fill into martingale state.
 
         Called by the portfolio scanner when it discovers a redeemed
         position whose token_id matches a missed_windows entry.  This
@@ -4772,6 +4801,7 @@ class MartingaleBot(threading.Thread):
         fill_price = round(cost / shares, 6) if shares > 0 else 0
         slippage = round(0.50 - fill_price, 6)
         slippage_usdc = round(slippage * shares, 6)
+        won = exit_price >= 0.5
 
         bet = {
             "slug": self.strategy_name,
@@ -4787,17 +4817,20 @@ class MartingaleBot(threading.Thread):
             "_late_phantom": True,
         }
 
+        outcome = "WIN" if won else "LOSS"
         self.logger.warning(
-            "MARTINGALE [%s]: LATE PHANTOM FILL — token %s, "
-            "%.1f shares @ $%.4f ($%.2f) from missed window %d. "
-            "Incorporating as loss.",
-            self.strategy_name, token_id[:16] + "...",
-            shares, fill_price, cost,
+            "MARTINGALE [%s]: LATE PHANTOM FILL %s — token %s, "
+            "%.1f shares @ $%.4f ($%.2f), exit $%.2f, "
+            "from missed window %d",
+            self.strategy_name, outcome, token_id[:16] + "...",
+            shares, fill_price, cost, exit_price,
             matched.get("window_ts", 0),
         )
 
-        # Process as a loss — updates streak, cumulative_losses, current_bet
-        self._handle_loss(bet)
+        if won:
+            self._handle_win(bet)
+        else:
+            self._handle_loss(bet)
         return True
 
     def _log_bet(self, bet, won, profit):
@@ -4858,6 +4891,97 @@ class MartingaleBot(threading.Thread):
             return self.clob_client._get_token_balance(addr, token_id, neg_risk=neg_risk)
         except Exception:
             return 0
+
+    def _resolve_deferred_phantom(self, dp):
+        """Re-check for a phantom fill after a network error.
+
+        Called from _cycle() ~10 seconds after the order attempt.
+        If shares are found on-chain, creates _active_bet so the normal
+        resolution path handles win/loss, logging, and Telegram alerts.
+        """
+        token_id = dp["token_id"]
+        pre_balance = dp["pre_balance"]
+        ask_price = dp["ask_price"]
+        target_shares = dp["target_shares"]
+        neg_risk = dp.get("neg_risk", False)
+        direction = dp["direction"]
+        market = dp["market"]
+        order_bet = dp["order_bet"]
+
+        self.logger.info(
+            "MARTINGALE [%s]: deferred phantom check for %s @ $%.4f "
+            "(%.0fs after network error)",
+            self.strategy_name, direction, ask_price,
+            time.time() - dp["scheduled_at"],
+        )
+
+        phantom = self._detect_phantom_fill(
+            token_id, pre_balance, ask_price,
+            target_shares, neg_risk=neg_risk,
+        )
+        if not phantom:
+            self.logger.info(
+                "MARTINGALE [%s]: deferred check — no phantom fill found",
+                self.strategy_name,
+            )
+            return
+
+        # Phantom fill confirmed — build _active_bet so normal
+        # resolution handles it (win/loss, logging, Telegram).
+        actual_shares = float(phantom.get("takingAmount", 0)) or target_shares
+        actual_cost = float(phantom.get("makingAmount", 0)) or order_bet
+        fill_price = round(actual_cost / actual_shares, 6) if actual_shares > 0 else ask_price
+        slippage = round(0.50 - fill_price, 6)
+        slippage_usdc = round(slippage * actual_shares, 6)
+
+        opposite_token = (
+            market["down_token"] if direction == "Up"
+            else market["up_token"]
+        )
+        self._active_bet = {
+            "slug": market.get("slug", self.strategy_name),
+            "condition_id": market["condition_id"],
+            "token_id": token_id,
+            "opposite_token_id": opposite_token,
+            "direction": direction,
+            "bet_size": self.current_bet,
+            "order_bet": order_bet,
+            "expected_shares": round(target_shares, 2),
+            "fill_price": fill_price,
+            "shares": actual_shares,
+            "cost": actual_cost,
+            "slippage": slippage,
+            "slippage_usdc": slippage_usdc,
+            "question": market.get("question", self.strategy_name),
+            "window_end": self._get_window_end(),
+            "ts": datetime.now().isoformat(),
+            "_deferred_phantom": True,
+        }
+        # Clear the skip state since we now have an active bet
+        self._skip_reason = None
+        self._skip_price = None
+        self._skip_token_id = None
+        self._save_state()
+
+        slip_tag = ""
+        if abs(slippage) >= 0.0001:
+            slip_tag = f" | slip {slippage:+.4f} (${slippage_usdc:+.4f})"
+        self.logger.warning(
+            "MARTINGALE [%s]: DEFERRED PHANTOM FILL — %s $%.2f @ $%.4f "
+            "(%.1f shares) — streak: %d%s",
+            self.strategy_name, direction, actual_cost, fill_price,
+            actual_shares, self.consecutive_losses, slip_tag,
+        )
+        if self.notify_callback:
+            try:
+                self.notify_callback(
+                    f"{self.strategy_name} DEFERRED FILL: {direction} "
+                    f"${actual_cost:.2f} @ ${fill_price:.4f} "
+                    f"({actual_shares:.1f} shares) — streak: "
+                    f"{self.consecutive_losses}"
+                )
+            except Exception:
+                pass
 
     def _detect_phantom_fill(self, token_id, pre_balance, ask_price,
                              target_shares, neg_risk=False):
@@ -5150,6 +5274,16 @@ class MartingaleBot(threading.Thread):
                 self._handle_loss(bet)
             return False  # resolved — fast poll for next bet
         else:
+            # Deferred phantom fill check — re-check on-chain after a
+            # network error locked a window.  Wait at least 10 seconds
+            # for the transaction to confirm, then check once.
+            if self._deferred_phantom:
+                dp = self._deferred_phantom
+                elapsed = time.time() - dp["scheduled_at"]
+                if elapsed >= 10:
+                    self._resolve_deferred_phantom(dp)
+                    self._deferred_phantom = None
+
             # While paused for streak recovery, sample candles instead of betting
             if self._streak_paused:
                 if self._check_streak_recovery():
@@ -5573,7 +5707,7 @@ class TradeExecutor:
                 for mb in self._martingale_bots:
                     if mb.handle_late_phantom_fill(
                         token_id, cost_basis, num_shares, entry_p,
-                        market_name=market,
+                        exit_price=exit_p, market_name=market,
                     ):
                         self.logger.info(
                             "Late phantom fill for %s handled by "
