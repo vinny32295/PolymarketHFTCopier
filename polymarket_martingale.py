@@ -3157,6 +3157,7 @@ class MartingaleBot(threading.Thread):
         self._skip_reason = None        # last reason a window was skipped
         self._skip_price = None         # ask price when last skip occurred
         self._skip_gap = None           # "gap_up", "gap_down", or None
+        self._skip_token_id = None      # token_id when FOK was rejected (phantom fill tracking)
         self._miss_recorded_for_ts = 0  # last window_ts we recorded a miss for (dedup)
         self._windows_attempted = 0     # windows where we tried to bet
         self._windows_no_market = 0     # market slug not found on Gamma API
@@ -4258,6 +4259,7 @@ class MartingaleBot(threading.Thread):
                 "ask_price": self._skip_price,
                 "gap": self._skip_gap,
                 "strategy": self.strategy_name,
+                "token_id": self._skip_token_id,
             }
             self._missed_windows.append(missed_rec)
             _append_missed_window(missed_rec, logger=self.logger)
@@ -4271,6 +4273,7 @@ class MartingaleBot(threading.Thread):
         self._skip_reason = None
         self._skip_price = None
         self._skip_gap = None
+        self._skip_token_id = None
 
         now = int(time.time())
         seconds_into = now - current_window_ts
@@ -4511,6 +4514,7 @@ class MartingaleBot(threading.Thread):
                     )
                 self._skip_reason = f"FOK rejected @ ${ask_price:.4f}"
                 self._skip_price = ask_price
+                self._skip_token_id = token_id
                 return False
 
         if not result:
@@ -4532,6 +4536,7 @@ class MartingaleBot(threading.Thread):
                 self._last_window_ts = current_window_ts
                 self._skip_reason = f"order failed for {direction}"
                 self._skip_price = ask_price
+                self._skip_token_id = token_id
                 return False
 
         actual_shares = float(result.get("takingAmount", 0)) or target_shares
@@ -4581,6 +4586,7 @@ class MartingaleBot(threading.Thread):
         self._skip_reason = None  # bet placed successfully
         self._skip_price = None
         self._skip_gap = None
+        self._skip_token_id = None
         self._windows_attempted += 1
         self._save_state()
 
@@ -4740,6 +4746,59 @@ class MartingaleBot(threading.Thread):
         # Candle confirmation is only useful as a recovery gate after
         # hitting max_streak, which is handled above via _streak_paused.
         self._save_state()
+
+    def handle_late_phantom_fill(self, token_id, cost, shares, entry_price,
+                                 market_name=None):
+        """Incorporate a late-discovered phantom fill as a martingale loss.
+
+        Called by the portfolio scanner when it discovers a redeemed
+        position whose token_id matches a missed_windows entry.  This
+        corrects the martingale state (streak, cumulative_losses) and
+        logs the trade via _log_bet() so the equity chart attributes it
+        correctly and the normal dedup prevents double-counting.
+
+        Returns True if the fill was accepted, False if the token_id
+        was not recognised or already tracked.
+        """
+        # Only accept if the token_id appears in our missed_windows
+        matched = None
+        for mw in self._missed_windows:
+            if mw.get("token_id") == token_id:
+                matched = mw
+                break
+        if not matched:
+            return False
+
+        fill_price = round(cost / shares, 6) if shares > 0 else 0
+        slippage = round(0.50 - fill_price, 6)
+        slippage_usdc = round(slippage * shares, 6)
+
+        bet = {
+            "slug": self.strategy_name,
+            "token_id": token_id,
+            "direction": self.direction,
+            "bet_size": matched.get("bet_would_be", cost),
+            "fill_price": fill_price,
+            "shares": shares,
+            "cost": cost,
+            "slippage": slippage,
+            "slippage_usdc": slippage_usdc,
+            "question": market_name or self.strategy_name,
+            "_late_phantom": True,
+        }
+
+        self.logger.warning(
+            "MARTINGALE [%s]: LATE PHANTOM FILL — token %s, "
+            "%.1f shares @ $%.4f ($%.2f) from missed window %d. "
+            "Incorporating as loss.",
+            self.strategy_name, token_id[:16] + "...",
+            shares, fill_price, cost,
+            matched.get("window_ts", 0),
+        )
+
+        # Process as a loss — updates streak, cumulative_losses, current_bet
+        self._handle_loss(bet)
+        return True
 
     def _log_bet(self, bet, won, profit):
         fill_price = bet.get("fill_price", 0)
@@ -5276,6 +5335,10 @@ class TradeExecutor:
         # Optional webhook callback (set by MartingaleEngine after init)
         self.notify_callback = None
 
+        # Reference to martingale bots for late phantom fill reconciliation.
+        # Set by MartingaleEngine after martingale manager is created.
+        self._martingale_bots = None
+
         # Kill switch: stop the bot when session losses exceed threshold
         self.kill_switch_triggered = False
         self._session_pnl = 0.0
@@ -5498,6 +5561,24 @@ class TradeExecutor:
                             "Skipping duplicate _log_closed_trade for %s "
                             "(already logged by martingale)",
                             token_id[:16] + "...",
+                        )
+                        return
+
+            # Late phantom fill reconciliation: if a redeemed position
+            # matches a martingale missed window (FOK was rejected but
+            # the order filled on-chain), feed it back to the martingale
+            # so it logs the trade properly and the equity chart
+            # attributes it correctly.
+            if reason == "redeemed" and self._martingale_bots:
+                for mb in self._martingale_bots:
+                    if mb.handle_late_phantom_fill(
+                        token_id, cost_basis, num_shares, entry_p,
+                        market_name=market,
+                    ):
+                        self.logger.info(
+                            "Late phantom fill for %s handled by "
+                            "martingale [%s] — skipping executor record",
+                            token_id[:16] + "...", mb.strategy_name,
                         )
                         return
 
@@ -8128,6 +8209,10 @@ class MartingaleEngine:
             self._martingale_mgr.set_notify_callback(self._notify)
             self._martingale_mgr.set_log_trade_callback(self._append_trade_history)
             self._martingale_mgr.start()
+            # Give the executor a reference to martingale bots so it can
+            # reconcile late phantom fills during portfolio scans.
+            if self.executor:
+                self.executor._martingale_bots = self._martingale_mgr.bots
 
         # ---- Start Telegram command bot ----
         tg_token = self.cfg.get("telegram_bot_token", "").strip()
