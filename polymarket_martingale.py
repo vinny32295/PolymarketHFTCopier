@@ -1480,6 +1480,13 @@ class TelegramCommandBot:
                             f" [PAUSED — recovery {green}/{total} "
                             f"green, need {n_needed}/{n_candles}]"
                         )
+                    elif mg._confirm_waiting:
+                        fav = sum(1 for c in mg._confirm_candles if c.get("favorable"))
+                        total = len(mg._confirm_candles)
+                        status_extra = (
+                            f" [CONFIRMING — {fav}/{total} "
+                            f"favorable, need 2/3]"
+                        )
                     lines.append(
                         f"  Martingale [{mg.strategy_name}]: "
                         f"streak={mg.consecutive_losses}, "
@@ -2955,6 +2962,12 @@ class MartingaleBot(threading.Thread):
         self._recovery_candle_open = None   # price at start of current candle
         self._recovery_candle_ts = 0    # epoch when current candle opened
 
+        # Pre-bet candle confirmation for recovery (any streak > 0)
+        self._confirm_candles = []      # recent candles for direction confirmation
+        self._confirm_candle_open = None
+        self._confirm_candle_ts = 0
+        self._confirm_waiting = False   # True while waiting for candle confirmation
+
         # Callbacks (wired by MartingaleEngine)
         self.notify_callback = None
         self.log_trade_callback = None
@@ -3031,6 +3044,8 @@ class MartingaleBot(threading.Thread):
             "streak_paused": self._streak_paused,
             "streak_paused_at": self._streak_paused_at.isoformat() if self._streak_paused_at else None,
             "recovery_candles": self._recovery_candles[-20:],
+            "confirm_candles": self._confirm_candles[-10:],
+            "confirm_waiting": self._confirm_waiting,
         }
         try:
             tmp = self.STATE_FILE + ".tmp"
@@ -3059,6 +3074,8 @@ class MartingaleBot(threading.Thread):
                 except (ValueError, TypeError):
                     self._streak_paused_at = None
             self._recovery_candles = state.get("recovery_candles", [])
+            self._confirm_candles = state.get("confirm_candles", [])
+            self._confirm_waiting = bool(state.get("confirm_waiting", False))
 
             # On restart while paused, prune recovery candles that are
             # outside the lookback window so the bot evaluates recent
@@ -3139,6 +3156,10 @@ class MartingaleBot(threading.Thread):
         self._recovery_candles = []
         self._recovery_candle_open = None
         self._recovery_candle_ts = 0
+        self._confirm_candles = []
+        self._confirm_candle_open = None
+        self._confirm_candle_ts = 0
+        self._confirm_waiting = False
         try:
             os.remove(self.STATE_FILE)
         except OSError:
@@ -3579,6 +3600,86 @@ class MartingaleBot(threading.Thread):
             )
         except Exception as exc:
             self.logger.debug("MARTINGALE: prefetch failed: %s", exc)
+
+    # -- pre-bet candle confirmation (recovery) --------------------------------
+
+    def _check_confirm_candles(self):
+        """Sample price and build candles to confirm direction before a
+        recovery bet.  Returns True when 2 out of 3 candles are favorable
+        (green for Up, red for Down).  Uses the bet window interval.
+
+        Called each cycle while ``_confirm_waiting`` is True.
+        """
+        window = int(self._scfg("window", "martingale_window", 300))
+        n_needed = 2
+        n_total = 3
+
+        # Get current price from the orderbook
+        slug = self._generate_slug()
+        market = self._fetch_market(slug)
+        if not market:
+            return False
+
+        direction = self._scfg("direction", "martingale_direction", self.direction)
+        token_id = (
+            market["up_token"] if direction == "Up"
+            else market["down_token"]
+        )
+        price, _ = self._get_best_ask(token_id)
+        if not price or price <= 0:
+            return False
+
+        now = int(time.time())
+
+        # Start a new candle or close the current one
+        if self._confirm_candle_ts == 0 or (now - self._confirm_candle_ts) >= window:
+            # Close the previous candle if one was open
+            if self._confirm_candle_open is not None and self._confirm_candle_ts > 0:
+                is_green = price >= self._confirm_candle_open
+                # For Up bets: favorable = green candle
+                # For Down bets: favorable = red candle
+                favorable = is_green if direction == "Up" else not is_green
+                candle = {
+                    "open": self._confirm_candle_open,
+                    "close": price,
+                    "green": is_green,
+                    "favorable": favorable,
+                    "ts": self._confirm_candle_ts,
+                }
+                self._confirm_candles.append(candle)
+                self._confirm_candles = self._confirm_candles[-n_total:]
+                self._save_state()
+
+                color = "GREEN" if is_green else "RED"
+                fav_count = sum(1 for c in self._confirm_candles if c.get("favorable"))
+                total = len(self._confirm_candles)
+                self.logger.info(
+                    "MARTINGALE [%s] confirm candle: %s (%.4f → %.4f) "
+                    "— %d/%d favorable (%d needed from %d)",
+                    self.strategy_name, color, candle["open"], candle["close"],
+                    fav_count, total, n_needed, n_total,
+                )
+
+                # Check if confirmation is met
+                if total >= n_total and fav_count >= n_needed:
+                    self.logger.info(
+                        "MARTINGALE [%s]: candle confirmation met — "
+                        "%d/%d favorable, proceeding with recovery bet $%.2f",
+                        self.strategy_name, fav_count, total,
+                        self.current_bet,
+                    )
+                    self._confirm_waiting = False
+                    self._confirm_candles = []
+                    self._confirm_candle_open = None
+                    self._confirm_candle_ts = 0
+                    self._save_state()
+                    return True
+
+            # Open a new candle
+            self._confirm_candle_open = price
+            self._confirm_candle_ts = now
+
+        return False
 
     # -- streak recovery (candle sampling) ------------------------------------
 
@@ -4126,6 +4227,11 @@ class MartingaleBot(threading.Thread):
         self.current_bet = self.start_bet
         self.consecutive_losses = 0
         self._active_bet = None
+        # Clear candle confirmation — no confirmation needed at streak 0
+        self._confirm_candles = []
+        self._confirm_candle_open = None
+        self._confirm_candle_ts = 0
+        self._confirm_waiting = False
         self._save_state()
 
     def _handle_loss(self, bet):
@@ -4183,6 +4289,16 @@ class MartingaleBot(threading.Thread):
             )
 
         self._active_bet = None
+        # Start candle confirmation for the recovery bet
+        self._confirm_candles = []
+        self._confirm_candle_open = None
+        self._confirm_candle_ts = 0
+        self._confirm_waiting = True
+        self.logger.info(
+            "MARTINGALE [%s]: waiting for 2/3 candle confirmation "
+            "before recovery bet (streak %d, next $%.2f)",
+            self.strategy_name, self.consecutive_losses, self.current_bet,
+        )
         self._save_state()
 
     def _log_bet(self, bet, won, profit):
@@ -4539,6 +4655,10 @@ class MartingaleBot(threading.Thread):
             if self._streak_paused:
                 if self._check_streak_recovery():
                     self._resume_from_streak_pause()
+                return False  # keep fast-polling to sample prices
+            # While waiting for candle confirmation before recovery bet
+            if self._confirm_waiting:
+                self._check_confirm_candles()
                 return False  # keep fast-polling to sample prices
             placed = self._try_place_bet()
             return placed  # fast poll until placed, then slow poll
