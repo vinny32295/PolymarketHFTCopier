@@ -480,8 +480,8 @@ DEFAULT_CONFIG = {
     "martingale_start_bet": 5.0,       # starting bet size in USDC
     "martingale_max_bet": 0,           # max bet cap in USDC (0 = no limit)
     "martingale_max_streak": 0,        # stop after N consecutive losses (0 = no limit)
-    "martingale_recovery_candles": 10,  # number of candles to evaluate for recovery
-    "martingale_recovery_green": 5,     # how many of those candles must be green to resume
+    "martingale_recovery_candles": 3,   # number of candles to evaluate for recovery
+    "martingale_recovery_in_favor": 2,   # how many candles must be in our favor to resume
     "martingale_recovery_interval": 300, # candle interval in seconds for recovery sampling
     "martingale_slug_base": "btc-updown-5m",  # slug prefix for the market
     "martingale_window": 300,          # window size in seconds (300 = 5 min)
@@ -516,7 +516,7 @@ _PERSISTENT_CONFIG_KEYS = [
     "martingale_slug_base", "martingale_window", "martingale_poll_seconds",
     "martingale_price_min", "martingale_price_max", "martingale_max_entry_seconds",
     "martingale_normalize_slippage", "martingale_fair_price",
-    "martingale_recovery_candles", "martingale_recovery_green",
+    "martingale_recovery_candles", "martingale_recovery_in_favor",
     "martingale_recovery_interval",
     "martingale_strategies",
 ]
@@ -1470,22 +1470,27 @@ class TelegramCommandBot:
                 for mg in mgr.bots:
                     status_extra = ""
                     if mg._streak_paused:
-                        green = sum(1 for c in mg._recovery_candles if c.get("green"))
+                        green = sum(1 for c in mg._recovery_candles
+                                    if c.get("favorable", c.get("green")))
                         total = len(mg._recovery_candles)
                         n_needed = int(mg._scfg(
-                            "recovery_green", "martingale_recovery_green", 5))
+                            "recovery_in_favor", "martingale_recovery_in_favor", 2))
                         n_candles = int(mg._scfg(
-                            "recovery_candles", "martingale_recovery_candles", 10))
+                            "recovery_candles", "martingale_recovery_candles", 3))
                         status_extra = (
                             f" [PAUSED — recovery {green}/{total} "
-                            f"green, need {n_needed}/{n_candles}]"
+                            f"in favor, need {n_needed}/{n_candles}]"
                         )
                     elif mg._confirm_waiting:
                         fav = sum(1 for c in mg._confirm_candles if c.get("favorable"))
                         total = len(mg._confirm_candles)
+                        n_candles = int(mg._scfg(
+                            "recovery_candles", "martingale_recovery_candles", 3))
+                        n_favor = int(mg._scfg(
+                            "recovery_in_favor", "martingale_recovery_in_favor", 2))
                         status_extra = (
                             f" [CONFIRMING — {fav}/{total} "
-                            f"favorable, need 2/3]"
+                            f"favorable, need {n_favor}/{n_candles}]"
                         )
                     lines.append(
                         f"  Martingale [{mg.strategy_name}]: "
@@ -3086,7 +3091,7 @@ class MartingaleBot(threading.Thread):
                 interval = int(self._scfg(
                     "recovery_interval", "martingale_recovery_interval", 300))
                 n_candles = int(self._scfg(
-                    "recovery_candles", "martingale_recovery_candles", 10))
+                    "recovery_candles", "martingale_recovery_candles", 3))
                 cutoff = int(time.time()) - (n_candles * interval)
                 before = len(self._recovery_candles)
                 self._recovery_candles = [
@@ -3105,14 +3110,15 @@ class MartingaleBot(threading.Thread):
                         n_candles - len(self._recovery_candles),
                     )
                     self._save_state()
-                green = sum(1 for c in self._recovery_candles if c["green"])
+                fav = sum(1 for c in self._recovery_candles
+                          if c.get("favorable", c.get("green")))
                 self.logger.info(
                     "MARTINGALE [%s]: recovery status on restart: "
-                    "%d/%d candles (%d green, need %d)",
+                    "%d/%d candles (%d in favor, need %d)",
                     self.strategy_name, len(self._recovery_candles),
-                    n_candles, green,
+                    n_candles, fav,
                     int(self._scfg(
-                        "recovery_green", "martingale_recovery_green", 5)),
+                        "recovery_in_favor", "martingale_recovery_in_favor", 2)),
                 )
 
             self.logger.info(
@@ -3605,14 +3611,18 @@ class MartingaleBot(threading.Thread):
 
     def _check_confirm_candles(self):
         """Sample price and build candles to confirm direction before a
-        recovery bet.  Returns True when 2 out of 3 candles are favorable
-        (green for Up, red for Down).  Uses the bet window interval.
+        recovery bet.  Returns True when N out of M candles are favorable
+        (green for Up, red for Down).  Uses the recovery_interval for
+        candle duration and recovery_candles/recovery_in_favor for thresholds.
 
         Called each cycle while ``_confirm_waiting`` is True.
         """
-        window = int(self._scfg("window", "martingale_window", 300))
-        n_needed = 2
-        n_total = 3
+        interval = int(self._scfg(
+            "recovery_interval", "martingale_recovery_interval", 300))
+        n_total = int(self._scfg(
+            "recovery_candles", "martingale_recovery_candles", 3))
+        n_needed = int(self._scfg(
+            "recovery_in_favor", "martingale_recovery_in_favor", 2))
 
         # Get current price from the orderbook
         slug = self._generate_slug()
@@ -3632,7 +3642,7 @@ class MartingaleBot(threading.Thread):
         now = int(time.time())
 
         # Start a new candle or close the current one
-        if self._confirm_candle_ts == 0 or (now - self._confirm_candle_ts) >= window:
+        if self._confirm_candle_ts == 0 or (now - self._confirm_candle_ts) >= interval:
             # Close the previous candle if one was open
             if self._confirm_candle_open is not None and self._confirm_candle_ts > 0:
                 is_green = price >= self._confirm_candle_open
@@ -3687,18 +3697,18 @@ class MartingaleBot(threading.Thread):
         """Sample price to build candles and check if market has recovered.
 
         Called each cycle while ``_streak_paused`` is True.  Returns True
-        when the recovery condition is met (N out of M candles are green),
-        meaning the bot should resume trading.
+        when the recovery condition is met (N out of M candles are in our
+        favor), meaning the bot should resume trading.
 
         A "candle" is simply the price at the start and end of each
-        *recovery_interval* period.  Green = close >= open.
+        *recovery_interval* period.  Favorable = green for Up, red for Down.
         """
         interval = int(self._scfg(
             "recovery_interval", "martingale_recovery_interval", 300))
         n_candles = int(self._scfg(
-            "recovery_candles", "martingale_recovery_candles", 10))
-        n_green = int(self._scfg(
-            "recovery_green", "martingale_recovery_green", 5))
+            "recovery_candles", "martingale_recovery_candles", 3))
+        n_in_favor = int(self._scfg(
+            "recovery_in_favor", "martingale_recovery_in_favor", 2))
 
         # Get a token_id to sample — use the current window's market
         slug = self._generate_slug()
@@ -3721,10 +3731,13 @@ class MartingaleBot(threading.Thread):
         if self._recovery_candle_ts == 0 or (now - self._recovery_candle_ts) >= interval:
             # Close the previous candle if one was open
             if self._recovery_candle_open is not None and self._recovery_candle_ts > 0:
+                is_green = price >= self._recovery_candle_open
+                favorable = is_green if direction == "Up" else not is_green
                 candle = {
                     "open": self._recovery_candle_open,
                     "close": price,
-                    "green": price >= self._recovery_candle_open,
+                    "green": is_green,
+                    "favorable": favorable,
                     "ts": self._recovery_candle_ts,
                 }
                 self._recovery_candles.append(candle)
@@ -3732,18 +3745,21 @@ class MartingaleBot(threading.Thread):
                 self._recovery_candles = self._recovery_candles[-n_candles:]
                 self._save_state()
 
-                green_count = sum(1 for c in self._recovery_candles if c["green"])
+                fav_count = sum(1 for c in self._recovery_candles
+                                if c.get("favorable", c.get("green")))
                 total = len(self._recovery_candles)
-                color = "GREEN" if candle["green"] else "RED"
+                color = "GREEN" if is_green else "RED"
+                fav_label = "FAVORABLE" if favorable else "UNFAVORABLE"
                 self.logger.info(
-                    "MARTINGALE [%s] recovery candle: %s (%.4f → %.4f) "
-                    "— %d/%d green (%d needed from %d candles)",
-                    self.strategy_name, color, candle["open"], candle["close"],
-                    green_count, total, n_green, n_candles,
+                    "MARTINGALE [%s] recovery candle: %s %s (%.4f → %.4f) "
+                    "— %d/%d in favor (%d needed from %d candles)",
+                    self.strategy_name, color, fav_label,
+                    candle["open"], candle["close"],
+                    fav_count, total, n_in_favor, n_candles,
                 )
 
                 # Check recovery condition
-                if total >= n_candles and green_count >= n_green:
+                if total >= n_candles and fav_count >= n_in_favor:
                     return True
 
             # Open a new candle
@@ -3760,7 +3776,8 @@ class MartingaleBot(threading.Thread):
             mins = int(delta.total_seconds() // 60)
             paused_dur = f" (paused for {mins}m)"
 
-        green_count = sum(1 for c in self._recovery_candles if c["green"])
+        fav_count = sum(1 for c in self._recovery_candles
+                        if c.get("favorable", c.get("green")))
         total = len(self._recovery_candles)
 
         self._streak_paused = False
@@ -3773,7 +3790,7 @@ class MartingaleBot(threading.Thread):
 
         msg = (
             f"MARTINGALE [{self.strategy_name}] RESUMED: recovery confirmed "
-            f"({green_count}/{total} green candles){paused_dur} "
+            f"({fav_count}/{total} in favor){paused_dur} "
             f"— next bet=${self.current_bet:.2f}"
         )
         self.logger.info(msg)
@@ -3800,13 +3817,13 @@ class MartingaleBot(threading.Thread):
             self._recovery_candle_ts = 0
             self._save_state()
             n_candles = int(self._scfg(
-                "recovery_candles", "martingale_recovery_candles", 10))
+                "recovery_candles", "martingale_recovery_candles", 3))
             n_green = int(self._scfg(
-                "recovery_green", "martingale_recovery_green", 5))
+                "recovery_in_favor", "martingale_recovery_in_favor", 2))
             msg = (
                 f"MARTINGALE [{self.strategy_name}] PAUSED: max streak of "
                 f"{max_streak} losses reached — waiting for {n_green}/{n_candles} "
-                f"green candles before resuming"
+                f"candles in favor before resuming"
             )
             self.logger.warning(msg)
             if self.notify_callback:
@@ -4294,10 +4311,15 @@ class MartingaleBot(threading.Thread):
         self._confirm_candle_open = None
         self._confirm_candle_ts = 0
         self._confirm_waiting = True
+        n_candles = int(self._scfg(
+            "recovery_candles", "martingale_recovery_candles", 3))
+        n_favor = int(self._scfg(
+            "recovery_in_favor", "martingale_recovery_in_favor", 2))
         self.logger.info(
-            "MARTINGALE [%s]: waiting for 2/3 candle confirmation "
+            "MARTINGALE [%s]: waiting for %d/%d candle confirmation "
             "before recovery bet (streak %d, next $%.2f)",
-            self.strategy_name, self.consecutive_losses, self.current_bet,
+            self.strategy_name, n_favor, n_candles,
+            self.consecutive_losses, self.current_bet,
         )
         self._save_state()
 
@@ -9057,14 +9079,14 @@ class MartingaleGUI:
              "Latest point (in seconds after window start) at which a bet can be placed. "
              "Prevents entering too late when the outcome is nearly decided.",
              "Don\u2019t bet after this many sec"),
-            ("Recovery Candles:", "mart_e_recovery_candles", 10,
+            ("Recovery Candles:", "mart_e_recovery_candles", 3,
              "Number of candles to evaluate when deciding whether to resume "
-             "after a max-streak pause. More candles = more confirmation.",
-             "Candles to sample after pause"),
-            ("Recovery Green:", "mart_e_recovery_green", 10,
-             "How many of the recovery candles must be green (close >= open) "
-             "before the bot resumes betting.",
-             "Green candles needed to resume"),
+             "after a loss. More candles = more confirmation.",
+             "Candles to sample after loss"),
+            ("Recovery In Favor:", "mart_e_recovery_in_favor", 3,
+             "How many of the recovery candles must be in our favor "
+             "(green for Up, red for Down) before placing the recovery bet.",
+             "Favorable candles needed to resume"),
             ("Recovery Interval (sec):", "mart_e_recovery_interval", 10,
              "Duration of each recovery candle in seconds. "
              "Controls how long the bot waits between price samples.",
@@ -9144,8 +9166,8 @@ class MartingaleGUI:
             "mart_e_price_min": ("price_min", 0.40),
             "mart_e_price_max": ("price_max", 0.55),
             "mart_e_max_entry": ("max_entry_seconds", 60),
-            "mart_e_recovery_candles": ("recovery_candles", 10),
-            "mart_e_recovery_green": ("recovery_green", 5),
+            "mart_e_recovery_candles": ("recovery_candles", 3),
+            "mart_e_recovery_in_favor": ("recovery_in_favor", 2),
             "mart_e_recovery_interval": ("recovery_interval", 300),
         }
         for attr, (key, default) in mapping.items():
@@ -9176,7 +9198,7 @@ class MartingaleGUI:
             ("mart_e_price_max", "price_max", float),
             ("mart_e_max_entry", "max_entry_seconds", int),
             ("mart_e_recovery_candles", "recovery_candles", int),
-            ("mart_e_recovery_green", "recovery_green", int),
+            ("mart_e_recovery_in_favor", "recovery_in_favor", int),
             ("mart_e_recovery_interval", "recovery_interval", int),
         ]:
             try:
@@ -9220,8 +9242,8 @@ class MartingaleGUI:
             "price_min": 0.40,
             "price_max": 0.55,
             "max_entry_seconds": 60,
-            "recovery_candles": 10,
-            "recovery_green": 5,
+            "recovery_candles": 3,
+            "recovery_in_favor": 2,
             "recovery_interval": 300,
         })
         self._mart_refresh_listbox()
