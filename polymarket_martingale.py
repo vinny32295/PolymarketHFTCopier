@@ -4887,18 +4887,19 @@ class MartingaleBot(threading.Thread):
         return None
 
     def _normalize_bet_for_slippage(self, base_bet, ask_price):
-        """Adjust bet size upward when ask exceeds fair price so we buy
-        the same number of shares as if buying at fair price.
+        """Adjust bet size upward when ask exceeds fair price so the WIN
+        PROFIT stays constant regardless of slippage.
 
-        Target shares = base_bet / fair.  When ask > fair the cost is
-        higher per share, so we increase the bet to:
-            adjusted = expected_shares × ask_price
+        Profit = shares × (1 - ask_price).  To preserve profit = base_bet:
+            shares = base_bet / (1 - ask_price)
+            cost   = shares × ask_price
 
         Never adjusts *downward* — if the ask is at or below fair, the
         original bet is returned unchanged (the caller keeps the bonus
         profit from favorable pricing).
 
-        Returns ``(adjusted_bet, expected_shares)``.
+        Returns ``(adjusted_bet, expected_shares)`` where *expected_shares*
+        is the share count needed to preserve the target profit.
         """
         normalize = self._scfg(
             "normalize_slippage", "martingale_normalize_slippage", True,
@@ -4909,16 +4910,17 @@ class MartingaleBot(threading.Thread):
         expected_shares = base_bet / fair
         if not normalize or ask_price <= fair:
             return base_bet, expected_shares
-        # Share-preserving: buy the same number of shares we would at
-        # fair price, just pay the higher ask.  This avoids the runaway
-        # cost inflation of the old profit-preserving formula.
+        # Profit-preserving formula: shares = base_bet / (1 - ask_price)
+        # so that shares × (1 - ask_price) = base_bet regardless of ask.
+        expected_shares = base_bet / (1 - ask_price)
         adjusted = round(expected_shares * ask_price, 2)
         if adjusted > base_bet:
             self.logger.info(
                 "MARTINGALE [%s]: slippage normalization — ask $%.4f > fair "
-                "$%.4f, adjusting $%.2f -> $%.2f to get %.1f shares",
+                "$%.4f, overbetting $%.2f -> $%.2f to target %.1f shares "
+                "(profit-preserving: $%.2f win profit)",
                 self.strategy_name, ask_price, fair,
-                base_bet, adjusted, expected_shares,
+                base_bet, adjusted, expected_shares, base_bet,
             )
         return adjusted, expected_shares
 
