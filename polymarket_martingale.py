@@ -3124,6 +3124,28 @@ class MartingaleBot(threading.Thread):
                         "recovery_in_favor", "martingale_recovery_in_favor", 2)),
                 )
 
+            # State migration: if saved state has _confirm_waiting but
+            # streak already hit max_streak, upgrade to _streak_paused so
+            # we skip the redundant double candle-wait on restart.
+            max_streak = int(self._scfg("max_streak", "martingale_max_streak", 0))
+            if (max_streak > 0
+                    and self.consecutive_losses >= max_streak
+                    and self._confirm_waiting
+                    and not self._streak_paused):
+                self.logger.info(
+                    "MARTINGALE [%s]: upgrading stale confirm_waiting to "
+                    "streak_paused (streak %d >= max %d)",
+                    self.strategy_name, self.consecutive_losses, max_streak,
+                )
+                self._confirm_waiting = False
+                self._confirm_candles = []
+                self._streak_paused = True
+                self._streak_paused_at = datetime.now()
+                self._recovery_candles = []
+                self._recovery_candle_open = None
+                self._recovery_candle_ts = 0
+                self._save_state()
+
             self.logger.info(
                 "Loaded martingale state: bet=$%.2f, streak=%d, pnl=$%.4f, "
                 "dir=%s, last_window_ts=%d, missed=%d%s",
