@@ -3164,6 +3164,8 @@ class MartingaleBot(threading.Thread):
         self._missed_windows = []       # windows skipped due to price/book/balance
         self._phantom_fills = 0         # phantom fills detected this session
         self._deferred_phantom = None   # pending deferred phantom fill check
+        self._last_trades_audit = 0     # epoch of last CLOB trades audit
+        self._known_trade_ids = set()   # trade IDs already processed (dedup)
 
         # Streak-pause recovery state
         self._streak_paused = False     # True when max_streak hit, waiting for recovery
@@ -3253,6 +3255,7 @@ class MartingaleBot(threading.Thread):
             "active_bet": self._active_bet,
             "last_window_ts": self._last_window_ts,
             "missed_windows": self._missed_windows[-500:],  # cap at 500
+            "deferred_phantom": self._deferred_phantom,
             "streak_paused": self._streak_paused,
             "streak_just_resumed": self._streak_just_resumed,
             "streak_paused_at": self._streak_paused_at.isoformat() if self._streak_paused_at else None,
@@ -3288,6 +3291,7 @@ class MartingaleBot(threading.Thread):
             self._active_bet = state.get("active_bet")
             self._last_window_ts = int(state.get("last_window_ts", 0))
             self._missed_windows = state.get("missed_windows", [])
+            self._deferred_phantom = state.get("deferred_phantom")
             self._streak_paused = bool(state.get("streak_paused", False))
             self._streak_just_resumed = bool(state.get("streak_just_resumed", False))
             paused_at_str = state.get("streak_paused_at")
@@ -3436,8 +3440,93 @@ class MartingaleBot(threading.Thread):
                             self._active_bet = None
                             self._save_state()
 
+            # Resolve persisted deferred phantom — the bot crashed or
+            # restarted before the 10-second deferred check could run.
+            # Check on-chain now so we don't lose the fill.
+            if self._deferred_phantom and not self._active_bet:
+                dp = self._deferred_phantom
+                elapsed = time.time() - dp.get("scheduled_at", 0)
+                self.logger.warning(
+                    "MARTINGALE [%s]: STARTUP — found persisted deferred "
+                    "phantom from %.0fs ago — checking on-chain now",
+                    self.strategy_name, elapsed,
+                )
+                self._resolve_deferred_phantom(dp)
+                self._deferred_phantom = None
+                self._save_state()
+
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             pass
+
+    def _startup_balance_audit(self):
+        """Check for untracked on-chain positions from missed/phantom fills.
+
+        Called once at the start of ``run()`` to catch fills that happened
+        while the bot was down.  Queries recent CLOB trades for this wallet
+        and checks if any match missed_windows entries that were never
+        reconciled.  If found, creates ``_active_bet`` so the normal
+        resolution path handles them, or immediately resolves if the market
+        has already settled.
+        """
+        if self._active_bet:
+            return  # already tracking something
+
+        # Check all missed_windows that have a token_id but were never
+        # reconciled (no corresponding bet was logged).
+        missed_with_tokens = [
+            mw for mw in self._missed_windows
+            if mw.get("token_id") and not mw.get("_reconciled")
+        ]
+        if not missed_with_tokens:
+            return
+
+        self.logger.info(
+            "MARTINGALE [%s]: startup balance audit — checking %d missed "
+            "windows with token_ids",
+            self.strategy_name, len(missed_with_tokens),
+        )
+
+        for mw in missed_with_tokens:
+            token_id = mw["token_id"]
+            neg_risk = mw.get("neg_risk", False)
+            try:
+                balance = self._check_phantom_fill(token_id, neg_risk=neg_risk)
+                if balance > 0:
+                    # We have tokens on-chain from a missed window!
+                    shares = float(Decimal(balance) / Decimal("1000000"))
+                    ask_price = mw.get("ask_price", 0.50)
+                    cost = round(shares * ask_price, 6)
+                    self.logger.warning(
+                        "MARTINGALE [%s]: STARTUP AUDIT — found %.1f shares "
+                        "on-chain for missed window %d (token %s) — "
+                        "this was a phantom fill!",
+                        self.strategy_name, shares,
+                        mw.get("window_ts", 0), token_id[:16] + "...",
+                    )
+                    if self.notify_callback:
+                        try:
+                            self.notify_callback(
+                                f"{self.strategy_name} STARTUP: found phantom "
+                                f"fill — {shares:.1f} shares on-chain from "
+                                f"missed window {mw.get('window_ts', 0)}"
+                            )
+                        except Exception:
+                            pass
+                    # Mark reconciled so we don't re-check every restart
+                    mw["_reconciled"] = True
+                    mw["_reconciled_at"] = datetime.now().isoformat()
+                    mw["_reconciled_shares"] = shares
+                    mw["_reconciled_cost"] = cost
+                    self._save_state()
+
+                    # Try to resolve immediately if market has settled
+                    # (use handle_late_phantom_fill logic)
+                    # Otherwise we'll catch it via the portfolio scanner
+            except Exception as exc:
+                self.logger.debug(
+                    "MARTINGALE [%s]: startup audit failed for token %s: %s",
+                    self.strategy_name, token_id[:16] + "...", exc,
+                )
 
     def reset_state(self):
         """Wipe persisted state and reset to defaults."""
@@ -4789,12 +4878,52 @@ class MartingaleBot(threading.Thread):
         Returns True if the fill was accepted, False if the token_id
         was not recognised or already tracked.
         """
-        # Only accept if the token_id appears in our missed_windows
+        # Check if the token_id appears in our missed_windows
         matched = None
         for mw in self._missed_windows:
             if mw.get("token_id") == token_id:
                 matched = mw
                 break
+
+        # Fallback: also check missed windows where token_id was not
+        # captured (e.g. error occurred before _skip_token_id was set).
+        # Match by window timestamp proximity and market name instead.
+        if not matched and market_name:
+            slug_base = self._scfg("slug_base", "martingale_slug_base", "")
+            if slug_base and slug_base in (market_name or ""):
+                # Check if any recent missed window (last 30 min) has no
+                # token_id — this is likely the phantom fill for it.
+                now = time.time()
+                for mw in reversed(self._missed_windows):
+                    if mw.get("token_id"):
+                        continue  # already has a token_id — skip
+                    if mw.get("_reconciled"):
+                        continue
+                    mw_ts = mw.get("window_ts", 0)
+                    # Accept if within 30 minutes
+                    if mw_ts > 0 and abs(now - mw_ts) < 1800:
+                        self.logger.warning(
+                            "MARTINGALE [%s]: BROADENED MATCH — token %s "
+                            "matched missed window %d by market name '%s' "
+                            "(no token_id was recorded)",
+                            self.strategy_name, token_id[:16] + "...",
+                            mw_ts, market_name,
+                        )
+                        matched = mw
+                        # Backfill the token_id for future dedup
+                        mw["token_id"] = token_id
+                        break
+
+        # Final fallback: check if any missed window has a _reconciled
+        # marker with matching token_id from the startup audit
+        if not matched:
+            for mw in self._missed_windows:
+                if (mw.get("_reconciled")
+                        and mw.get("token_id") == token_id
+                        and not mw.get("_late_resolved")):
+                    matched = mw
+                    break
+
         if not matched:
             return False
 
@@ -4831,6 +4960,11 @@ class MartingaleBot(threading.Thread):
             self._handle_win(bet)
         else:
             self._handle_loss(bet)
+
+        # Mark this missed window as late-resolved so we don't process it again
+        matched["_late_resolved"] = True
+        matched["_late_resolved_at"] = datetime.now().isoformat()
+        self._save_state()
         return True
 
     def _log_bet(self, bet, won, profit):
@@ -5069,6 +5203,152 @@ class MartingaleBot(threading.Thread):
             }
         return None
 
+    def _audit_recent_trades(self):
+        """Periodically check CLOB trades API for untracked fills.
+
+        If a buy trade is found that we don't have in _active_bet and
+        wasn't logged, it's a phantom fill that slipped through all other
+        detection.  We create an _active_bet for it so the normal
+        resolution path can handle win/loss and update martingale state.
+        """
+        if self._active_bet:
+            return  # already tracking a bet
+
+        try:
+            addr = self.clob_client.address
+            recent = self.clob_client.get_trades_for_address(addr, limit=10)
+        except Exception:
+            return
+
+        if not recent:
+            return
+
+        slug_base = self._scfg("slug_base", "martingale_slug_base", "")
+        window = int(self._scfg("window", "martingale_window", 300))
+        now = time.time()
+
+        for trade in (recent or []):
+            trade_id = str(trade.get("id") or trade.get("tradeID") or "")
+            if trade_id and trade_id in self._known_trade_ids:
+                continue
+
+            # Only care about BUY trades (our bets)
+            side = str(trade.get("side") or "").upper()
+            if side != "BUY":
+                if trade_id:
+                    self._known_trade_ids.add(trade_id)
+                continue
+
+            # Check recency — only look at trades from the last 2 windows
+            rt_ts = trade.get("match_time") or trade.get("timestamp") or ""
+            try:
+                if isinstance(rt_ts, (int, float)):
+                    rt_epoch = float(rt_ts)
+                else:
+                    from datetime import timezone
+                    rt_epoch = datetime.fromisoformat(
+                        str(rt_ts).replace("Z", "+00:00")
+                    ).timestamp()
+            except Exception:
+                rt_epoch = 0
+            if rt_epoch and (now - rt_epoch) > window * 2:
+                if trade_id:
+                    self._known_trade_ids.add(trade_id)
+                continue
+
+            token_id = str(trade.get("asset_id") or trade.get("token_id") or "")
+            if not token_id:
+                if trade_id:
+                    self._known_trade_ids.add(trade_id)
+                continue
+
+            # Check if this token is from a missed window we know about
+            is_missed = any(
+                mw.get("token_id") == token_id
+                for mw in self._missed_windows
+            )
+
+            if not is_missed:
+                # Also check if it matches our slug pattern
+                market_slug = str(trade.get("market") or trade.get("slug") or "")
+                if slug_base and slug_base not in market_slug:
+                    if trade_id:
+                        self._known_trade_ids.add(trade_id)
+                    continue
+
+            # This is a trade for our strategy that we don't have tracked!
+            rt_size = float(trade.get("size") or 0)
+            rt_price = float(trade.get("price") or 0.50)
+            if rt_size <= 0:
+                if trade_id:
+                    self._known_trade_ids.add(trade_id)
+                continue
+
+            actual_cost = round(rt_size * rt_price, 6)
+            self.logger.warning(
+                "MARTINGALE [%s]: AUDIT — found untracked BUY trade: "
+                "%.1f shares @ $%.4f ($%.2f) token %s — "
+                "this is a phantom fill that bypassed detection!",
+                self.strategy_name, rt_size, rt_price, actual_cost,
+                token_id[:16] + "...",
+            )
+
+            if self.notify_callback:
+                try:
+                    self.notify_callback(
+                        f"{self.strategy_name} AUDIT ALERT: untracked "
+                        f"phantom fill detected — {rt_size:.1f} shares "
+                        f"@ ${rt_price:.4f} (${actual_cost:.2f}). "
+                        f"Martingale state will be corrected."
+                    )
+                except Exception:
+                    pass
+
+            # Find the corresponding missed window to get bet_would_be
+            matched_mw = None
+            for mw in self._missed_windows:
+                if mw.get("token_id") == token_id and not mw.get("_late_resolved"):
+                    matched_mw = mw
+                    break
+
+            # Build _active_bet so normal resolution handles win/loss
+            fill_price = rt_price
+            slippage = round(0.50 - fill_price, 6)
+            slippage_usdc = round(slippage * rt_size, 6)
+
+            self._active_bet = {
+                "slug": self.strategy_name,
+                "condition_id": trade.get("condition_id", ""),
+                "token_id": token_id,
+                "opposite_token_id": "",  # will be resolved during check
+                "direction": self.direction,
+                "bet_size": matched_mw.get("bet_would_be", actual_cost) if matched_mw else self.current_bet,
+                "order_bet": actual_cost,
+                "expected_shares": rt_size,
+                "fill_price": fill_price,
+                "shares": rt_size,
+                "cost": actual_cost,
+                "slippage": slippage,
+                "slippage_usdc": slippage_usdc,
+                "question": self.strategy_name,
+                "window_end": int(rt_epoch) + window if rt_epoch else int(now),
+                "ts": datetime.now().isoformat(),
+                "_audit_phantom": True,
+            }
+            self._save_state()
+            self.logger.warning(
+                "MARTINGALE [%s]: AUDIT — created active_bet from "
+                "untracked fill — will resolve via normal path",
+                self.strategy_name,
+            )
+            if trade_id:
+                self._known_trade_ids.add(trade_id)
+            break  # handle one at a time
+
+        # Cap known_trade_ids to prevent unbounded growth
+        if len(self._known_trade_ids) > 1000:
+            self._known_trade_ids = set(list(self._known_trade_ids)[-500:])
+
     def _normalize_bet_for_slippage(self, base_bet, ask_price):
         """Adjust bet size upward when ask exceeds fair price so the WIN
         PROFIT stays constant regardless of slippage.
@@ -5283,6 +5563,23 @@ class MartingaleBot(threading.Thread):
                 if elapsed >= 10:
                     self._resolve_deferred_phantom(dp)
                     self._deferred_phantom = None
+                    self._save_state()
+
+            # Periodic CLOB trades audit — every 5 minutes, check recent
+            # trades for this wallet to catch fills that bypassed all
+            # other detection (phantom fills not caught by immediate or
+            # deferred checks).
+            now_ts = time.time()
+            if (not self._active_bet
+                    and now_ts - self._last_trades_audit >= 300):
+                self._last_trades_audit = now_ts
+                try:
+                    self._audit_recent_trades()
+                except Exception as exc:
+                    self.logger.debug(
+                        "MARTINGALE [%s]: trades audit failed: %s",
+                        self.strategy_name, exc,
+                    )
 
             # While paused for streak recovery, sample candles instead of betting
             if self._streak_paused:
@@ -5297,6 +5594,15 @@ class MartingaleBot(threading.Thread):
             return placed  # fast poll until placed, then slow poll
 
     def run(self):
+        # Startup: audit on-chain balances for untracked phantom fills
+        try:
+            self._startup_balance_audit()
+        except Exception as exc:
+            self.logger.warning(
+                "MARTINGALE [%s]: startup balance audit failed (non-fatal): %s",
+                self.strategy_name, exc,
+            )
+
         self.logger.info(
             "Martingale bot [%s] started — direction=%s, bet=$%.2f, streak=%d",
             self.strategy_name, self.direction, self.current_bet,

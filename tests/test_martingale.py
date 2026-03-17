@@ -1857,6 +1857,17 @@ class TestMartingaleBot(unittest.TestCase):
         mb._miss_recorded_for_ts = 0
         mb._missed_windows = []
         mb._phantom_fills = 0
+        mb._deferred_phantom = None
+        mb._last_trades_audit = 0
+        mb._known_trade_ids = set()
+        mb.cumulative_losses = 0.0
+        mb._skip_token_id = None
+        mb._streak_just_resumed = False
+        mb._confirm_candles = []
+        mb._confirm_candle_open = None
+        mb._confirm_candle_ts = 0
+        mb._confirm_waiting = False
+        mb.executor = None
         return mb
 
     # -- slug generation --
@@ -2408,24 +2419,24 @@ class TestMartingaleBot(unittest.TestCase):
         # P&L: -5 -10 + (40-20) = +5
         self.assertAlmostEqual(mb.session_pnl, 5.0)
 
-    def test_martingale_geometric_ignores_cost_drift(self):
-        """Bet size must follow start_bet × 2^n even when exchange bumps cost."""
+    def test_martingale_cumulative_loss_bet_sizing(self):
+        """Bet size = cumulative_losses + start_bet to recover all actual losses."""
         mb = self._make_bot()
         # start_bet = 5.0, but exchange bumped actual cost to 5.20
         mb._handle_loss({
             "direction": "Up", "shares": 10.0, "cost": 5.20,
             "bet_size": 5.0, "question": "BTC?", "token_id": "t1",
         })
-        # Should be 5.0 × 2^1 = 10.0, NOT 5.20 × 2 = 10.40
-        self.assertEqual(mb.current_bet, 10.0)
+        # cumulative_losses = 5.20, next bet = 5.20 + 5.0 = 10.20
+        self.assertEqual(mb.current_bet, 10.20)
 
         # Second loss: exchange bumps cost again
         mb._handle_loss({
             "direction": "Up", "shares": 20.0, "cost": 10.40,
-            "bet_size": 10.0, "question": "BTC?", "token_id": "t1",
+            "bet_size": 10.20, "question": "BTC?", "token_id": "t1",
         })
-        # Should be 5.0 × 2^2 = 20.0, NOT 10.40 × 2 = 20.80
-        self.assertEqual(mb.current_bet, 20.0)
+        # cumulative_losses = 5.20 + 10.40 = 15.60, next = 15.60 + 5.0 = 20.60
+        self.assertEqual(mb.current_bet, 20.60)
 
     # -- resolution detection --
 
