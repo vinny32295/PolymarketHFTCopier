@@ -3168,22 +3168,57 @@ class MartingaleBot(threading.Thread):
                 " [PAUSED — waiting for recovery]" if self._streak_paused else "",
             )
 
-            # Discard stale active bets from a previous session.
-            # If the bet's window ended more than 2 windows ago, it is
-            # from an old run that was stopped before resolution.  Do NOT
-            # treat it as a timeout loss — just drop it.
+            # Resolve stale active bets from a previous session.
+            # If the bet's window ended more than 2 windows ago, try to
+            # resolve it via LTP/orderbook before dropping.  A stale bet
+            # that won should reset the streak; one that lost should be
+            # counted properly.
             if self._active_bet:
                 window = int(self._scfg("window", "martingale_window", 300))
                 now = int(time.time())
                 window_end = int(self._active_bet.get("window_end", 0))
                 if window_end and now > window_end + window * 2:
-                    self.logger.warning(
-                        "MARTINGALE: discarding stale active bet from "
-                        "window ending %d (%ds ago) — will NOT count as loss",
+                    self.logger.info(
+                        "MARTINGALE: stale active bet from window ending "
+                        "%d (%ds ago) — attempting late resolution",
                         window_end, now - window_end,
                     )
-                    self._active_bet = None
-                    self._save_state()
+                    # Try orderbook/LTP resolution
+                    ob_result = self._check_resolution_orderbook(
+                        self._active_bet)
+                    if ob_result is not None:
+                        if ob_result:
+                            self.logger.info(
+                                "MARTINGALE: stale bet resolved as WIN — "
+                                "resetting streak")
+                            self._handle_win(self._active_bet)
+                        else:
+                            self.logger.info(
+                                "MARTINGALE: stale bet resolved as LOSS")
+                            self._handle_loss(self._active_bet)
+                    else:
+                        # Try Gamma API
+                        resolved, won = self._check_resolution(
+                            self._active_bet["condition_id"],
+                            self._active_bet["direction"],
+                        )
+                        if resolved:
+                            if won:
+                                self.logger.info(
+                                    "MARTINGALE: stale bet resolved as WIN "
+                                    "(Gamma) — resetting streak")
+                                self._handle_win(self._active_bet)
+                            else:
+                                self.logger.info(
+                                    "MARTINGALE: stale bet resolved as LOSS "
+                                    "(Gamma)")
+                                self._handle_loss(self._active_bet)
+                        else:
+                            self.logger.warning(
+                                "MARTINGALE: stale bet unresolvable — "
+                                "discarding (will NOT count as loss)")
+                            self._active_bet = None
+                            self._save_state()
 
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             pass
