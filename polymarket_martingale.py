@@ -3785,12 +3785,15 @@ class MartingaleBot(threading.Thread):
         self._recovery_candles = []
         self._recovery_candle_open = None
         self._recovery_candle_ts = 0
-        self.consecutive_losses = 0
+        # Keep consecutive_losses and current_bet — the streak pause
+        # waits for favorable conditions, it does NOT forgive losses.
+        # The next bet must still be sized to recover all prior losses.
         self._save_state()
 
         msg = (
             f"MARTINGALE [{self.strategy_name}] RESUMED: recovery confirmed "
             f"({fav_count}/{total} in favor){paused_dur} "
+            f"streak={self.consecutive_losses}, "
             f"— next bet=${self.current_bet:.2f}"
         )
         self.logger.info(msg)
