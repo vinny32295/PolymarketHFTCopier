@@ -3636,161 +3636,252 @@ class MartingaleBot(threading.Thread):
     # -- pre-bet candle confirmation (recovery) --------------------------------
 
     def _check_confirm_candles(self):
-        """Sample price and build candles to confirm direction before a
-        recovery bet.  Returns True when N out of M candles are favorable
-        (green for Up, red for Down).  Uses the recovery_interval for
-        candle duration and recovery_candles/recovery_in_favor for thresholds.
+        """Watch actual window outcomes to confirm direction before a
+        recovery bet.  Returns True when N out of M windows resolved
+        favorably (win for our direction).
 
         Called each cycle while ``_confirm_waiting`` is True.
         """
-        interval = int(self._scfg(
-            "recovery_interval", "martingale_recovery_interval", 300))
         n_total = int(self._scfg(
             "recovery_candles", "martingale_recovery_candles", 3))
         n_needed = int(self._scfg(
             "recovery_in_favor", "martingale_recovery_in_favor", 2))
+        window = int(self._scfg("window", "martingale_window", 300))
+        direction = self._scfg(
+            "direction", "martingale_direction", self.direction)
 
-        # Get current price from the orderbook
-        slug = self._generate_slug()
-        market = self._fetch_market(slug)
-        if not market:
+        current_window_ts = self._get_window_ts(window)
+
+        # First call — start tracking the current window
+        if self._confirm_candle_ts == 0:
+            self._confirm_candle_ts = current_window_ts
+            self._confirm_candle_open = None  # not used in window mode
+            self.logger.info(
+                "MARTINGALE [%s]: confirm watching window %d for %s outcome",
+                self.strategy_name, current_window_ts, direction,
+            )
             return False
 
-        direction = self._scfg("direction", "martingale_direction", self.direction)
+        # Still in the same window — wait for it to end
+        if current_window_ts <= self._confirm_candle_ts:
+            return False
+
+        # New window started — try to resolve the previous one
+        prev_window_ts = self._confirm_candle_ts
+        base = self._scfg(
+            "slug_base", "martingale_slug_base", "btc-updown-5m")
+        prev_slug = f"{base}-{prev_window_ts}"
+        market = self._fetch_market(prev_slug)
+        if not market:
+            if current_window_ts > prev_window_ts + window * 2:
+                self.logger.warning(
+                    "MARTINGALE [%s]: confirm window %d — no market data "
+                    "after timeout, skipping",
+                    self.strategy_name, prev_window_ts,
+                )
+                self._confirm_candle_ts = current_window_ts
+            return False
+
         token_id = (
             market["up_token"] if direction == "Up"
             else market["down_token"]
         )
-        price, _ = self._get_best_ask(token_id)
-        if not price or price <= 0:
+
+        # Try to determine outcome: LTP first, then orderbook ask
+        won = None
+        try:
+            ltp = self.clob_client.get_last_trade_price(token_id)
+            if ltp is not None:
+                if ltp >= 0.95:
+                    won = True
+                elif ltp <= 0.05:
+                    won = False
+        except Exception:
+            pass
+
+        if won is None:
+            ask_price, _ = self._get_best_ask(token_id)
+            if ask_price is not None:
+                if ask_price >= 0.95:
+                    won = True
+                elif ask_price <= 0.05:
+                    won = False
+
+        if won is None:
+            if current_window_ts > prev_window_ts + window * 2:
+                self.logger.warning(
+                    "MARTINGALE [%s]: confirm window %d inconclusive "
+                    "after timeout — skipping",
+                    self.strategy_name, prev_window_ts,
+                )
+                self._confirm_candle_ts = current_window_ts
             return False
 
-        now = int(time.time())
+        # Record the window outcome
+        favorable = won
+        candle = {
+            "window_ts": prev_window_ts,
+            "won": won,
+            "favorable": favorable,
+            "ts": int(time.time()),
+        }
+        self._confirm_candles.append(candle)
+        self._confirm_candles = self._confirm_candles[-n_total:]
+        self._save_state()
 
-        # Start a new candle or close the current one
-        if self._confirm_candle_ts == 0 or (now - self._confirm_candle_ts) >= interval:
-            # Close the previous candle if one was open
-            if self._confirm_candle_open is not None and self._confirm_candle_ts > 0:
-                is_green = price >= self._confirm_candle_open
-                # For Up bets: favorable = green candle
-                # For Down bets: favorable = red candle
-                favorable = is_green if direction == "Up" else not is_green
-                candle = {
-                    "open": self._confirm_candle_open,
-                    "close": price,
-                    "green": is_green,
-                    "favorable": favorable,
-                    "ts": self._confirm_candle_ts,
-                }
-                self._confirm_candles.append(candle)
-                self._confirm_candles = self._confirm_candles[-n_total:]
-                self._save_state()
+        fav_count = sum(1 for c in self._confirm_candles
+                        if c.get("favorable"))
+        total = len(self._confirm_candles)
+        outcome = "WIN" if won else "LOSS"
 
-                color = "GREEN" if is_green else "RED"
-                fav_count = sum(1 for c in self._confirm_candles if c.get("favorable"))
-                total = len(self._confirm_candles)
-                self.logger.info(
-                    "MARTINGALE [%s] confirm candle: %s (%.4f → %.4f) "
-                    "— %d/%d favorable (%d needed from %d)",
-                    self.strategy_name, color, candle["open"], candle["close"],
-                    fav_count, total, n_needed, n_total,
-                )
+        self.logger.info(
+            "MARTINGALE [%s] confirm window: %s (window %d) "
+            "— %d/%d favorable (%d needed from %d)",
+            self.strategy_name, outcome, prev_window_ts,
+            fav_count, total, n_needed, n_total,
+        )
 
-                # Check if confirmation is met
-                if total >= n_total and fav_count >= n_needed:
-                    self.logger.info(
-                        "MARTINGALE [%s]: candle confirmation met — "
-                        "%d/%d favorable, proceeding with recovery bet $%.2f",
-                        self.strategy_name, fav_count, total,
-                        self.current_bet,
-                    )
-                    self._confirm_waiting = False
-                    self._confirm_candles = []
-                    self._confirm_candle_open = None
-                    self._confirm_candle_ts = 0
-                    self._save_state()
-                    return True
+        # Move to tracking the current window
+        self._confirm_candle_ts = current_window_ts
 
-            # Open a new candle
-            self._confirm_candle_open = price
-            self._confirm_candle_ts = now
+        # Check if confirmation is met
+        if total >= n_total and fav_count >= n_needed:
+            self.logger.info(
+                "MARTINGALE [%s]: candle confirmation met — "
+                "%d/%d favorable, proceeding with recovery bet $%.2f",
+                self.strategy_name, fav_count, total,
+                self.current_bet,
+            )
+            self._confirm_waiting = False
+            self._confirm_candles = []
+            self._confirm_candle_open = None
+            self._confirm_candle_ts = 0
+            self._save_state()
+            return True
 
         return False
 
     # -- streak recovery (candle sampling) ------------------------------------
 
     def _check_streak_recovery(self):
-        """Sample price to build candles and check if market has recovered.
+        """Watch actual window outcomes to confirm market recovery.
 
         Called each cycle while ``_streak_paused`` is True.  Returns True
-        when the recovery condition is met (N out of M candles are in our
-        favor), meaning the bot should resume trading.
+        when N out of M consecutive windows resolved in our favor.
 
-        A "candle" is simply the price at the start and end of each
-        *recovery_interval* period.  Favorable = green for Up, red for Down.
+        Instead of sampling price candles (which are meaningless when a
+        binary window is already resolving), this tracks whether each
+        5-minute window actually resolved as a WIN or LOSS for our
+        direction.  This gives a genuine signal about market conditions.
         """
-        interval = int(self._scfg(
-            "recovery_interval", "martingale_recovery_interval", 300))
         n_candles = int(self._scfg(
             "recovery_candles", "martingale_recovery_candles", 3))
         n_in_favor = int(self._scfg(
             "recovery_in_favor", "martingale_recovery_in_favor", 2))
+        window = int(self._scfg("window", "martingale_window", 300))
+        direction = self._scfg(
+            "direction", "martingale_direction", self.direction)
 
-        # Get a token_id to sample — use the current window's market
-        slug = self._generate_slug()
-        market = self._fetch_market(slug)
+        current_window_ts = self._get_window_ts(window)
+
+        # First call — start tracking the current window
+        if self._recovery_candle_ts == 0:
+            self._recovery_candle_ts = current_window_ts
+            self._recovery_candle_open = None  # not used in window mode
+            self.logger.info(
+                "MARTINGALE [%s]: recovery watching window %d for %s outcome",
+                self.strategy_name, current_window_ts, direction,
+            )
+            return False
+
+        # Still in the same window — wait for it to end
+        if current_window_ts <= self._recovery_candle_ts:
+            return False
+
+        # New window started — try to resolve the previous one
+        prev_window_ts = self._recovery_candle_ts
+        base = self._scfg(
+            "slug_base", "martingale_slug_base", "btc-updown-5m")
+        prev_slug = f"{base}-{prev_window_ts}"
+        market = self._fetch_market(prev_slug)
         if not market:
-            return False  # can't sample yet
+            # Can't fetch market — if it's been too long, skip this window
+            if current_window_ts > prev_window_ts + window * 2:
+                self.logger.warning(
+                    "MARTINGALE [%s]: recovery window %d — no market data "
+                    "after timeout, skipping",
+                    self.strategy_name, prev_window_ts,
+                )
+                self._recovery_candle_ts = current_window_ts
+            return False
 
-        direction = self._scfg("direction", "martingale_direction", self.direction)
         token_id = (
             market["up_token"] if direction == "Up"
             else market["down_token"]
         )
-        price, _ = self._get_best_ask(token_id)
-        if not price or price <= 0:
-            return False  # no asks — can't sample
 
-        now = int(time.time())
+        # Try to determine outcome: LTP first, then orderbook ask
+        won = None
+        try:
+            ltp = self.clob_client.get_last_trade_price(token_id)
+            if ltp is not None:
+                if ltp >= 0.95:
+                    won = True
+                elif ltp <= 0.05:
+                    won = False
+        except Exception:
+            pass
 
-        # Start a new candle if none open or interval elapsed
-        if self._recovery_candle_ts == 0 or (now - self._recovery_candle_ts) >= interval:
-            # Close the previous candle if one was open
-            if self._recovery_candle_open is not None and self._recovery_candle_ts > 0:
-                is_green = price >= self._recovery_candle_open
-                favorable = is_green if direction == "Up" else not is_green
-                candle = {
-                    "open": self._recovery_candle_open,
-                    "close": price,
-                    "green": is_green,
-                    "favorable": favorable,
-                    "ts": self._recovery_candle_ts,
-                }
-                self._recovery_candles.append(candle)
-                # Keep only the last N candles
-                self._recovery_candles = self._recovery_candles[-n_candles:]
-                self._save_state()
+        if won is None:
+            ask_price, _ = self._get_best_ask(token_id)
+            if ask_price is not None:
+                if ask_price >= 0.95:
+                    won = True
+                elif ask_price <= 0.05:
+                    won = False
 
-                fav_count = sum(1 for c in self._recovery_candles
-                                if c.get("favorable", c.get("green")))
-                total = len(self._recovery_candles)
-                color = "GREEN" if is_green else "RED"
-                fav_label = "FAVORABLE" if favorable else "UNFAVORABLE"
-                self.logger.info(
-                    "MARTINGALE [%s] recovery candle: %s %s (%.4f → %.4f) "
-                    "— %d/%d in favor (%d needed from %d candles)",
-                    self.strategy_name, color, fav_label,
-                    candle["open"], candle["close"],
-                    fav_count, total, n_in_favor, n_candles,
+        if won is None:
+            # Inconclusive — if too old, skip; otherwise retry next cycle
+            if current_window_ts > prev_window_ts + window * 2:
+                self.logger.warning(
+                    "MARTINGALE [%s]: recovery window %d inconclusive "
+                    "after timeout — skipping",
+                    self.strategy_name, prev_window_ts,
                 )
+                self._recovery_candle_ts = current_window_ts
+            return False
 
-                # Check recovery condition
-                if total >= n_candles and fav_count >= n_in_favor:
-                    return True
+        # Record the window outcome
+        favorable = won  # Up win = favorable for Up direction
+        candle = {
+            "window_ts": prev_window_ts,
+            "won": won,
+            "favorable": favorable,
+            "ts": int(time.time()),
+        }
+        self._recovery_candles.append(candle)
+        self._recovery_candles = self._recovery_candles[-n_candles:]
+        self._save_state()
 
-            # Open a new candle
-            self._recovery_candle_open = price
-            self._recovery_candle_ts = now
+        fav_count = sum(1 for c in self._recovery_candles
+                        if c.get("favorable"))
+        total = len(self._recovery_candles)
+        outcome = "WIN" if won else "LOSS"
+        fav_label = "FAVORABLE" if favorable else "UNFAVORABLE"
+
+        self.logger.info(
+            "MARTINGALE [%s] recovery window: %s %s (window %d) "
+            "— %d/%d in favor (%d needed from %d windows)",
+            self.strategy_name, outcome, fav_label, prev_window_ts,
+            fav_count, total, n_in_favor, n_candles,
+        )
+
+        # Move to tracking the current window
+        self._recovery_candle_ts = current_window_ts
+
+        # Check recovery condition
+        if total >= n_candles and fav_count >= n_in_favor:
+            return True
 
         return False
 
