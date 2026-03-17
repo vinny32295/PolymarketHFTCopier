@@ -2946,6 +2946,7 @@ class MartingaleBot(threading.Thread):
         self.current_bet = self.start_bet
         self.direction = self._scfg("direction", "martingale_direction", "Up")
         self.consecutive_losses = 0
+        self.cumulative_losses = 0.0  # total actual $ lost in current streak
         self.session_pnl = 0.0
         self._active_bet = None
         self._bet_history = []
@@ -3042,6 +3043,7 @@ class MartingaleBot(threading.Thread):
         state = {
             "current_bet": self.current_bet,
             "consecutive_losses": self.consecutive_losses,
+            "cumulative_losses": self.cumulative_losses,
             "session_pnl": self.session_pnl,
             "direction": self.direction,
             "active_bet": self._active_bet,
@@ -3068,6 +3070,15 @@ class MartingaleBot(threading.Thread):
                 state = json.load(fh)
             self.current_bet = float(state.get("current_bet", self.start_bet))
             self.consecutive_losses = int(state.get("consecutive_losses", 0))
+            # Migration: if old state lacks cumulative_losses, estimate from
+            # the geometric formula (current_bet - start_bet) as a fallback.
+            if "cumulative_losses" in state:
+                self.cumulative_losses = float(state["cumulative_losses"])
+            elif self.consecutive_losses > 0:
+                self.cumulative_losses = round(
+                    self.current_bet - self.start_bet, 2)
+            else:
+                self.cumulative_losses = 0.0
             self.session_pnl = float(state.get("session_pnl", 0.0))
             self.direction = state.get("direction", self.direction)
             self._active_bet = state.get("active_bet")
@@ -3147,10 +3158,12 @@ class MartingaleBot(threading.Thread):
                 self._save_state()
 
             self.logger.info(
-                "Loaded martingale state: bet=$%.2f, streak=%d, pnl=$%.4f, "
+                "Loaded martingale state: bet=$%.2f, streak=%d, "
+                "cumulative_losses=$%.2f, pnl=$%.4f, "
                 "dir=%s, last_window_ts=%d, missed=%d%s",
                 self.current_bet, self.consecutive_losses,
-                self.session_pnl, self.direction, self._last_window_ts,
+                self.cumulative_losses, self.session_pnl,
+                self.direction, self._last_window_ts,
                 len(self._missed_windows),
                 " [PAUSED — waiting for recovery]" if self._streak_paused else "",
             )
@@ -3179,6 +3192,7 @@ class MartingaleBot(threading.Thread):
         """Wipe persisted state and reset to defaults."""
         self.current_bet = self.start_bet
         self.consecutive_losses = 0
+        self.cumulative_losses = 0.0
         self.session_pnl = 0.0
         self._active_bet = None
         self._last_window_ts = 0
@@ -4369,6 +4383,7 @@ class MartingaleBot(threading.Thread):
 
         self.current_bet = self.start_bet
         self.consecutive_losses = 0
+        self.cumulative_losses = 0.0
         self._active_bet = None
         self._streak_just_resumed = False
         # Clear candle confirmation — no confirmation needed at streak 0
@@ -4382,24 +4397,30 @@ class MartingaleBot(threading.Thread):
         loss = bet["cost"]
         self.session_pnl -= loss
         self.consecutive_losses += 1
-        # Use geometric doubling from start_bet to keep the martingale
-        # progression clean and predictable: start_bet × 2^streak.
-        # Previously this doubled the actual exchange cost, which caused
-        # drift when place_order bumped the bet to meet Polymarket minimums
-        # (e.g. $2.50 bumped to $2.60 → doubled to $5.20 instead of $5.00).
-        self.current_bet = round(
-            self.start_bet * (2 ** self.consecutive_losses), 2
-        )
+        self.cumulative_losses = round(self.cumulative_losses + loss, 2)
+        # Next bet = total actual losses + start_bet.  This ensures a win
+        # recovers ALL real money lost (including slippage/minimum bumps)
+        # plus the original profit target (start_bet).
+        # Geometric formula (start_bet × 2^streak) only works when every
+        # bet costs exactly the intended amount — slippage breaks it.
+        self.current_bet = round(self.cumulative_losses + self.start_bet, 2)
 
         # Log if the actual cost diverged from intended bet size
         actual_cost = bet.get("cost", 0)
         intended = bet.get("bet_size", 0)
+        geometric = round(self.start_bet * (2 ** self.consecutive_losses), 2)
         if actual_cost and intended and abs(actual_cost - intended) > 0.01:
             self.logger.info(
                 "MARTINGALE [%s]: exchange cost $%.2f differed from "
                 "intended $%.2f (bumped by %.0f%% to meet minimums)",
                 self.strategy_name, actual_cost, intended,
                 ((actual_cost - intended) / intended) * 100,
+            )
+        if abs(self.current_bet - geometric) > 0.01:
+            self.logger.info(
+                "MARTINGALE [%s]: bet adjusted for actual losses — "
+                "$%.2f (cumulative) vs $%.2f (geometric)",
+                self.strategy_name, self.current_bet, geometric,
             )
 
         max_bet = float(self._scfg("max_bet", "martingale_max_bet", 0))
@@ -4416,9 +4437,9 @@ class MartingaleBot(threading.Thread):
 
         self.logger.info(
             "MARTINGALE LOSS: %s -$%.2f (fill $%.4f) — next bet $%.2f "
-            "(start $%.2f × 2^%d), streak: %d | session P&L: $%.4f%s",
+            "(losses $%.2f + start $%.2f), streak: %d | session P&L: $%.4f%s",
             bet["direction"], loss, bet.get("fill_price", 0),
-            self.current_bet, self.start_bet, self.consecutive_losses,
+            self.current_bet, self.cumulative_losses, self.start_bet,
             self.consecutive_losses, self.session_pnl, slip_info,
         )
 
