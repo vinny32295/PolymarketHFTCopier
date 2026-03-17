@@ -3815,6 +3815,10 @@ class MartingaleBot(threading.Thread):
 
         Returns ``True`` if a bet was placed, ``False`` otherwise.
         """
+        # Guard: never place a new bet while one is still active
+        if self._active_bet:
+            return False
+
         # Safety: max streak — pause and wait for bullish recovery
         # Skip this check if we just resumed — allow the recovery bet to be placed
         max_streak = int(self._scfg("max_streak", "martingale_max_streak", 0))
