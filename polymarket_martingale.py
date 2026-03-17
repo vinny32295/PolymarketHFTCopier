@@ -4321,6 +4321,36 @@ class MartingaleBot(threading.Thread):
 
         self._active_bet = None
         self._streak_just_resumed = False
+
+        # Check max streak — go straight to streak pause (with its own
+        # recovery candles) instead of the normal candle confirmation.
+        # This ensures the PAUSED Telegram notification fires immediately.
+        max_streak = int(self._scfg("max_streak", "martingale_max_streak", 0))
+        if max_streak > 0 and self.consecutive_losses >= max_streak:
+            self._streak_paused = True
+            self._streak_paused_at = datetime.now()
+            self._recovery_candles = []
+            self._recovery_candle_open = None
+            self._recovery_candle_ts = 0
+            self._confirm_waiting = False
+            n_candles = int(self._scfg(
+                "recovery_candles", "martingale_recovery_candles", 3))
+            n_green = int(self._scfg(
+                "recovery_in_favor", "martingale_recovery_in_favor", 2))
+            msg = (
+                f"MARTINGALE [{self.strategy_name}] PAUSED: max streak of "
+                f"{max_streak} losses reached — waiting for {n_green}/{n_candles} "
+                f"candles in favor before resuming"
+            )
+            self.logger.warning(msg)
+            if self.notify_callback:
+                try:
+                    self.notify_callback(msg)
+                except Exception:
+                    pass
+            self._save_state()
+            return
+
         # Start candle confirmation for the recovery bet
         self._confirm_candles = []
         self._confirm_candle_open = None
