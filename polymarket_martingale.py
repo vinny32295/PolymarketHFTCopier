@@ -3096,6 +3096,18 @@ class MartingaleBot(threading.Thread):
             self._confirm_candles = state.get("confirm_candles", [])
             self._confirm_waiting = bool(state.get("confirm_waiting", False))
 
+            # Migration: candle confirmation is now only used during
+            # streak-pause recovery — clear stale confirm_waiting from
+            # older state files so the bot doesn't block mid-streak.
+            if self._confirm_waiting and not self._streak_paused:
+                self.logger.info(
+                    "MARTINGALE [%s]: clearing stale confirm_waiting from "
+                    "saved state (streak %d, not paused)",
+                    self.strategy_name, self.consecutive_losses,
+                )
+                self._confirm_waiting = False
+                self._confirm_candles = []
+
             # On restart while paused, prune recovery candles that are
             # outside the lookback window so the bot evaluates recent
             # market conditions.  Candles within the last N*interval
@@ -4520,21 +4532,11 @@ class MartingaleBot(threading.Thread):
             self._save_state()
             return
 
-        # Start candle confirmation for the recovery bet
-        self._confirm_candles = []
-        self._confirm_candle_open = None
-        self._confirm_candle_ts = 0
-        self._confirm_waiting = True
-        n_candles = int(self._scfg(
-            "recovery_candles", "martingale_recovery_candles", 3))
-        n_favor = int(self._scfg(
-            "recovery_in_favor", "martingale_recovery_in_favor", 2))
-        self.logger.info(
-            "MARTINGALE [%s]: waiting for %d/%d candle confirmation "
-            "before recovery bet (streak %d, next $%.2f)",
-            self.strategy_name, n_favor, n_candles,
-            self.consecutive_losses, self.current_bet,
-        )
+        # Only start candle confirmation when max_streak is NOT set or
+        # the streak hasn't reached it yet — in that case, keep betting
+        # immediately (the whole point of martingale is to double down).
+        # Candle confirmation is only useful as a recovery gate after
+        # hitting max_streak, which is handled above via _streak_paused.
         self._save_state()
 
     def _log_bet(self, bet, won, profit):
