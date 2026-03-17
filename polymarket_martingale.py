@@ -2598,16 +2598,73 @@ class PolymarketCLOBClient:
                     # Retry ONCE with a refreshed orderbook price before
                     # giving up.  This catches cases where our smart price
                     # was slightly stale by the time the order hit the book.
+                    fok_exc_str = str(fok_exc)
+
+                    # ── Network error detection ──
+                    # Network errors (status_code=None, "Request exception",
+                    # ConnectionError, Timeout) mean the order may have
+                    # actually filled on-chain despite the exception.
+                    # In this case, NEVER retry — a retry risks a double
+                    # fill.  Return immediately so the caller can lock the
+                    # window.  Accept a missed window over a double bet.
+                    _is_fok_network_error = (
+                        "status_code=None" in fok_exc_str
+                        or "Request exception" in fok_exc_str
+                        or "ConnectionError" in fok_exc_str
+                        or "Timeout" in fok_exc_str
+                    )
+
+                    if _is_fok_network_error:
+                        self.logger.warning(
+                            "FOK network error (%s) — skipping retry to "
+                            "prevent double bet. Checking for phantom fill.",
+                            fok_exc,
+                        )
+                        # Give chain a moment then check if it actually filled
+                        try:
+                            time.sleep(2.0)
+                            _fok_post_bal = self._get_token_balance(
+                                self.address, token_id, neg_risk=neg_risk,
+                            )
+                            _fok_delta = _fok_post_bal - _fok_pre_bal
+                            if _fok_delta > 0:
+                                delta_shares = float(
+                                    Decimal(_fok_delta) / Decimal("1000000")
+                                )
+                                self.logger.warning(
+                                    "FOK phantom fill confirmed — balance "
+                                    "increased by %d (pre=%d, post=%d, "
+                                    "~%.1f shares). Treating as filled.",
+                                    _fok_delta, _fok_pre_bal, _fok_post_bal,
+                                    delta_shares,
+                                )
+                                return {
+                                    "takingAmount": str(delta_shares),
+                                    "makingAmount": str(actual_usdc),
+                                    "status": "matched",
+                                    "_phantom_fill": True,
+                                }
+                        except Exception as pf_exc:
+                            self.logger.debug(
+                                "FOK phantom fill check failed: %s", pf_exc,
+                            )
+                        # No phantom fill detected — return as network error
+                        # so caller locks the window
+                        return {
+                            "status": "fok_rejected",
+                            "reason": fok_exc_str,
+                        }
+
+                    # Non-network rejection (e.g. price moved) — safe to
+                    # retry once with refreshed price.
                     self.logger.warning(
                         "FOK rejected (%s) — retrying with refreshed price",
                         fok_exc,
                     )
 
                     # ── Phantom fill guard ──
-                    # Network errors (status_code=None) mean the order may
-                    # have actually filled on-chain despite the exception.
-                    # Check if token balance increased since the pre-FOK
-                    # snapshot to avoid placing a duplicate retry order.
+                    # Even for non-network rejections, check balance to be
+                    # safe before retrying.
                     try:
                         time.sleep(1.5)  # brief pause for on-chain state
                         _fok_post_bal = self._get_token_balance(
