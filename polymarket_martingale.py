@@ -2691,13 +2691,15 @@ class PolymarketCLOBClient:
                             # Fall through to the retry logic below
                         else:
                             # Trades API itself errored — can't confirm
-                            # either way.  Check on-chain as last resort.
+                            # via API.  Fall back to on-chain balance.
+                            _onchain_ok = False
                             try:
                                 time.sleep(1.5)
                                 _fok_post_bal = self._get_token_balance(
                                     self.address, token_id,
                                     neg_risk=neg_risk,
                                 )
+                                _onchain_ok = True
                                 _fok_delta = _fok_post_bal - _fok_pre_bal
                                 if _fok_delta > 0:
                                     delta_shares = float(
@@ -2722,20 +2724,33 @@ class PolymarketCLOBClient:
                                     "FOK on-chain check failed: %s",
                                     pf_exc,
                                 )
-                            # Neither API nor on-chain could confirm —
-                            # lock window conservatively
-                            self.logger.warning(
-                                "FOK network error: trades API unavailable "
-                                "and no on-chain fill — locking window",
-                            )
-                            return {
-                                "status": "fok_rejected",
-                                "reason": fok_exc_str,
-                            }
 
-                    # Non-network rejection or network error where trades
-                    # API confirmed no fill — safe to retry once with
-                    # refreshed price.
+                            if _onchain_ok:
+                                # On-chain confirmed no balance change —
+                                # order definitely didn't fill.  Safe to
+                                # retry with refreshed price.
+                                self.logger.info(
+                                    "FOK network error but on-chain "
+                                    "confirms no fill (delta=0) — safe "
+                                    "to retry",
+                                )
+                                # Fall through to retry logic below
+                            else:
+                                # Both trades API AND on-chain failed —
+                                # lock window conservatively
+                                self.logger.warning(
+                                    "FOK network error: both trades API "
+                                    "and on-chain unavailable — locking "
+                                    "window",
+                                )
+                                return {
+                                    "status": "fok_rejected",
+                                    "reason": fok_exc_str,
+                                }
+
+                    # Non-network rejection, or network error where trades
+                    # API or on-chain confirmed no fill — safe to retry
+                    # once with refreshed price.
                     if not _is_fok_network_error:
                         self.logger.warning(
                             "FOK rejected (%s) — retrying with refreshed "
