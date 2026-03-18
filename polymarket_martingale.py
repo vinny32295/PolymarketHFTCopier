@@ -10048,11 +10048,29 @@ class MartingaleGUI:
             ToolTip(lbl, tip)
             ToolTip(entry, tip)
 
+        # -- Normalize Slippage checkbox --
+        next_row = len(fields)
+        self._mart_normalize_var = tk.BooleanVar(value=True)
+        _norm_cb = ttk.Checkbutton(
+            edit_frame, text="Normalize Bet for Slippage",
+            variable=self._mart_normalize_var,
+        )
+        _norm_cb.grid(row=next_row, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+        _norm_tip = (
+            "When enabled, the bot overbets when the ask price exceeds the fair "
+            "price (0.50) so that your WIN PROFIT stays constant regardless of "
+            "slippage. Disable to always bet the exact calculated amount."
+        )
+        ToolTip(_norm_cb, _norm_tip)
+        ttk.Label(edit_frame, text="Overbet to preserve win profit",
+                  foreground="#666", font=("TkDefaultFont", 8)).grid(
+            row=next_row, column=2, sticky=tk.W, padx=(6, 2), pady=(6, 0))
+
         _apply_btn = ttk.Button(
             edit_frame, text="Apply to Selected",
             command=self._mart_apply_edit,
         )
-        _apply_btn.grid(row=len(fields), column=0, columnspan=2, pady=(10, 0))
+        _apply_btn.grid(row=next_row + 1, column=0, columnspan=2, pady=(10, 0))
         ToolTip(_apply_btn, "Save the current field values to the selected strategy in the list.")
 
         # --- Bottom: status + reset ---
@@ -10117,6 +10135,7 @@ class MartingaleGUI:
             entry = self._mart_entries[attr]
             entry.delete(0, tk.END)
             entry.insert(0, str(s.get(key, default)))
+        self._mart_normalize_var.set(s.get("normalize_slippage", True))
 
     def _mart_apply_edit(self):
         """Write the edit fields back into the selected strategy dict.
@@ -10148,6 +10167,7 @@ class MartingaleGUI:
                 s[key] = conv(self._mart_entries[attr].get().strip())
             except (ValueError, TypeError):
                 pass
+        s["normalize_slippage"] = self._mart_normalize_var.get()
         self._mart_refresh_listbox()
         # Re-select the same index
         if idx < self.mart_listbox.size():
@@ -11054,6 +11074,7 @@ class MartingaleGUI:
                 "price_min": self.cfg.get("martingale_price_min", 0.40),
                 "price_max": self.cfg.get("martingale_price_max", 0.55),
                 "max_entry_seconds": self.cfg.get("martingale_max_entry_seconds", 60),
+                "normalize_slippage": self.cfg.get("martingale_normalize_slippage", True),
             }]
         import copy as _copy
         self._mart_strategies = [_copy.deepcopy(s) for s in strategies]
@@ -11103,6 +11124,7 @@ class MartingaleGUI:
             self.cfg["martingale_price_min"] = s0.get("price_min", 0.40)
             self.cfg["martingale_price_max"] = s0.get("price_max", 0.55)
             self.cfg["martingale_max_entry_seconds"] = s0.get("max_entry_seconds", 60)
+            self.cfg["martingale_normalize_slippage"] = s0.get("normalize_slippage", True)
 
     # ---- Button handlers ----
 

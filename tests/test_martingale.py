@@ -2105,10 +2105,10 @@ class TestMartingaleBot(unittest.TestCase):
         """When ask > fair ($0.50), bet should increase to get expected shares."""
         mb = self._make_bot()
         adjusted, expected = mb._normalize_bet_for_slippage(5.0, 0.55)
-        # expected shares = 5.0 / 0.50 = 10
-        self.assertEqual(expected, 10.0)
-        # adjusted = 10 * 0.55 = 5.50
-        self.assertEqual(adjusted, 5.50)
+        # profit-preserving: shares = 5.0 / (1 - 0.55) = 11.11…
+        self.assertAlmostEqual(expected, 11.111111, places=4)
+        # adjusted = 11.111… * 0.55 = 6.11
+        self.assertEqual(adjusted, 6.11)
 
     def test_normalize_bet_for_slippage_no_change_below_fair(self):
         """When ask <= fair ($0.50), bet stays the same (no reduction)."""
@@ -2135,10 +2135,11 @@ class TestMartingaleBot(unittest.TestCase):
         """Custom fair_price should be respected."""
         mb = self._make_bot({"martingale_fair_price": 0.40})
         adjusted, expected = mb._normalize_bet_for_slippage(4.0, 0.50)
-        # expected shares = 4.0 / 0.40 = 10
-        self.assertEqual(expected, 10.0)
-        # adjusted = 10 * 0.50 = 5.00
-        self.assertEqual(adjusted, 5.0)
+        # ask 0.50 > fair 0.40 → profit-preserving:
+        # expected shares = 4.0 / (1 - 0.50) = 8.0
+        self.assertEqual(expected, 8.0)
+        # adjusted = 8.0 * 0.50 = 4.00
+        self.assertEqual(adjusted, 4.0)
 
     def test_try_place_bet_uses_normalized_amount(self):
         """place_order should be called with the normalized bet, not current_bet."""
@@ -2155,19 +2156,19 @@ class TestMartingaleBot(unittest.TestCase):
             "asks": [{"price": "0.55", "size": "100"}],
         }
         mb.clob_client.place_order.return_value = {
-            "takingAmount": "10.0",
-            "makingAmount": "5.50",
+            "takingAmount": "11.11",
+            "makingAmount": "6.11",
         }
         result = mb._try_place_bet()
         self.assertTrue(result)
         # current_bet is $5, but ask is $0.55 > fair $0.50, so
-        # order_bet = (5/0.50) * 0.55 = $5.50
+        # profit-preserving: shares = 5/(1-0.55) = 11.11, cost = 11.11*0.55 = 6.11
         call_args = mb.clob_client.place_order.call_args
-        self.assertEqual(call_args[1]["size_usdc"], 5.50)
+        self.assertEqual(call_args[1]["size_usdc"], 6.11)
         # active_bet should track both amounts
         self.assertEqual(mb._active_bet["bet_size"], 5.0)
-        self.assertEqual(mb._active_bet["order_bet"], 5.50)
-        self.assertEqual(mb._active_bet["expected_shares"], 10.0)
+        self.assertEqual(mb._active_bet["order_bet"], 6.11)
+        self.assertEqual(mb._active_bet["expected_shares"], 11.11)
 
     @patch("time.sleep")
     def test_phantom_fill_detected_on_fok_rejection(self, mock_sleep):
