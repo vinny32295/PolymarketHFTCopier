@@ -5055,9 +5055,17 @@ class MartingaleBot(threading.Thread):
         )
         if not phantom:
             self.logger.info(
-                "MARTINGALE [%s]: deferred check — no phantom fill found",
+                "MARTINGALE [%s]: deferred check — no phantom fill found, "
+                "unlocking window for retry",
                 self.strategy_name,
             )
+            # On-chain confirmed no position — safe to retry this window.
+            # Clear the window lock so _try_place_bet can re-enter.
+            self._last_window_ts = 0
+            self._skip_reason = None
+            self._skip_price = None
+            self._skip_token_id = None
+            self._save_state()
             return
 
         # Phantom fill confirmed — build _active_bet so normal
